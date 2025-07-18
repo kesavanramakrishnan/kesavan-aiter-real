@@ -1,25 +1,8 @@
 # SPDX-License-Identifier: MIT
-# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
-
-"""
-Lean Attention
-===============
-This is a Triton implementation of the Lean Attention algorithm from https://arxiv.org/abs/2405.10480
-Lean Attention adopts streamK style tiling strategy, which efficiently utilize all available CUs in the system.
-Lean Attention is for both decode and prefill attention of transformer based models.
-
-It currently supports ragged batching decode and prefill attention with causal=1
-
-TO be added features:
-- Add GQA support
-- batch_size > 1 for prefill/causal=1
-- Misc
-    - N_CTX with non-integer number of BLOCK_N (pad zeros or add mask)
-    -
-"""
+# Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
 
 import torch
-
+import sys
 import triton
 import triton.language as tl
 
@@ -40,8 +23,6 @@ def persistent_lean_attention(
     causal: bool,
     batch_size: int,
     sm_scale: torch.float16,
-    num_warps: int,
-    waves_per_eu: int,
 ):
     # shape constraints
     HEAD_DIM_Q, HEAD_DIM_K, HEAD_DIM_V = q.shape[-1], k.shape[-1], v.shape[-1]
@@ -50,25 +31,18 @@ def persistent_lean_attention(
     ), "Incompatible Q/K/V Hidden Dimensions"
     assert HEAD_DIM_K in {16, 32, 64, 128, 256}
 
-    # MASKED_BLOCKS is used for prefill/causal for BLOCK_M > BLOCK_N
-    # For MI300, BLOCK_M=128, BLOCK_N=64 is better for performance
-    MASKED_BLOCKS = BLOCK_M // BLOCK_N
-
-    if causal:
-        # Only support BLOCK_M is multiple of BLOCK_N
-        # TODO: add other scenarios
-        assert BLOCK_M % BLOCK_N == 0
-
     N_CTX_Q = q.shape[0] // batch_size
     N_CTX_K = k.shape[0]  # This is the sum of all ctx_n in a batch
     H = q.shape[1]
+
+    BLOCK_RATIO = BLOCK_M // BLOCK_N
 
     qk_scale = sm_scale * 1.44269504
 
     (
         num_m_blocks,
         num_n_blocks,
-        high_load_wgs,
+        high_load_tbs,
         max_tiles_per_wg,
         tiles_per_head,
         total_programs,
@@ -81,25 +55,20 @@ def persistent_lean_attention(
         N_CTX_K,
         H,
         H,
+        HEAD_DIM_Q,
         BLOCK_M,
         BLOCK_N,
         total_programs,
     )
-    # print(
-    #    f"high_load_wgs={high_load_wgs}, max_tiles_per_wg={max_tiles_per_wg}, tiles_per_head={tiles_per_head}"
-    # )
-    # print(
-    #    f"total_programs={total_programs}, num_splits={num_splits}, even_split={even_split}"
-    # )
-    # print(f"num_m_blocks={num_m_blocks}, num_n_blocks={num_n_blocks}")
 
     grid = (total_programs, 1, 1)
 
     o = torch.empty_like(q, dtype=v.dtype)
+    
+    # Counter for workgroup tile contributions
+    wg_tile_count = torch.zeros((total_programs,), dtype=torch.int32, device=q.device)
 
-    la_kernel = la_persistent[grid](
-        False,
-        0,
+    la_persistent[grid](
         q,
         k,
         v,
@@ -108,6 +77,7 @@ def persistent_lean_attention(
         Lp,
         Op,
         o,
+        wg_tile_count, # Pass counter to kernel
         batch_num_block_n,
         locks,
         q.stride(0),  # N_CTX_Q
@@ -128,25 +98,20 @@ def persistent_lean_attention(
         HEAD_DIM=HEAD_DIM_K,
         BLOCK_M=BLOCK_M,
         BLOCK_N=BLOCK_N,
-        MASKED_BLOCKS=MASKED_BLOCKS,
+        BLOCK_RATIO=BLOCK_RATIO,
         batch_size=batch_size,
         causal=causal,
         num_m_blocks=num_m_blocks,
         num_n_blocks=num_n_blocks,
         # leanAttention params
-        high_load_wgs=high_load_wgs,
+        high_load_wgs=high_load_tbs,
         max_tiles_per_wg=max_tiles_per_wg,
         tiles_per_head=tiles_per_head,
         num_splits=num_splits,
-        waves_per_eu=waves_per_eu,
-        num_warps=num_warps,
-        num_stages=1,
-        num_ctas=1,
     )
-
-    print(f"la kernel {la_kernel.n_regs} registers used, {la_kernel.n_spills} spills")
-
-    return o
+    # Synchronize to ensure kernel is complete before returning
+    torch.cuda.synchronize()
+    return o, wg_tile_count
 
 
 def get_num_splits_and_buffer_sizes(
@@ -156,6 +121,7 @@ def get_num_splits_and_buffer_sizes(
     max_seqlen_k,
     num_heads,
     num_heads_k,
+    head_size,
     BLOCK_M,
     BLOCK_N,
     num_SMs,
@@ -168,37 +134,24 @@ def get_num_splits_and_buffer_sizes(
     # TODO: Support Grouped-Query Attention
     max_seqlen_q = max_seqlen_q * num_heads // num_heads_k
 
-    # print(f"block_m: {BLOCK_M}, block_n: {BLOCK_N} ")
-    # print(f"num_m_block: {num_m_blocks}, num_n_block: {num_n_blocks} ")
-    # print(f"max_seqlen_q: {max_seqlen_q}, max_seqlen_k: {max_seqlen_k}")
-    # print(f"num_heads: {num_heads}, num_heads_k: {num_heads_k} ")
-
     if max_seqlen_q == 1:
         causal = False
 
     tiles_per_head = 0
     if causal:
-        # Prefill - Causal
+        # Prefill - Causal (Ping-pong schedule)
+        # The total number of tiles is the sum of workloads for each m_block
         for i in range(0, num_m_blocks):
-            tiles_per_head += (((i + 1) * BLOCK_M) + BLOCK_N - 1) // BLOCK_N
-        # Does not support ragged batch for causal.
+            tiles_per_head += (i + 1) * (BLOCK_M // BLOCK_N)
         tiles_per_head = tiles_per_head * batch_size
     else:
         # Decode or Not Causal
         tiles_per_head = num_m_blocks * num_n_blocks
 
     total_tiles = tiles_per_head * num_heads_k  # Total tiles across all heads
-
-    # StreamK Lean has as many threadblocks as SMs
-    # This should be a function of tile size and number of scratchpad space
-    # LeanAttention assign 3 CTAs per SM (bounded by LDS size)
+    print(f"Total Lean Tiles: {total_tiles}")
     lean_griddimz = num_SMs  # CTA launch grid
-    # if (total_tiles <= 2 * 2 * num_SMs):
-    #    lean_griddimz = min((total_tiles + 1) / 2, (32 * total_tiles + num_n_blocks - 1) / num_n_blocks)
-    # else:
-    #    lean_griddimz = min(2 * num_SMs, 32 * num_heads_k * batch_size * num_m_blocks)
 
-    # Max number lean tiles per task block (CTA)
     max_tiles_per_tb = (total_tiles + lean_griddimz - 1) // lean_griddimz
 
     # Find max number of splits
@@ -230,14 +183,13 @@ def get_num_splits_and_buffer_sizes(
         even_split,
     )
 
-
 @triton.jit
-def find_group(x, MASKED_BLOCKS, num_m_blocks: tl.constexpr):
+def find_group(x, BLOCK_RATIO, num_m_blocks: tl.constexpr):
     """
-    Finds which Query block (and its corresponding workload) a global tile `x` belongs to.
-    It iterates through tasks in a "ping-pong" order to ensure workloads are balanced.
+    Finds the output tile (M-block) that the current N-block belongs to.
+    This function implements a load-balancing scheduling strategy for causal attention
+    by pairing the first and last M-blocks, second and second-to-last, and so on.
     """
-    # Running total of tiles processed so far
     total_blocks_processed = 0
     final_q_block_idx = 0
     final_task_size = 0
@@ -255,7 +207,7 @@ def find_group(x, MASKED_BLOCKS, num_m_blocks: tl.constexpr):
             q_block_idx = num_m_blocks - 1 - pair_idx
 
         # Calculate the size of this task's workload (number of K/V blocks to process)
-        task_size = (q_block_idx + 1) * MASKED_BLOCKS
+        task_size = (q_block_idx + 1) * BLOCK_RATIO
 
         # Check if the global tile `x` falls within this task's range
         if total_blocks_processed + task_size > x and found == False:
@@ -272,8 +224,6 @@ def find_group(x, MASKED_BLOCKS, num_m_blocks: tl.constexpr):
 
 @triton.jit
 def la_persistent(
-    is_pod,
-    pod_pid,
     Q,
     K,
     V,
@@ -282,6 +232,7 @@ def la_persistent(
     Lp,
     Op,
     Out,
+    wg_tile_count, # Counter for workgroup contributions
     batch_num_block_n,
     locks,
     stride_qm,  # n_ctx_q
@@ -302,7 +253,7 @@ def la_persistent(
     HEAD_DIM: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
-    MASKED_BLOCKS: tl.constexpr,
+    BLOCK_RATIO: tl.constexpr,
     batch_size: tl.constexpr,
     causal: tl.constexpr,
     num_m_blocks: tl.constexpr,
@@ -313,10 +264,7 @@ def la_persistent(
     tiles_per_head: tl.constexpr,
     num_splits: tl.constexpr,
 ):
-    if is_pod:
-        current_pid = pod_pid
-    else:
-        current_pid = tl.program_id(0)
+    current_pid = tl.program_id(0)
 
     if current_pid < high_load_wgs:
         iter = max_tiles_per_wg * current_pid
@@ -329,42 +277,27 @@ def la_persistent(
 
     # Loop context length
     while iter < cta_end_tile_gid:
-        # Calculate index of current head output tile
-        # The tiles_per_head is the sum of # BLOCK_N in K/V sequence of all batches
         tile_head_idx = iter // tiles_per_head
-
-        # To generate an otuput tile, a loop over [tile_iter, tile_iter_end) lean tiles is needed
-        # [tile_iter, tile_iter_end) are in the form of global tile id
         if causal:
             tile_batch_idx = (iter % tiles_per_head) // (tiles_per_head // batch_size)
-            # Does not support ragged batching. All requests in the batch have the same context length (per_head_tile_size)
-            # tiles_per_head: total sum of # BLOCK_N in K/V sequence of all batches
-            # per_head_tile_size: per head # BLOCK_N of each output tile
+            
+            local_tile_x = iter - (tile_head_idx * tiles_per_head) - (tile_batch_idx * (tiles_per_head // batch_size))
 
             q_idx, per_head_tile_size, tile_group_start = find_group(
-                iter 
-                - (tile_head_idx * tiles_per_head) 
-                - (tile_batch_idx * (tiles_per_head // batch_size)),
-                MASKED_BLOCKS,
+                local_tile_x,
+                BLOCK_RATIO,
                 num_m_blocks
             )
-
-            # The q_idx is now the true index for the Q block we need to process
             q_idx += tile_batch_idx * num_m_blocks
-
-            # The start of the K/V tile iterations for this Q block
+            
             tile_iter = (
                 tile_head_idx * tiles_per_head
                 + (tile_batch_idx * (tiles_per_head // batch_size))
                 + tile_group_start
             )
-
-            tile_iter_end = tile_iter + (per_head_tile_size)
-
+            tile_iter_end = tile_iter + per_head_tile_size
         else:
-            tile_idx = (
-                tile_head_idx * batch_size
-            )  # Output tile idx, 1 output tile per head per batch
+            tile_idx = (tile_head_idx * batch_size)
             tile_iter = tile_head_idx * tiles_per_head
             if batch_size == 1:
                 req_size = tiles_per_head
@@ -379,15 +312,15 @@ def la_persistent(
                     tile_idx = tile_idx + b
                     tile_iter_end = tile_iter + (next_req_size - req_size)
                 req_size = next_req_size
-        # Local lean tile ID within a loop of an output tile
-        local_iter = iter - tile_iter
-        local_iter_end = tl.minimum(tile_iter_end, cta_end_tile_gid) - tile_iter
 
         if iter == tile_iter:
             host_block = True
         else:
             host_block = False
-        # finishing_block: the output tile is finished within this block
+
+        local_iter = iter - tile_iter
+        local_iter_end = tl.minimum(tile_iter_end, cta_end_tile_gid) - tile_iter
+
         if cta_end_tile_gid >= tile_iter_end:
             finishing_block = True
         else:
@@ -403,39 +336,19 @@ def la_persistent(
             tile_batch_idx = tile_idx % batch_size
             b_seq_size = 0
             if tile_batch_idx > 0:
-                b_seq_size = tl.load(
-                    batch_num_block_n + tile_batch_idx - 1
-                )  # Previous batch size
+                b_seq_size = tl.load(batch_num_block_n + tile_batch_idx - 1)
 
-        k_offs = (
-            (b_seq_size + local_iter) * BLOCK_N * stride_kn
-            + tile_head_idx * stride_kh
-            + offs_n[None, :] * stride_kn
-            + offs_k[:, None] * stride_kk
-        )
-        v_offs = (
-            (b_seq_size + local_iter) * BLOCK_N * stride_vn
-            + tile_head_idx * stride_vh
-            + offs_n[:, None] * stride_vn
-            + offs_k[None, :] * stride_vk
-        )
-
+        k_offs = ((b_seq_size + local_iter) * BLOCK_N + offs_n[None, :]) * stride_kn + tile_head_idx * stride_kh + offs_k[:, None] * stride_kk
+        v_offs = ((b_seq_size + local_iter) * BLOCK_N + offs_n[:, None]) * stride_vn + tile_head_idx * stride_vh + offs_k[None, :] * stride_vk
+        
         k_ptrs = K + k_offs
-        k_ptrs = tl.multiple_of(k_ptrs, (16, 1))
         v_ptrs = V + v_offs
-        v_ptrs = tl.multiple_of(v_ptrs, (1, 16))
 
         if not causal:
-            q_idx = tile_batch_idx
-            
-        q_offs = (
-            q_idx * BLOCK_M * stride_qm
-            + tile_head_idx * stride_qh
-            + offs_m[:, None] * stride_qm
-            + offs_k[None, :] * stride_qk
-        )
+             q_idx = tile_batch_idx
+             
+        q_offs = (q_idx * BLOCK_M + offs_m[:, None]) * stride_qm + tile_head_idx * stride_qh + offs_k[None, :] * stride_qk
         q_ptrs = Q + q_offs
-        q_ptrs = tl.multiple_of(q_ptrs, (1, 16))
 
         m_i = tl.zeros([BLOCK_M], dtype=tl.float32) - float("inf")
         l_i = tl.zeros([BLOCK_M], dtype=tl.float32) + 1.0
@@ -443,157 +356,165 @@ def la_persistent(
 
         q = tl.load(q_ptrs)
 
-        for l_iter in range(local_iter, local_iter_end):
-            # -- compute qk ----
-            # k = tl.load(k_ptrs, cache_modifier=".cg")
+        for l_iter_offset in range(local_iter, local_iter_end):
             k = tl.load(k_ptrs)
             qk = tl.dot(q, k)
             qk = qk * qk_scale
 
-            # if ((iter + (l_iter - local_iter)) == (tile_iter_end - 1)) and causal:
-            #    mask = offs_m[:, None] >= offs_n[None, :]
-            # Apply the causal mask
-            #    qk = tl.where(mask, qk, float("-inf"))
-            if causal and (MASKED_BLOCKS > 1):
-                if l_iter == (tile_iter_end - tile_iter) - 2:
+            if causal and (BLOCK_RATIO > 1):
+                if l_iter_offset == (tile_iter_end - tile_iter) - 2:
                     mask = offs_m[:, None] >= offs_n[None, :]
                     qk = tl.where(mask, qk, float("-inf"))
-                if l_iter == (tile_iter_end - tile_iter) - 1:
-                    mask = (offs_m[:, None] >= BLOCK_N) & (
-                        offs_n[None, :] <= (offs_m[:, None] - BLOCK_N)
-                    )
+                if l_iter_offset == (tile_iter_end - tile_iter) - 1:
+                    mask = (offs_m[:, None] >= BLOCK_N) & (offs_n[None, :] <= (offs_m[:, None] - BLOCK_N))
                     qk = tl.where(mask, qk, float("-inf"))
-
-            if causal and (MASKED_BLOCKS == 1):
-                # if (l_iter == (tile_iter_end - tile_iter) - 1):
-                if (iter + (l_iter - local_iter)) == (tile_iter_end - 1):
+            if causal and (BLOCK_RATIO == 1):
+                if (iter + (l_iter_offset - local_iter)) == (tile_iter_end - 1):
                     mask = offs_m[:, None] >= offs_n[None, :]
                     qk = tl.where(mask, qk, float("-inf"))
 
             m_ij = tl.maximum(m_i, tl.max(qk, 1))
             qk = qk - m_ij[:, None]
-            p = tl.math.exp2(qk)  # p.shape = [BLOCK_M, BLOCK_N]
-            # -- update output accumulator --
+            p = tl.math.exp2(qk)
+            
             alpha = tl.math.exp2(m_i - m_ij)
-            acc = (
-                acc * alpha[:, None]
-            )  # Scale each row of acc by the corresponding elements in alpha
-            # v = tl.load(v_ptrs, cache_modifier=".cg")  # v.shape = [BLOCK_N, HEAD_DIM]
+            acc = acc * alpha[:, None]
+            
             v = tl.load(v_ptrs)
-            acc += tl.dot(p.to(v.dtype), v)  # acc.shape = [BLOCK_M, HEAD_DIM]
-            # -- update l_i
-            l_ij = tl.sum(p, 1)  # rowsum(p)
+            acc += tl.dot(p.to(v.dtype), v)
+            
+            l_ij = tl.sum(p, 1)
             l_i = l_i * alpha + l_ij
-            # update m_i
             m_i = m_ij.to(m_i.dtype)
 
-            if (
-                (l_iter == (tile_iter_end - tile_iter) - 1)
-                and (iter == tile_iter_end - 1)
-                and (MASKED_BLOCKS == 2)
-            ):
-                mask1 = offs_m >= BLOCK_N
-                m_i = tl.where(mask1, m_i, float("-inf"))
-                l_i = tl.where(mask1, l_i, 1.0)
-                mask1 = mask1[:, None]
-                acc = tl.where(mask1, acc, 0.0)
-
-            # update k/v pointer
-            v_ptrs += BLOCK_N * stride_vn
             k_ptrs += BLOCK_N * stride_kn
-
-        # initialize pointer to m and l
-        m_cta = tl.zeros([BLOCK_M], dtype=tl.float32) - float("inf")
-        l_cta = tl.zeros([BLOCK_M], dtype=tl.float32) + 1.0
-        acc_cta = tl.zeros([BLOCK_M, HEAD_DIM], dtype=tl.float32)
-
-        # lean output tile epilogue
+            v_ptrs += BLOCK_N * stride_vn
+        
+        # Epilogue
         if not host_block:
-            # Update pointers of partial results Mp[cta], Lp[cta], Op[cta]
             mp_ptrs = Mp + current_pid * BLOCK_M + offs_m
             lp_ptrs = Lp + current_pid * BLOCK_M + offs_m
-            op_ptrs = (
-                Op
-                + current_pid * stride_oph  # stride_oph is total_program dimension
-                + offs_m[:, None] * stride_opm
-                + offs_k[None, :] * stride_opn
-            )
-
+            op_ptrs = Op + current_pid * stride_oph + offs_m[:, None] * stride_opm + offs_k[None, :] * stride_opn
+            
             tl.store(mp_ptrs, m_i, cache_modifier=".wt")
             tl.store(lp_ptrs, l_i, cache_modifier=".wt")
             tl.store(op_ptrs, acc, cache_modifier=".wt")
             tl.debug_barrier()
-            # tl.store(locks + current_pid, 1, cache_modifier=".wt")
-            # According to streamK gemm, store + cache_modifier won't work universally
-            # atomic_xchg is better solution but a less performant variant
             tl.atomic_xchg(locks + current_pid, 1)
 
-        if host_block:  # and finishing_block:
-            # A host block that is also a finishing block completes all the LeanTile iterations for its output tile
-            # in a single CTA and so can directly store its results from LeanTile() in global memory without any reduction
-
-            o_h_offs = (
-                q_idx * BLOCK_M * stride_om
-                + tile_head_idx * stride_oh
-                + offs_m[:, None] * stride_om
-                + offs_k[None, :] * stride_on
-            )
+        if host_block:
+            o_h_offs = (q_idx * BLOCK_M + offs_m[:, None]) * stride_om + tile_head_idx * stride_oh + offs_k[None, :] * stride_on
             o_ptrs = Out + o_h_offs
 
             if not finishing_block:
-                # if host not finishing_block: # another CTA is processing the end of the output tile and store partial results
-
                 last_cta = current_pid + 1
                 temp_end_gid = cta_end_tile_gid
                 split = 1
                 while (split < num_splits) and (temp_end_gid < tile_iter_end):
                     if last_cta < high_load_wgs:
-                        if (tile_iter_end - temp_end_gid) < max_tiles_per_wg:
-                            temp_end_gid += tile_iter_end - temp_end_gid
-                        else:
-                            temp_end_gid += max_tiles_per_wg
+                        temp_end_gid += max_tiles_per_wg if (tile_iter_end - temp_end_gid) >= max_tiles_per_wg else (tile_iter_end - temp_end_gid)
                     else:
-                        if (tile_iter_end - temp_end_gid) < (max_tiles_per_wg - 1):
-                            temp_end_gid += tile_iter_end - temp_end_gid
-                        else:
-                            temp_end_gid += max_tiles_per_wg - 1
-
+                        temp_end_gid += (max_tiles_per_wg - 1) if (tile_iter_end - temp_end_gid) >= (max_tiles_per_wg-1) else (tile_iter_end - temp_end_gid)
                     last_cta += 1
                     split += 1
-                # Next, load nonHost partial restult
+                
                 for cta in range((current_pid + 1), last_cta):
-                    # According to treamK gemm, atomic_cas is universal solution but less performant
                     while tl.atomic_cas(locks + cta, 1, 1) != 1:
-                        # while tl.load(locks + cta, cache_modifier=".cv", volatile=True) != 1:
                         pass
-
-                    # Partial results are stored in [nonHost, Host-nonFinishing] layout
+                    
                     offs_mplp = cta * BLOCK_M + offs_m
                     mp_ptrs = Mp + offs_mplp
                     lp_ptrs = Lp + offs_mplp
-                    op_h_offs = (
-                        cta * stride_oph
-                        + offs_m[:, None] * stride_opm
-                        + offs_k[None, :] * stride_opn
-                    )
+                    op_h_offs = cta * stride_oph + offs_m[:, None] * stride_opm + offs_k[None, :] * stride_opn
                     op_ptrs = Op + op_h_offs
 
                     m_cta = tl.load(mp_ptrs)
                     l_cta = tl.load(lp_ptrs)
                     acc_cta = tl.load(op_ptrs)
 
-                    # m_i is the host CTA's m, m_cta is other nonHost CTA's m
                     m_new = tl.maximum(m_cta, m_i)
                     alpha = tl.math.exp2(m_cta - m_new)
                     alpha1 = tl.math.exp2(m_i - m_new)
                     l_new = alpha * l_cta + alpha1 * l_i
                     acc = acc_cta * alpha[:, None] + acc * alpha1[:, None]
-                    # update m, l
+                    
                     m_i = m_new
                     l_i = l_new
-            # host CTA write final result to memory
+                    
             acc = acc / l_i[:, None]
-            tl.store(o_ptrs, acc.to(Out.type.element_ty))
+            tl.store(o_ptrs, acc.to(Out.dtype.element_ty))
 
-        # update iter
-        iter = iter + (local_iter_end - local_iter)
+        # --- CORRECTED COUNTING LOGIC ---
+        # Add the number of tiles processed in this iteration to the workgroup's total.
+        tl.atomic_add(wg_tile_count + current_pid, local_iter_end)
+        iter = iter + local_iter_end
+
+
+def main():
+    # --- CONFIGURATION CHANGED TO A LARGER SCENARIO ---
+    batch = 1
+    causal = True
+    h = 4
+    n_ctx_q = 2048
+    n_ctx = [2048]
+    d = 128
+    total_programs = 16 # Increased number of workgroups
+
+    init_dtype = torch.float16
+    BLOCK_M = 128
+    BLOCK_N = 64
+    # --- END OF CONFIGURATION CHANGE ---
+
+    assert batch == len(n_ctx)
+
+    try:
+        sum_n_ctx = sum(int(n) for n in n_ctx)
+    except ValueError:
+        pass
+
+    list_num_block_n = [(int(str(s).strip()) + BLOCK_N - 1) // BLOCK_N for s in n_ctx]
+    len_sum = 0
+    list_sum_block_n = []
+    for i in range(batch):
+        len_sum += list_num_block_n[i]
+        list_sum_block_n.append(len_sum)
+    batch_num_block_n = torch.tensor(list_sum_block_n, dtype=torch.int32, device='cuda')
+
+    sm_scale = 0.5
+
+    q = torch.empty((n_ctx_q * batch, h, d), device='cuda', dtype=init_dtype).normal_(mean=0.0, std=0.5)
+    k = torch.empty((sum_n_ctx, h, d), device='cuda', dtype=init_dtype).normal_(mean=0.0, std=0.5)
+    v = torch.empty((sum_n_ctx, h, d), device='cuda', dtype=init_dtype).normal_(mean=0.0, std=0.5)
+
+    Mp = torch.empty((total_programs, BLOCK_M), device=q.device, dtype=torch.float32)
+    Lp = torch.empty((total_programs, BLOCK_M), device=q.device, dtype=torch.float32)
+    Op = torch.empty((total_programs, BLOCK_M, d), device=q.device, dtype=torch.float32)
+
+    locks = torch.zeros((total_programs,), device=q.device, dtype=torch.int32)
+
+    # Triton LeanAttention output
+    _, wg_tile_count = persistent_lean_attention(
+        q,
+        k,
+        v,
+        Mp,
+        Lp,
+        Op,
+        locks,
+        batch_num_block_n,
+        total_programs,
+        BLOCK_M,
+        BLOCK_N,
+        causal,
+        batch,
+        sm_scale,
+    )
+    
+    # Print the results of the workgroup contribution counter from the host
+    print("\nWork distribution for CORRECTED implementation:")
+    print(wg_tile_count)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+

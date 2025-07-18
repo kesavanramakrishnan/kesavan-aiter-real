@@ -232,12 +232,7 @@ def get_num_splits_and_buffer_sizes(
 
 
 @triton.jit
-def find_group(x, MASKED_BLOCKS, num_m_blocks: tl.constexpr):
-    """
-    Finds which Query block (and its corresponding workload) a global tile `x` belongs to.
-    It iterates through tasks in a "ping-pong" order to ensure workloads are balanced.
-    """
-    # Running total of tiles processed so far
+def find_group(x, MASKED_BLOCKS, num_m_blocks:tl.constexpr):
     total_blocks_processed = 0
     final_q_block_idx = 0
     final_task_size = 0
@@ -268,7 +263,6 @@ def find_group(x, MASKED_BLOCKS, num_m_blocks: tl.constexpr):
     
     # Should not be reached if x is valid
     return final_q_block_idx, final_task_size, final_total_blocks
-
 
 @triton.jit
 def la_persistent(
@@ -340,27 +334,22 @@ def la_persistent(
             # Does not support ragged batching. All requests in the batch have the same context length (per_head_tile_size)
             # tiles_per_head: total sum of # BLOCK_N in K/V sequence of all batches
             # per_head_tile_size: per head # BLOCK_N of each output tile
-
-            q_idx, per_head_tile_size, tile_group_start = find_group(
-                iter 
-                - (tile_head_idx * tiles_per_head) 
+            per_head_tile_idx, per_head_tile_size, total_blocks = find_group(
+                iter
+                - (tile_head_idx * tiles_per_head)
                 - (tile_batch_idx * (tiles_per_head // batch_size)),
                 MASKED_BLOCKS,
                 num_m_blocks
             )
-
-            # The q_idx is now the true index for the Q block we need to process
-            q_idx += tile_batch_idx * num_m_blocks
-
-            # The start of the K/V tile iterations for this Q block
             tile_iter = (
                 tile_head_idx * tiles_per_head
                 + (tile_batch_idx * (tiles_per_head // batch_size))
-                + tile_group_start
+                + total_blocks
             )
-
             tile_iter_end = tile_iter + (per_head_tile_size)
-
+            tile_idx = (
+                tile_head_idx * batch_size + tile_batch_idx
+            ) * num_m_blocks + per_head_tile_idx
         else:
             tile_idx = (
                 tile_head_idx * batch_size
@@ -425,9 +414,10 @@ def la_persistent(
         v_ptrs = V + v_offs
         v_ptrs = tl.multiple_of(v_ptrs, (1, 16))
 
-        if not causal:
+        if causal:
+            q_idx = per_head_tile_idx + tile_batch_idx * num_m_blocks
+        else:
             q_idx = tile_batch_idx
-            
         q_offs = (
             q_idx * BLOCK_M * stride_qm
             + tile_head_idx * stride_qh
