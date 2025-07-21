@@ -5,7 +5,7 @@ import sys
 import pytest
 import torch
 
-from aiter.ops.triton.lean_atten_vgpr_mask_invest import persistent_lean_attention
+from aiter.ops.triton.lean_atten_updated_invest import persistent_lean_attention
 
 
 @pytest.mark.parametrize(

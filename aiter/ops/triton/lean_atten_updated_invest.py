@@ -231,15 +231,67 @@ def get_num_splits_and_buffer_sizes(
     )
 
 
+# @triton.jit
+# def find_group(x, MASKED_BLOCKS):
+#     group_id = 0
+#     total_blocks = 0
+#     while total_blocks + (group_id + 1) * MASKED_BLOCKS <= x:
+#         total_blocks += (group_id + 1) * MASKED_BLOCKS
+#         group_id += 1
+#     group_size = (group_id + 1) * MASKED_BLOCKS
+#     return group_id, group_size, total_blocks
+
+
 @triton.jit
-def find_group(x, MASKED_BLOCKS):
-    group_id = 0
-    total_blocks = 0
-    while total_blocks + (group_id + 1) * MASKED_BLOCKS <= x:
-        total_blocks += (group_id + 1) * MASKED_BLOCKS
-        group_id += 1
-    group_size = (group_id + 1) * MASKED_BLOCKS
-    return group_id, group_size, total_blocks
+def find_group_formula(x, MASKED_BLOCKS: tl.constexpr, num_m_blocks: tl.constexpr):
+    """
+    Calculates the q_block_idx, task_size, and starting tile offset
+    using a closed-form mathematical formula instead of an iterative loop.
+    This avoids the high register pressure caused by the original find_group.
+    """
+    # Each pair of tasks (e.g., 0 and N-1) processes a constant number of tiles.
+    # This allows us to find the correct "pair" of tasks with a simple division.
+    tiles_per_pair = (num_m_blocks + 1) * MASKED_BLOCKS
+
+    # --- Handle the main paired blocks ---
+
+    # Determine which pair of tasks the current tile `x` falls into.
+    pair_idx = x // tiles_per_pair
+    # Calculate the number of tiles that came before this pair.
+    base_tiles = pair_idx * tiles_per_pair
+    # Find the tile's index within the current pair.
+    x_local = x - base_tiles
+
+    # The first task in the pair is for q_block_idx = pair_idx.
+    task1_size = (pair_idx + 1) * MASKED_BLOCKS
+
+    # Check if the local tile index falls within the first task.
+    is_in_task1 = x_local < task1_size
+
+    # Use tl.where to select the correct values based on which task we are in.
+    # This is a ternary operation, which is much cheaper than a loop.
+    q_block_idx = tl.where(is_in_task1, pair_idx, num_m_blocks - 1 - pair_idx)
+    task_size = tl.where(is_in_task1, task1_size, (num_m_blocks - pair_idx) * MASKED_BLOCKS)
+    total_blocks = tl.where(is_in_task1, base_tiles, base_tiles + task1_size)
+
+    # --- Handle the unpaired middle block (only if num_m_blocks is odd) ---
+
+    if num_m_blocks % 2 != 0:
+        num_pairs = num_m_blocks // 2
+        total_tiles_in_pairs = num_pairs * tiles_per_pair
+
+        # Check if the tile belongs to the single, unpaired middle block.
+        is_in_middle_block = x >= total_tiles_in_pairs
+
+        middle_q_idx = num_m_blocks // 2
+        middle_task_size = (middle_q_idx + 1) * MASKED_BLOCKS
+
+        # If it's in the middle block, overwrite the paired calculations.
+        q_block_idx = tl.where(is_in_middle_block, middle_q_idx, q_block_idx)
+        task_size = tl.where(is_in_middle_block, middle_task_size, task_size)
+        total_blocks = tl.where(is_in_middle_block, total_tiles_in_pairs, total_blocks)
+
+    return q_block_idx, task_size, total_blocks
 
 
 @triton.jit
@@ -312,11 +364,12 @@ def la_persistent(
             # Does not support ragged batching. All requests in the batch have the same context length (per_head_tile_size)
             # tiles_per_head: total sum of # BLOCK_N in K/V sequence of all batches
             # per_head_tile_size: per head # BLOCK_N of each output tile
-            per_head_tile_idx, per_head_tile_size, total_blocks = find_group(
+            per_head_tile_idx, per_head_tile_size, total_blocks = find_group_formula(
                 iter
                 - (tile_head_idx * tiles_per_head)
                 - (tile_batch_idx * (tiles_per_head // batch_size)),
                 MASKED_BLOCKS,
+                num_m_blocks
             )
             tile_iter = (
                 tile_head_idx * tiles_per_head
@@ -403,6 +456,9 @@ def la_persistent(
         )
         q_ptrs = Q + q_offs
         q_ptrs = tl.multiple_of(q_ptrs, (1, 16))
+        # Place this right after `q_ptrs` is defined
+        if causal:
+            q_start_m = q_idx * BLOCK_M
 
         m_i = tl.zeros([BLOCK_M], dtype=tl.float32) - float("inf")
         l_i = tl.zeros([BLOCK_M], dtype=tl.float32) + 1.0
@@ -421,21 +477,14 @@ def la_persistent(
             #    mask = offs_m[:, None] >= offs_n[None, :]
             # Apply the causal mask
             #    qk = tl.where(mask, qk, float("-inf"))
-            if causal and (MASKED_BLOCKS > 1):
-                if l_iter == (tile_iter_end - tile_iter) - 2:
-                    mask = offs_m[:, None] >= offs_n[None, :]
-                    qk = tl.where(mask, qk, float("-inf"))
-                if l_iter == (tile_iter_end - tile_iter) - 1:
-                    mask = (offs_m[:, None] >= BLOCK_N) & (
-                        offs_n[None, :] <= (offs_m[:, None] - BLOCK_N)
-                    )
-                    qk = tl.where(mask, qk, float("-inf"))
+            if causal:
+                # Get the starting column index of the current K block
+                k_start_n = (b_seq_size + l_iter) * BLOCK_N
+                # Create mask based on absolute sequence positions
+                mask = (q_start_m + offs_m[:, None]) >= (k_start_n + offs_n[None, :])
+                # Apply the mask
+                qk = tl.where(mask, qk, float("-inf"))
 
-            if causal and (MASKED_BLOCKS == 1):
-                # if (l_iter == (tile_iter_end - tile_iter) - 1):
-                if (iter + (l_iter - local_iter)) == (tile_iter_end - 1):
-                    mask = offs_m[:, None] >= offs_n[None, :]
-                    qk = tl.where(mask, qk, float("-inf"))
 
             m_ij = tl.maximum(m_i, tl.max(qk, 1))
             qk = qk - m_ij[:, None]
