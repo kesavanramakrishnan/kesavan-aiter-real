@@ -5,7 +5,7 @@ import sys
 import pytest
 import torch
 
-from aiter.ops.triton.lean_atten import persistent_lean_attention
+from aiter.ops.triton.lean_atten_orig import persistent_lean_attention
 
 
 @pytest.mark.parametrize(
