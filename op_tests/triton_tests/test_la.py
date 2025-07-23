@@ -8,6 +8,7 @@ import torch
 from aiter.ops.triton.lean_atten_vgpr_simple import persistent_lean_attention
 
 
+
 @pytest.mark.parametrize(
     "causal, batch, h, n_ctx_q, n_ctx, d, total_programs, init_dtype, BLOCK_M, BLOCK_N, waves_per_eu, num_warps ",
     [
@@ -294,6 +295,7 @@ def main():
     atol = 1.4e-1 if init_dtype == "fp8" else 1e-2
     rtol = 1e-2 if init_dtype == "fp8" else 3e-3
     torch.testing.assert_close(ref_out, la_out, atol=atol, rtol=rtol)
+    #
 
 
 if __name__ == "__main__":
