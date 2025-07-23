@@ -456,7 +456,7 @@ def la_persistent(
         )
         q_ptrs = Q + q_offs
         q_ptrs = tl.multiple_of(q_ptrs, (1, 16))
-        # Place this right after `q_ptrs` is defined
+
         if causal:
             q_start_m = q_idx * BLOCK_M
 

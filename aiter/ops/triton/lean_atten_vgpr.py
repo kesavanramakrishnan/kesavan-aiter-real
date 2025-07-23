@@ -427,6 +427,9 @@ def la_persistent(
         q_ptrs = Q + q_offs
         q_ptrs = tl.multiple_of(q_ptrs, (1, 16))
 
+        if causal:
+            q_start_m = q_idx * BLOCK_M
+
         m_i = tl.zeros([BLOCK_M], dtype=tl.float32) - float("inf")
         l_i = tl.zeros([BLOCK_M], dtype=tl.float32) + 1.0
         acc = tl.zeros([BLOCK_M, HEAD_DIM], dtype=tl.float32)
