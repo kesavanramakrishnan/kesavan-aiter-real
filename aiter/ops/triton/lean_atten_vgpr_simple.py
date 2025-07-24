@@ -54,10 +54,10 @@ def persistent_lean_attention(
     # For MI300, BLOCK_M=128, BLOCK_N=64 is better for performance
     MASKED_BLOCKS = BLOCK_M // BLOCK_N
 
-    if causal:
-        # Only support BLOCK_M is multiple of BLOCK_N
-        # TODO: add other scenarios
-        assert BLOCK_M % BLOCK_N == 0
+    # if causal:
+    #     # Only support BLOCK_M is multiple of BLOCK_N
+    #     # TODO: add other scenarios
+    #     assert BLOCK_M % BLOCK_N == 0
 
     N_CTX_Q = q.shape[0] // batch_size
     N_CTX_K = k.shape[0]  # This is the sum of all ctx_n in a batch
@@ -450,27 +450,34 @@ def la_persistent(
             #    mask = offs_m[:, None] >= offs_n[None, :]
             # Apply the causal mask
             #    qk = tl.where(mask, qk, float("-inf"))
-            if causal and (MASKED_BLOCKS > 1):
-                if l_iter == (tile_iter_end - tile_iter) - 2:
-                    mask = offs_m[:, None] >= offs_n[None, :]
-                    qk = tl.where(mask, qk, float("-inf"))
-                if l_iter == (tile_iter_end - tile_iter) - 1:
-                    mask = (offs_m[:, None] >= BLOCK_N) & (
-                        offs_n[None, :] <= (offs_m[:, None] - BLOCK_N)
-                    )
-                    qk = tl.where(mask, qk, float("-inf"))
+            if causal:
+                # Get the starting column index of the current K block
+                k_start_n = (b_seq_size + l_iter) * BLOCK_N
+                # Create mask based on absolute sequence positions
+                mask = (q_start_m + offs_m[:, None]) >= (k_start_n + offs_n[None, :])
+                # Apply the mask
+                qk = tl.where(mask, qk, float("-inf"))
 
-            if causal and (MASKED_BLOCKS == 1):
-                # if (l_iter == (tile_iter_end - tile_iter) - 1):
-                if (iter + (l_iter - local_iter)) == (tile_iter_end - 1):
-                    mask = offs_m[:, None] >= offs_n[None, :]
-                    qk = tl.where(mask, qk, float("-inf"))
+            # m_ij = tl.maximum(m_i, tl.max(qk, 1))
+            # qk = qk - m_ij[:, None]
+            # p = tl.math.exp2(qk)  # p.shape = [BLOCK_M, BLOCK_N]
+            # # -- update output accumulator --
+            # alpha = tl.math.exp2(m_i - m_ij)
 
             m_ij = tl.maximum(m_i, tl.max(qk, 1))
-            qk = qk - m_ij[:, None]
-            p = tl.math.exp2(qk)  # p.shape = [BLOCK_M, BLOCK_N]
-            # -- update output accumulator --
-            alpha = tl.math.exp2(m_i - m_ij)
+
+            # Prevent NaNs in p calculation
+            p_arg = qk - m_ij[:, None]
+            # If m_ij is -inf, the subtraction results in NaN. Force the argument to -inf instead.
+            p_arg = tl.where(m_ij[:, None] == float("-inf"), float("-inf"), p_arg)
+            p = tl.math.exp2(p_arg)
+
+            # Prevent NaNs in alpha calculation
+            # If m_i and m_ij are both -inf, the subtraction is NaN. Force the argument to 0, so alpha=1.
+            alpha_arg = m_i - m_ij
+            alpha_arg = tl.where(m_ij == float("-inf"), 0.0, alpha_arg)
+            alpha = tl.math.exp2(alpha_arg)
+
             acc = (
                 acc * alpha[:, None]
             )  # Scale each row of acc by the corresponding elements in alpha
@@ -483,16 +490,16 @@ def la_persistent(
             # update m_i
             m_i = m_ij.to(m_i.dtype)
 
-            if (
-                (l_iter == (tile_iter_end - tile_iter) - 1)
-                and (iter == tile_iter_end - 1)
-                and (MASKED_BLOCKS == 2)
-            ):
-                mask1 = offs_m >= BLOCK_N
-                m_i = tl.where(mask1, m_i, float("-inf"))
-                l_i = tl.where(mask1, l_i, 1.0)
-                mask1 = mask1[:, None]
-                acc = tl.where(mask1, acc, 0.0)
+            # if (
+            #     (l_iter == (tile_iter_end - tile_iter) - 1)
+            #     and (iter == tile_iter_end - 1)
+            #     and (MASKED_BLOCKS == 2)
+            # ):
+            #     mask1 = offs_m >= BLOCK_N
+            #     m_i = tl.where(mask1, m_i, float("-inf"))
+            #     l_i = tl.where(mask1, l_i, 1.0)
+            #     mask1 = mask1[:, None]
+            #     acc = tl.where(mask1, acc, 0.0)
 
             # update k/v pointer
             v_ptrs += BLOCK_N * stride_vn

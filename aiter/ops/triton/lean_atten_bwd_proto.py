@@ -1,69 +1,23 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+
+"""
+Lean Attention -- BACKWARD PASS
+===============
+This file adapts the Lean Attention forward pass to perform the backward pass.
+It uses the same Stream-K style tiling strategy to efficiently compute 
+gradients (dQ, dK, dV) using atomic additions for reduction.
+
+The core idea is to linearize the backward pass workload (all q_block vs k_block
+interactions) and distribute it evenly across all SMs.
+"""
+
 import torch
 import triton
 import triton.language as tl
 
 # ==============================================================================
-# PyTorch Autograd Function
-# ==============================================================================
-
-class LeanAttentionBackward(torch.autograd.Function):
-    """
-    Wrapper class to integrate the Lean Attention backward pass into PyTorch's
-    autograd engine.
-    """
-
-    @staticmethod
-    def forward(ctx, q, k, v, out, softmax_lse, config_params):
-        """
-        The forward pass is a no-op from a computational standpoint. Its only
-        role is to save the necessary tensors and parameters for the actual
-        backward pass computation.
-        """
-        ctx.save_for_backward(q, k, v, out, softmax_lse)
-        ctx.config_params = config_params
-        return out
-
-    @staticmethod
-    def backward(ctx, do):
-        """
-        This is the entry point for the backward pass computation.
-        """
-        q, k, v, out, softmax_lse = ctx.saved_tensors
-        dq = torch.empty_like(q)
-        dk = torch.empty_like(k)
-        dv = torch.empty_like(v)
-        
-        # Extract config params to pass them individually to the backward function
-        config_params = ctx.config_params
-        BLOCK_M = config_params.get("BLOCK_M_BWD", 64)
-        BLOCK_N = config_params.get("BLOCK_N_BWD", 64)
-        causal = config_params.get("causal", False)
-        sm_scale = config_params.get("sm_scale", 1.0)
-        num_warps = config_params.get("num_warps", 4)
-        waves_per_eu = config_params.get("waves_per_eu", 2)
-        num_SMs = config_params.get("num_sms", 1)
-
-        # For ragged batching, this would be passed from the forward context
-        batch_num_block_n = torch.empty(0, device=q.device) # Placeholder
-
-        persistent_lean_attention_backward(
-            q, k, v, out, do, softmax_lse,
-            dq, dk, dv,
-            batch_num_block_n,
-            num_SMs, # total_programs
-            BLOCK_M,
-            BLOCK_N,
-            causal,
-            q.shape[0], # batch_size
-            sm_scale,
-            num_warps,
-            waves_per_eu
-        )
-        return dq, dk, dv, None, None, None, None
-
-
-# ==============================================================================
-# Python Wrapper for Triton Kernels
+# Backward Pass Python Launcher
 # ==============================================================================
 
 def persistent_lean_attention_backward(
@@ -79,208 +33,223 @@ def persistent_lean_attention_backward(
     dk: torch.Tensor,
     dv: torch.Tensor,
     # Forward-pass style parameters
-    batch_num_block_n: torch.Tensor,
     total_programs: int,
     BLOCK_M: int,
     BLOCK_N: int,
     causal: bool,
-    batch_size: int,
     sm_scale: torch.float16,
     num_warps: int,
     waves_per_eu: int,
 ):
     """
-    This function acts as the main launcher for the Lean Attention backward pass
-    using the HOST BLOCK reduction method, with a signature similar to the
-    forward pass.
+    Main Python launcher for the Lean Attention backward pass.
     """
+    # shape constraints
+    HEAD_DIM = q.shape[-1]
+    assert HEAD_DIM in {16, 32, 64, 128, 256}
+
+    batch_size, max_seqlen_q, num_heads, _ = q.shape
+    _, max_seqlen_k, num_heads_k, _ = k.shape
+
     # 1. Pre-computation of Delta
     delta = torch.empty_like(softmax_lse)
-    # This launcher would need to be implemented to pass the correct parameters
-    _bwd_preprocess_lean_launcher(out, do, delta, causal, batch_size, total_programs)
+    grid_pre = (triton.cdiv(max_seqlen_q, BLOCK_M), batch_size, num_heads)
+    _bwd_preprocess_lean[grid_pre](
+        out, do, delta,
+        out.stride(0), out.stride(2), out.stride(1), out.stride(3),
+        delta.stride(0), delta.stride(1), delta.stride(2),
+        max_seqlen_q,
+        BLOCK_M=BLOCK_M,
+        HEAD_DIM=HEAD_DIM,
+    )
 
-    # Extract parameters for the split calculation function
-    num_heads = q.shape[2]
-    num_heads_k = k.shape[2]
-    max_seqlen_q = q.shape[1]
-    max_seqlen_k = k.shape[1]
-
-    # 2. Calculate Stream-K splits and buffer sizes.
+    # 2. Calculate Stream-K splits for the main backward workload.
     (
         total_tiles,
         tiles_per_cta,
         high_load_wgs,
-        num_splits,
-        grid_size
-    ) = get_num_splits_and_buffer_sizes(
-        causal,
-        batch_size,
-        max_seqlen_q,
-        max_seqlen_k,
-        num_heads,
-        num_heads_k,
-        BLOCK_M,
-        BLOCK_N,
-        total_programs # num_SMs
+        grid_size,
+        num_m_blocks,
+        num_n_blocks,
+        tiles_per_head,
+        tiles_per_batch
+    ) = get_num_splits_and_buffer_sizes_bwd(
+        causal, batch_size, max_seqlen_q, max_seqlen_k,
+        num_heads, num_heads_k, BLOCK_M, BLOCK_N, total_programs
     )
 
-    # 3. Allocate temporary buffers for host-block reduction.
-    # These are analogous to Mp, Lp, Op in the forward pass.
-    partial_dq = torch.empty((grid_size, *q.shape[2:]), device=q.device, dtype=torch.float32)
-    partial_dk = torch.empty((grid_size, *k.shape[2:]), device=k.device, dtype=torch.float32)
-    partial_dv = torch.empty((grid_size, *v.shape[2:]), device=v.device, dtype=torch.float32)
-    locks = torch.zeros((grid_size,), device=q.device, dtype=torch.int32)
-
-    # 4. Launch the main backward kernel.
+    # 3. Launch the main backward kernel.
     grid = (grid_size, 1, 1)
     la_persistent_bwd[grid](
+        # Inputs
         q, k, v, do, delta, softmax_lse,
+        # Outputs
         dq, dk, dv,
-        partial_dq, partial_dk, partial_dv, # Pass partial buffers
-        locks, # Pass locks
-        # Pass strides, shapes, and other config parameters...
+        # Strides
+        q.stride(0), q.stride(2), q.stride(1), q.stride(3),
+        k.stride(0), k.stride(2), k.stride(1), k.stride(3),
+        v.stride(0), v.stride(2), v.stride(1), v.stride(3),
+        do.stride(0), do.stride(2), do.stride(1), do.stride(3),
+        dq.stride(0), dq.stride(2), dq.stride(1), dq.stride(3),
+        dk.stride(0), dk.stride(2), dk.stride(1), dk.stride(3),
+        dv.stride(0), dv.stride(2), dv.stride(1), dv.stride(3),
+        delta.stride(0), delta.stride(1), delta.stride(2),
+        # Dimensions
+        max_seqlen_q, max_seqlen_k, num_heads, num_heads_k,
+        # Block sizes & Compile-Time Constants
+        BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, HEAD_DIM=HEAD_DIM,
+        NUM_M_BLOCKS=num_m_blocks, NUM_N_BLOCKS=num_n_blocks,
+        TILES_PER_HEAD=tiles_per_head, TILES_PER_BATCH=tiles_per_batch,
+        # Lean / Stream-K parameters
         total_tiles=total_tiles,
         tiles_per_cta=tiles_per_cta,
         high_load_wgs=high_load_wgs,
-        num_splits=num_splits,
+        sm_scale=sm_scale,
+        causal=causal,
         num_warps=num_warps,
-        # ... other parameters
     )
-
-    return dq, dk, dv
-
-
-def _bwd_preprocess_lean_launcher(out, do, delta, causal, batch_size, total_programs):
-    """
-    Launches the Triton kernel to compute the initial delta values.
-    delta = rowsum(dO * O)
-    """
-    pass
-
-
-def get_num_splits_and_buffer_sizes(
-    causal,
-    batch_size,
-    max_seqlen_q,
-    max_seqlen_k,
-    num_heads,
-    num_heads_k,
-    BLOCK_M,
-    BLOCK_N,
-    num_SMs,
-):
-    """
-    Calculates parameters for Stream-K workload distribution and host-block
-    reduction for the backward pass.
-    """
-    grid_size = num_SMs
-
-    num_m_blocks = (max_seqlen_q + BLOCK_M - 1) // BLOCK_M
-    num_n_blocks = (max_seqlen_k + BLOCK_N - 1) // BLOCK_N
-
-    # In the backward pass, we always compute the full rectangular grid of tiles
-    # to calculate the gradients, regardless of whether the forward pass was causal.
-    # The causality is handled inside the kernel by masking.
-    total_tiles = batch_size * num_heads * num_m_blocks * num_n_blocks
-
-    # This logic is identical to the forward pass distribution.
-    # It determines how many tiles each CTA gets.
-    tiles_per_cta = total_tiles // grid_size
-    high_load_wgs = total_tiles % grid_size
-
-    # This logic is now needed for the host-block reduction.
-    # It calculates how many partial results a host block needs to reduce.
-    # This is a simplified version; the actual logic can be more complex
-    # depending on how tiles are mapped to output blocks.
-    if total_tiles % grid_size == 0:
-        # If the work is evenly divisible, the reduction logic is simpler.
-        num_splits = 1 + ((num_n_blocks + tiles_per_cta - 2) // tiles_per_cta)
-    else:
-        # If not, the logic is more complex.
-        num_splits = 1 + ((num_n_blocks + tiles_per_cta - 3) // (tiles_per_cta - 1))
-
-    return total_tiles, tiles_per_cta, high_load_wgs, num_splits, grid_size
-
+    return
 
 # ==============================================================================
-# Triton Kernels
+# Workload Calculation Function
+# ==============================================================================
+
+def get_num_splits_and_buffer_sizes_bwd(
+    causal, batch_size, max_seqlen_q, max_seqlen_k,
+    num_heads, num_heads_k, BLOCK_M, BLOCK_N, num_SMs,
+):
+    grid_size = num_SMs
+    num_m_blocks = (max_seqlen_q + BLOCK_M - 1) // BLOCK_M
+    num_n_blocks = (max_seqlen_k + BLOCK_N - 1) // BLOCK_N
+    
+    # Assert that divisors will be non-zero
+    assert num_m_blocks > 0 and num_n_blocks > 0 and num_heads > 0
+    
+    tiles_per_head = num_m_blocks * num_n_blocks
+    tiles_per_batch = num_heads * tiles_per_head
+    total_tiles = batch_size * tiles_per_batch
+
+    tiles_per_cta = total_tiles // grid_size
+    high_load_wgs = total_tiles % grid_size
+    
+    return total_tiles, tiles_per_cta, high_load_wgs, grid_size, num_m_blocks, num_n_blocks, tiles_per_head, tiles_per_batch
+
+# ==============================================================================
+# Triton Kernels for Backward Pass
 # ==============================================================================
 
 @triton.jit
 def _bwd_preprocess_lean(
     o_ptr, do_ptr, delta_ptr,
-    # ... other strides and parameters
+    stride_o_b, stride_o_h, stride_o_m, stride_o_k,
+    stride_delta_b, stride_delta_h, stride_delta_m,
+    max_seqlen_q,
+    BLOCK_M: tl.constexpr, HEAD_DIM: tl.constexpr,
 ):
-    """
-    Triton Kernel: Computes the initial delta term.
-    delta = rowsum(dO * O)
-    """
-    pass
+    pid_m = tl.program_id(0)
+    bid = tl.program_id(1)
+    hid = tl.program_id(2)
+
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_k = tl.arange(0, HEAD_DIM)
+    mask_m = offs_m < max_seqlen_q
+
+    o_offs = (bid * stride_o_b + hid * stride_o_h +
+              offs_m[:, None] * stride_o_m + offs_k[None, :] * stride_o_k)
+    do_offs = (bid * stride_o_b + hid * stride_o_h +
+               offs_m[:, None] * stride_o_m + offs_k[None, :] * stride_o_k)
+
+    o = tl.load(o_ptr + o_offs, mask=mask_m[:, None], other=0.0)
+    do = tl.load(do_ptr + do_offs, mask=mask_m[:, None], other=0.0)
+
+    delta = tl.sum(o * do, axis=1)
+
+    delta_offs = (bid * stride_delta_b + hid * stride_delta_h + offs_m * stride_delta_m)
+    tl.store(delta_ptr + delta_offs, delta, mask=mask_m)
 
 
 @triton.jit
 def la_persistent_bwd(
-    # Input Tensors
+    # Pointers to Tensors
     q_ptr, k_ptr, v_ptr, do_ptr, delta_ptr, lse_ptr,
-    # Output Gradient Tensors
     dq_ptr, dk_ptr, dv_ptr,
-    # Partial buffers for host-block reduction
-    partial_dq_ptr, partial_dk_ptr, partial_dv_ptr,
-    locks_ptr,
-    # Strides, shapes, etc...
-    # ...
-    # Stream-K / Lean Attention parameters
+    # Strides
+    stride_qb, stride_qh, stride_qm, stride_qd,
+    stride_kb, stride_kh, stride_kn, stride_kd,
+    stride_vb, stride_vh, stride_vn, stride_vd,
+    stride_dob, stride_doh, stride_dom, stride_dod,
+    stride_dqb, stride_dqh, stride_dqm, stride_dqd,
+    stride_dkb, stride_dkh, stride_dkn, stride_dkd,
+    stride_dvb, stride_dvh, stride_dvn, stride_dvd,
+    stride_deltab, stride_deltah, stride_deltam,
+    # Dimensions
+    max_seqlen_q, max_seqlen_k, num_heads, num_heads_k,
+    # Block sizes & Compile-Time Constants
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, HEAD_DIM: tl.constexpr,
+    NUM_M_BLOCKS: tl.constexpr, NUM_N_BLOCKS: tl.constexpr,
+    TILES_PER_HEAD: tl.constexpr, TILES_PER_BATCH: tl.constexpr,
+    # Lean Attention parameters
     total_tiles: tl.constexpr,
     tiles_per_cta: tl.constexpr,
     high_load_wgs: tl.constexpr,
-    num_splits: tl.constexpr,
-    # ...
+    sm_scale: tl.constexpr,
+    causal: tl.constexpr,
 ):
-    """
-    Triton Kernel: Main fused backward kernel using HOST-BLOCK reduction.
-    """
     pid = tl.program_id(0)
 
     # 1. Determine the range of tiles for this specific CTA.
-    # ... calculate start_tile and end_tile for this CTA ...
+    num_tiles_per_cta = tl.where(pid < high_load_wgs, tiles_per_cta + 1, tiles_per_cta)
+    start_tile = tl.where(pid < high_load_wgs, pid * (tiles_per_cta + 1),
+                          high_load_wgs * (tiles_per_cta + 1) + (pid - high_load_wgs) * tiles_per_cta)
+    end_tile = start_tile + num_tiles_per_cta
 
     # 2. Main loop over the assigned range of tiles.
-    # while current_tile < end_tile:
-        # a. Map linear `current_tile` back to (batch, head, q_block, k_block).
-        # b. Determine if this CTA is the HOST for the output gradient blocks
-        #    (dq_block, dk_block, dv_block) corresponding to this tile.
-        #    This is typically true if the CTA is processing the *first* tile
-        #    that contributes to a given output block.
-        #
-        # c. Load data and compute partial gradients (partial_dq, partial_dk, etc.)
-        #    for the current tile, same as before.
-        #
-        # d. HOST vs. WORKER reduction logic:
-        #
-        #    if IS_WORKER_FOR_THIS_BLOCK:
-        #        // This CTA is not the host for the current output block.
-        #        // It writes its partial result to the temporary global buffer.
-        #        tl.store(partial_dq_ptr + offset, partial_dq)
-        #        // Signal completion to the host.
-        #        tl.atomic_xchg(locks_ptr + lock_id, 1)
-        #
-        #    if IS_HOST_FOR_THIS_BLOCK:
-        #        // This CTA is the host. It must wait for all workers.
-        #        // It computes its own partial result first.
-        #
-        #        // Loop and wait for all workers for this block to finish.
-        #        for i in range(num_splits - 1):
-        #            while tl.atomic_cas(locks_ptr + worker_lock_id, 1, 1) != 1:
-        #                pass // Spin-wait
-        #
-        #        // All workers are done. Load their partial results and reduce.
-        #        for i in range(num_splits - 1):
-        #            worker_partial_dq = tl.load(partial_dq_ptr + worker_offset)
-        #            my_partial_dq += worker_partial_dq
-        #
-        #        // Write the final, fully reduced gradient block to output.
-        #        tl.store(dq_ptr + final_offset, my_partial_dq)
-        #
-        # g. Advance to the next tile.
-        #    current_tile += 1
-    pass
+    for current_tile in range(start_tile, end_tile):
+        # a. Map the linear `current_tile` index back to the 4D grid.
+        batch_idx = current_tile // TILES_PER_BATCH
+        head_tile_idx = current_tile % TILES_PER_BATCH
+        head_idx = head_tile_idx // TILES_PER_HEAD
+        block_tile_idx = head_tile_idx % TILES_PER_HEAD
+        m_block_idx = block_tile_idx // NUM_N_BLOCKS
+        n_block_idx = block_tile_idx % NUM_N_BLOCKS
+        
+        # --- Core Gradient Computation for one tile ---
+        offs_m = m_block_idx * BLOCK_M + tl.arange(0, BLOCK_M)
+        offs_n = n_block_idx * BLOCK_N + tl.arange(0, BLOCK_N)
+        offs_d = tl.arange(0, HEAD_DIM)
+        
+        q_ptrs = q_ptr + (batch_idx * stride_qb + head_idx * stride_qh + offs_m[:, None] * stride_qm + offs_d[None, :] * stride_qd)
+        k_ptrs = k_ptr + (batch_idx * stride_kb + head_idx * stride_kh + offs_n[None, :] * stride_kn + offs_d[:, None] * stride_kd)
+        v_ptrs = v_ptr + (batch_idx * stride_vb + head_idx * stride_vh + offs_n[:, None] * stride_vn + offs_d[None, :] * stride_vd)
+        do_ptrs = do_ptr + (batch_idx * stride_dob + head_idx * stride_doh + offs_m[:, None] * stride_dom + offs_d[None, :] * stride_dod)
+        lse_ptrs = lse_ptr + batch_idx * stride_deltab + head_idx * stride_deltah + offs_m
+        delta_ptrs = delta_ptr + batch_idx * stride_deltab + head_idx * stride_deltah + offs_m
+        
+        mask_m = offs_m < max_seqlen_q
+        mask_n = offs_n < max_seqlen_k
+        
+        q_tile = tl.load(q_ptrs, mask=mask_m[:, None], other=0.0)
+        k_tile = tl.load(k_ptrs, mask=mask_n[None, :], other=0.0)
+        v_tile = tl.load(v_ptrs, mask=mask_n[:, None], other=0.0)
+        do_tile = tl.load(do_ptrs, mask=mask_m[:, None], other=0.0)
+        lse_tile = tl.load(lse_ptrs, mask=mask_m, other=0.0)
+        delta_tile = tl.load(delta_ptrs, mask=mask_m, other=0.0)
+        
+        qk_tile = tl.dot(q_tile, tl.trans(k_tile)) * sm_scale
+        if causal: qk_tile += tl.where((offs_m[:, None] >= offs_n[None, :]), 0, float("-inf"))
+        p_tile = tl.exp(qk_tile - lse_tile[:, None])
+        
+        partial_dv = tl.dot(tl.trans(p_tile.to(do_tile.dtype)), do_tile)
+        dp_tile = tl.dot(do_tile, tl.trans(v_tile))
+        ds_tile = p_tile * (dp_tile - delta_tile[:, None])
+        partial_dq = tl.dot(ds_tile.to(k_tile.dtype), k_tile) * sm_scale
+        partial_dk = tl.dot(tl.trans(ds_tile.to(q_tile.dtype)), q_tile) * sm_scale
+        
+        # --- Reduction using atomic adds ---
+        dq_out_ptrs = dq_ptr + (batch_idx * stride_dqb + head_idx * stride_dqh + offs_m[:, None] * stride_dqm + offs_d[None, :] * stride_dqd)
+        dk_out_ptrs = dk_ptr + (batch_idx * stride_dkb + head_idx * stride_dkh + offs_n[:, None] * stride_dkn + offs_d[None, :] * stride_dkd)
+        dv_out_ptrs = dv_ptr + (batch_idx * stride_dvb + head_idx * stride_dvh + offs_n[:, None] * stride_dvn + offs_d[None, :] * stride_dvd)
+
+        tl.atomic_add(dq_out_ptrs, partial_dq, mask=mask_m[:, None])
+        tl.atomic_add(dk_out_ptrs, partial_dk, mask=mask_n[:, None])
+        tl.atomic_add(dv_out_ptrs, partial_dv, mask=mask_n[:, None])
