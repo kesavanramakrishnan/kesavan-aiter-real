@@ -407,7 +407,7 @@ def la_persistent_bwd(
         # Calculate index of current head output tile
         # The tiles_per_head is the sum of # BLOCK_N in K/V sequence of all batches
         tile_head_idx = iter // tiles_per_head
-
+        #TODO: add in o load
         # To generate an otuput tile, a loop over [tile_iter, tile_iter_end) lean tiles is needed
         # [tile_iter, tile_iter_end) are in the form of global tile id
         if causal:
@@ -549,7 +549,10 @@ def la_persistent_bwd(
             p = tl.math.exp2(qk)  # p.shape = [BLOCK_M, BLOCK_N]
             pT = tl.trans(p)  # pT.shape = [BLOCK_N, BLOCK_M]
 
-            dV = tl.dot(pT.to(do.type.element_ty), do)
+            dV = tl.dot(pT.to(do.type.element_ty), do) # calculate dV
+
+            dPT = tl.dot(do.to(pT.type.element_ty), tl.trans(v)) # calculate dP
+
             # -- update output accumulator --
             alpha = tl.math.exp2(m_i - m_ij)
             acc = (
