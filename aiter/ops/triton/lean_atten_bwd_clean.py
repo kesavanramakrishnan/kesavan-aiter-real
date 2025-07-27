@@ -551,7 +551,20 @@ def la_persistent_bwd(
 
             dV = tl.dot(pT.to(do.type.element_ty), do) # calculate dV
 
-            dPT = tl.dot(do.to(pT.type.element_ty), tl.trans(v)) # calculate dP
+            v = tl.load(v_ptrs)
+
+            dPT = tl.dot(v.to(do.dtype), tl.trans(do)) # calculate dP
+
+            dST_block = pT * (dPT_block - delta[None, :])
+
+            dk_block = tl.dot(dST_block.to(q.dtype), q) * sm_scale
+
+            # 5. Atomically add the block gradients to global memory
+            dk_store_ptrs = dk_ptr + (k_ptrs - k_ptr)
+            dv_store_ptrs = dv_ptr + (v_ptrs - v_ptr)
+
+            tl.atomic_add(dk_store_ptrs, dk_block.to(dk_ptr.dtype.element_ty), mask=offs_n[:, None] < max_seqlen_k)
+            tl.atomic_add(dv_store_ptrs, dv_block.to(dv_ptr.dtype.element_ty), mask=offs_n[:, None] < max_seqlen_k)
 
             # -- update output accumulator --
             alpha = tl.math.exp2(m_i - m_ij)
@@ -567,16 +580,16 @@ def la_persistent_bwd(
             # update m_i
             m_i = m_ij.to(m_i.dtype)
 
-            if (
-                (l_iter == (tile_iter_end - tile_iter) - 1)
-                and (iter == tile_iter_end - 1)
-                and (MASKED_BLOCKS == 2)
-            ):
-                mask1 = offs_m >= BLOCK_N
-                m_i = tl.where(mask1, m_i, float("-inf"))
-                l_i = tl.where(mask1, l_i, 1.0)
-                mask1 = mask1[:, None]
-                acc = tl.where(mask1, acc, 0.0)
+            # if (
+            #     (l_iter == (tile_iter_end - tile_iter) - 1)
+            #     and (iter == tile_iter_end - 1)
+            #     and (MASKED_BLOCKS == 2)
+            # ):
+            #     mask1 = offs_m >= BLOCK_N
+            #     m_i = tl.where(mask1, m_i, float("-inf"))
+            #     l_i = tl.where(mask1, l_i, 1.0)
+            #     mask1 = mask1[:, None]
+            #     acc = tl.where(mask1, acc, 0.0)
 
             # update k/v pointer
             v_ptrs += BLOCK_N * stride_vn
@@ -592,12 +605,12 @@ def la_persistent_bwd(
             # Update pointers of partial results Mp[cta], Lp[cta], Op[cta]
             mp_ptrs = Mp + current_pid * BLOCK_M + offs_m
             lp_ptrs = Lp + current_pid * BLOCK_M + offs_m
-            op_ptrs = (
-                Op
-                + current_pid * stride_oph  # stride_oph is total_program dimension
-                + offs_m[:, None] * stride_opm
-                + offs_k[None, :] * stride_opn
-            )
+            # op_ptrs = (
+            #     Op
+            #     + current_pid * stride_oph  # stride_oph is total_program dimension
+            #     + offs_m[:, None] * stride_opm
+            #     + offs_k[None, :] * stride_opn
+            # )
 
             tl.store(mp_ptrs, m_i, cache_modifier=".wt")
             tl.store(lp_ptrs, l_i, cache_modifier=".wt")
