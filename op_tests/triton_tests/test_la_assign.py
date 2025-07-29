@@ -358,9 +358,7 @@ def test_persistent_lean_attention(
         sm_scale,
         num_warps,
         waves_per_eu,
-        # max_output_tile_cnt,
-        sum_n_ctx,
-        h
+        max_output_tile_cnt,
     )
 
     # Calculate Pytorch refence output
@@ -510,7 +508,7 @@ def main():
         sm_scale,
         num_warps,
         waves_per_eu,
-        max_output_tile_cnt,
+        max_output_tile_cnt
     )
     # print(f"ms={ms}")
     # Calculate Pytorch refence output

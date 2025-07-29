@@ -23,7 +23,7 @@ import torch
 import triton
 import triton.language as tl
 
-from .utils.index_max_tiles import calculate_max_output_tiles_analytically
+from .utils.index_max_tiles import precompute_lean_attention_indices
 
 
 # Support tensor in [B, Seqlen, H, d] format. Taking tensors in [B*Seqlen, H, d] as inputs
@@ -43,7 +43,7 @@ def persistent_lean_attention(
     batch_size: int,
     sm_scale: torch.float16,
     num_warps: int,
-    waves_per_eu: int
+    waves_per_eu: int,
     # max_output_tile_cnt: int,
 ):
     # shape constraints
@@ -68,11 +68,10 @@ def persistent_lean_attention(
 
     qk_scale = sm_scale * 1.44269504
 
-    max_output_tile_cnt = calculate_max_output_tiles_analytically(
+    max_output_tile_cnt, tile_indices, tiles_per_head_per_batch = precompute_lean_attention_indices(
         causal=causal, batch_size=batch_size, max_seqlen_q=N_CTX_Q, max_seqlen_k=N_CTX_K,
         num_heads=H, num_SMs=total_programs, BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N,
     )
-    max_output_tile_cnt += 4
 
     (
         num_m_blocks,
@@ -106,6 +105,9 @@ def persistent_lean_attention(
 
     o = torch.empty_like(q, dtype=v.dtype)
 
+    if tile_indices is None and causal:
+        tile_indices = torch.empty((0, 3), dtype=torch.int32, device="cuda")
+
     """
     kernel_timing = {
         "attn_fwd": {
@@ -130,6 +132,7 @@ def persistent_lean_attention(
         o,
         batch_num_block_n,
         locks,
+        tile_indices,
         q.stride(0),  # N_CTX_Q
         q.stride(1),  # H
         q.stride(2),  # Head_Dim
@@ -163,6 +166,7 @@ def persistent_lean_attention(
         num_warps=num_warps,
         num_stages=1,
         num_ctas=1,
+        tiles_per_head_per_batch=tiles_per_head_per_batch
     )
     """
     kernel_timing["attn_fwd"]["end_event"].record()
@@ -172,9 +176,9 @@ def persistent_lean_attention(
         kernel_timing[k]["ms"] += ms
     total_ms = kernel_timing["attn_fwd"]["ms"]
     """
-    print(f"la kernel {la_kernel.n_regs} registers used, {la_kernel.n_spills} spills")
+    # print(f"la kernel {la_kernel.n_regs} registers used, {la_kernel.n_spills} spills")
     ms = 0
-    return o
+    return o, ms
 
 
 def get_num_splits_and_buffer_sizes(
@@ -281,7 +285,7 @@ def find_group(x, MASKED_BLOCKS: tl.constexpr, num_m_blocks: tl.constexpr):
         task_size = (q_block_idx + 1) * MASKED_BLOCKS
 
         # Check if the global tile `x` falls within this task's range
-        if total_blocks_processed + task_size > x and found == False:
+        if total_blocks_processed + task_size > x and not found:
             # We found it. Return the Q index, the size of its workload, and its starting tile.
             final_q_block_idx, final_task_size, final_total_blocks = (
                 q_block_idx,
@@ -310,6 +314,7 @@ def la_persistent(
     Out,
     batch_num_block_n,
     locks,
+    Tile_Indices,
     stride_qm,  # n_ctx_q
     stride_qh,  # Head
     stride_qk,  # head_dim
@@ -339,11 +344,26 @@ def la_persistent(
     tiles_per_head: tl.constexpr,
     num_splits: tl.constexpr,
     max_output_tile_cnt: tl.constexpr,
+    tiles_per_head_per_batch: tl.constexpr,
 ):
+
+    MAX_TILES_SRAM = 8192
     if is_pod:
         current_pid = pod_pid
     else:
         current_pid = tl.program_id(0)
+
+    sram_q_idx = tl.zeros((MAX_TILES_SRAM,), dtype=tl.int32)
+    sram_task_size = tl.zeros((MAX_TILES_SRAM,), dtype=tl.int32)
+    sram_start_offset = tl.zeros((MAX_TILES_SRAM,), dtype=tl.int32)
+
+
+    if causal:
+        offs = tl.arange(0, MAX_TILES_SRAM)
+        mask = offs < tiles_per_head_per_batch
+        sram_q_idx = tl.load(Tile_Indices + offs * 3 + 0, mask=mask, other=0)
+        sram_task_size = tl.load(Tile_Indices + offs * 3 + 1, mask=mask, other=0)
+        sram_start_offset = tl.load(Tile_Indices + offs * 3 + 2, mask=mask, other=0)
 
     if current_pid < high_load_wgs:
         iter = max_tiles_per_wg * current_pid
@@ -385,6 +405,9 @@ def la_persistent(
                 iter=iter,
                 cta_end_tile_gid=cta_end_tile_gid,
                 current_pid=current_pid,
+                SRAM_Q_Idx=sram_q_idx, 
+                SRAM_Task_Size=sram_task_size, 
+                SRAM_Start_Offset=sram_start_offset,
                 HEAD_DIM=HEAD_DIM,
                 BLOCK_M=BLOCK_M,
                 BLOCK_N=BLOCK_N,
@@ -431,6 +454,9 @@ def la_persistent_inner(
     iter,
     cta_end_tile_gid,
     current_pid,
+    SRAM_Q_Idx, 
+    SRAM_Task_Size, 
+    SRAM_Start_Offset,
     HEAD_DIM: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
@@ -470,25 +496,35 @@ def la_persistent_inner(
     # [tile_iter, tile_iter_end) are in the form of global tile id
     if causal:
         tile_batch_idx = (iter % tiles_per_head) // (tiles_per_head // batch_size)
-        # Does not support ragged batching. All requests in the batch have the same context length (per_head_tile_size)
-        # tiles_per_head: total sum of # BLOCK_N in K/V sequence of all batches
-        # per_head_tile_size: per head # BLOCK_N of each output tile
-        per_head_tile_idx, per_head_tile_size, total_blocks = find_group(
-            iter
-            - (tile_head_idx * tiles_per_head)
-            - (tile_batch_idx * (tiles_per_head // batch_size)),
-            MASKED_BLOCKS,
-            num_m_blocks,
-        )
-        tile_iter = (
-            tile_head_idx * tiles_per_head
-            + (tile_batch_idx * (tiles_per_head // batch_size))
-            + total_blocks
-        )
-        tile_iter_end = tile_iter + (per_head_tile_size)
-        tile_idx = (
-            tile_head_idx * batch_size + tile_batch_idx
-        ) * num_m_blocks + per_head_tile_idx
+        local_tile_idx = iter % (tiles_per_head // batch_size)
+        per_head_tile_idx = SRAM_Q_Idx[local_tile_idx]
+        per_head_tile_size = SRAM_Task_Size[local_tile_idx]
+        total_blocks = SRAM_Start_Offset[local_tile_idx]
+        # --------------------------------------------------------
+
+        tile_iter = tile_head_idx * tiles_per_head + tile_batch_idx * (tiles_per_head // batch_size) + total_blocks
+        tile_iter_end = tile_iter + per_head_tile_size
+        tile_idx = (tile_head_idx * batch_size + tile_batch_idx) * num_m_blocks + per_head_tile_idx
+        # tile_batch_idx = (iter % tiles_per_head) // (tiles_per_head // batch_size)
+        # # Does not support ragged batching. All requests in the batch have the same context length (per_head_tile_size)
+        # # tiles_per_head: total sum of # BLOCK_N in K/V sequence of all batches
+        # # per_head_tile_size: per head # BLOCK_N of each output tile
+        # per_head_tile_idx, per_head_tile_size, total_blocks = find_group(
+        #     iter
+        #     - (tile_head_idx * tiles_per_head)
+        #     - (tile_batch_idx * (tiles_per_head // batch_size)),
+        #     MASKED_BLOCKS,
+        #     num_m_blocks,
+        # )
+        # tile_iter = (
+        #     tile_head_idx * tiles_per_head
+        #     + (tile_batch_idx * (tiles_per_head // batch_size))
+        #     + total_blocks
+        # )
+        # tile_iter_end = tile_iter + (per_head_tile_size)
+        # tile_idx = (
+        #     tile_head_idx * batch_size + tile_batch_idx
+        # ) * num_m_blocks + per_head_tile_idx
     else:
         tile_idx = (
             tile_head_idx * batch_size
@@ -509,30 +545,17 @@ def la_persistent_inner(
             req_size = next_req_size
     # Local lean tile ID within a loop of an output tile
     local_iter = iter - tile_iter
-
-    host_block = iter == tile_iter
-    stole_last_tile = cta_end_tile_gid == (tile_iter_end - 1)
-
-    # Determine the number of tiles this WG will process for the current output tile.
     local_iter_end = tl.minimum(tile_iter_end, cta_end_tile_gid) - tile_iter
-    if stole_last_tile:
-        local_iter_end += 1
 
-    # 'host_is_finishing' tells the host if it's the sole contributor for this tile,
-    # which means it doesn't need to perform a reduction with other WGs.
-    host_is_finishing = (cta_end_tile_gid >= tile_iter_end) or (
-        stole_last_tile and host_block
-    )
-
-    # if iter == tile_iter:
-    #     host_block = True
-    # else:
-    #     host_block = False
-    # # finishing_block: the output tile is finished within this block
-    # if cta_end_tile_gid >= tile_iter_end:
-    #     finishing_block = True
-    # else:
-    #     finishing_block = False
+    if iter == tile_iter:
+        host_block = True
+    else:
+        host_block = False
+    # finishing_block: the output tile is finished within this block
+    if cta_end_tile_gid >= tile_iter_end:
+        finishing_block = True
+    else:
+        finishing_block = False
 
     offs_m = tl.arange(0, BLOCK_M)
     offs_n = tl.arange(0, BLOCK_N)
@@ -630,16 +653,16 @@ def la_persistent_inner(
         l_i = l_i * alpha + l_ij
         # update m_i
         m_i = m_ij.to(m_i.dtype)
-        # if (
-        #     (l_iter == (tile_iter_end - tile_iter) - 1)
-        #     and (iter == tile_iter_end - 1)
-        #     and (MASKED_BLOCKS == 2)
-        # ):
-        #     mask1 = offs_m >= BLOCK_N
-        #     m_i = tl.where(mask1, m_i, float("-inf"))
-        #     l_i = tl.where(mask1, l_i, 1.0)
-        #     mask1 = mask1[:, None]
-        #     acc = tl.where(mask1, acc, 0.0)
+        if (
+            (l_iter == (tile_iter_end - tile_iter) - 1)
+            and (iter == tile_iter_end - 1)
+            and (MASKED_BLOCKS == 2)
+        ):
+            mask1 = offs_m >= BLOCK_N
+            m_i = tl.where(mask1, m_i, float("-inf"))
+            l_i = tl.where(mask1, l_i, 1.0)
+            mask1 = mask1[:, None]
+            acc = tl.where(mask1, acc, 0.0)
         # update k/v pointer
         v_ptrs += BLOCK_N * stride_vn
         k_ptrs += BLOCK_N * stride_kn
@@ -678,14 +701,14 @@ def la_persistent_inner(
         acc0, acc1 = tl.split(acc_permuted)
 
         # o_h_offs = (
-        #     q_idx * BLOCK_M * stride_om
-        #     + tile_head_idx * stride_oh
-        #     + offs_m[:, None] * stride_om
-        #     + offs_k[None, :] * stride_on
+        #    q_idx * BLOCK_M * stride_om
+        #    + tile_head_idx * stride_oh
+        #    + offs_m[:, None] * stride_om
+        #    + offs_k[None, :] * stride_on
         # )
         # o_ptrs = Out + o_h_offs
 
-        if not host_is_finishing:
+        if not finishing_block:
             # if host not finishing_block: # another CTA is processing the end of the output tile and store partial results
 
             last_cta = current_pid + 1
@@ -774,6 +797,7 @@ def la_persistent_inner(
             + (tl.arange(0, HEAD_DIM // 2)[None, :] + HEAD_DIM // 2) * stride_on
         )
 
+        l_i = tl.where(l_i > 0, l_i, 1.0)
         acc0 = acc0 / l_i[:, None]
         acc1 = acc1 / l_i[:, None]
         tl.store(o_ptrs0, acc0.to(Out.type.element_ty))
