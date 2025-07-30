@@ -154,7 +154,7 @@ def calculate_max_output_tiles_analytically(
     causal: bool,
     batch_size: int,
     max_seqlen_q: int,
-    max_seqlen_k: int,
+    n_ctx: list[int],
     num_heads: int,
     num_SMs: int,
     BLOCK_M: int,
@@ -163,7 +163,15 @@ def calculate_max_output_tiles_analytically(
     """
     Calculates the maximum number of output tiles any single workgroup will process
     using a fast, analytical method with binary search.
+
+    This version is corrected to robustly handle both causal and non-causal attention
+    with batching and ragged sequence lengths.
+
+    Args:
+        n_ctx (list[int]): A list of sequence lengths for each item in the batch.
+                           This is required for accurate non-causal ragged calculation.
     """
+    max_seqlen_k = sum(n_ctx)
     MASKED_BLOCKS = BLOCK_M // BLOCK_N
     if causal and BLOCK_M % BLOCK_N != 0:
         raise ValueError("For causal, BLOCK_M must be a multiple of BLOCK_N")
@@ -188,17 +196,26 @@ def calculate_max_output_tiles_analytically(
     if num_wgs == 0:
         return 0
 
-    m_block_boundaries = []
+    boundaries = []
     if causal:
-        # Pre-compute the boundaries of each M-block's workload for a single head.
-        # This list will be used for binary searches.
+        # For causal, the boundaries are defined by the end of each M-block's workload
+        # within a single batch item.
         total_blocks = 0
         for i in range(num_m_blocks):
             pair_idx = i // 2
             q_block_idx = pair_idx if (i % 2) == 0 else num_m_blocks - 1 - pair_idx
             task_size = (q_block_idx + 1) * MASKED_BLOCKS
             total_blocks += task_size
-            m_block_boundaries.append(total_blocks)
+            boundaries.append(total_blocks)
+    else:
+        # For non-causal, the boundaries are defined by the end of each batch item's workload.
+        num_m_blocks_non_causal = (max_seqlen_q + BLOCK_M - 1) // BLOCK_M
+        n_blocks_per_item = [(n + BLOCK_N - 1) // BLOCK_N for n in n_ctx]
+        tiles_per_item = [num_m_blocks_non_causal * n_blocks for n_blocks in n_blocks_per_item]
+        total_tiles = 0
+        for tiles in tiles_per_item:
+            total_tiles += tiles
+            boundaries.append(total_tiles)
 
     max_total_output_tiles = 0
     # Loop through each workgroup to find the one that spans the most output tiles.
@@ -221,28 +238,32 @@ def calculate_max_output_tiles_analytically(
         # Loop through each head this workgroup touches
         for head_idx in range(start_head, end_head + 1):
             head_start_iter = head_idx * tiles_per_head
-
-            # Find the intersection of the WG's range and the current head's range
             wg_start_in_head = max(start_iter, head_start_iter)
             wg_end_in_head = min(end_iter, head_start_iter + tiles_per_head)
 
             if not causal:
-                # For non-causal, each head is one output tile.
-                total_output_tiles_for_wg += 1
-                continue
+                # For non-causal, use batch boundaries
+                relative_start = wg_start_in_head - head_start_iter
+                relative_end = wg_end_in_head - head_start_iter
+                start_idx = bisect_right(boundaries, relative_start)
+                end_idx = bisect_right(boundaries, relative_end - 1)
+                total_output_tiles_for_wg += (end_idx - start_idx) + 1
+            else:
+                # For causal, we must loop through each batch item within the head
+                tiles_per_head_per_batch = tiles_per_head // batch_size
+                start_batch_idx = (wg_start_in_head - head_start_iter) // tiles_per_head_per_batch
+                end_batch_idx = (wg_end_in_head - 1 - head_start_iter) // tiles_per_head_per_batch
 
-            # --- Causal Logic using Binary Search ---
-            # Convert to indices relative to the start of the head's workload
-            relative_start = wg_start_in_head - head_start_iter
-            relative_end = wg_end_in_head - head_start_iter
-
-            # Use binary search to find which M-block the start and end tiles fall into
-            start_m_idx = bisect_right(m_block_boundaries, relative_start)
-            end_m_idx = bisect_right(m_block_boundaries, relative_end - 1)
-
-            # The number of output tiles is the number of boundaries crossed
-            tiles_in_this_head = (end_m_idx - start_m_idx) + 1
-            total_output_tiles_for_wg += tiles_in_this_head
+                for batch_idx in range(start_batch_idx, end_batch_idx + 1):
+                    batch_start_iter = head_start_iter + batch_idx * tiles_per_head_per_batch
+                    # Get range relative to this specific batch item's workload
+                    relative_start = max(wg_start_in_head, batch_start_iter) - batch_start_iter
+                    relative_end = min(wg_end_in_head, batch_start_iter + tiles_per_head_per_batch) - batch_start_iter
+                    
+                    # Use M-block boundaries for causal
+                    start_m_idx = bisect_right(boundaries, relative_start)
+                    end_m_idx = bisect_right(boundaries, relative_end - 1)
+                    total_output_tiles_for_wg += (end_m_idx - start_m_idx) + 1
 
         max_total_output_tiles = max(max_total_output_tiles, total_output_tiles_for_wg)
 

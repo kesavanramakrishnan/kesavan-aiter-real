@@ -322,7 +322,9 @@ def la_persistent(
                 + (tile_batch_idx * (tiles_per_head // batch_size))
                 + total_blocks
             )
+            q_idx = tile_batch_idx * batch_size
             tile_iter_end = tile_iter + (per_head_tile_size)
+            q_idx = per_head_tile_idx + tile_batch_idx * num_m_blocks
             tile_idx = (
                 tile_head_idx * batch_size + tile_batch_idx
             ) * num_m_blocks + per_head_tile_idx
@@ -351,24 +353,57 @@ def la_persistent(
                     tile_iter_end = tile_iter + (next_req_size - req_size)
                 req_size = next_req_size
         print(
-            f"    tile_idx={tile_idx}, tile_iter={tile_iter}, tile_iter_end={tile_iter_end}"
+            f"    q_idx={q_idx}, tile_iter={tile_iter}, tile_iter_end={tile_iter_end}"
         )
         # Local lean tile ID within a loop of an output tile
         local_iter = iter - tile_iter
-        # local_iter_end = tl.minimum(tile_iter_end, cta_end_tile_gid) - tile_iter
-        local_iter_end = min(tile_iter_end, cta_end_tile_gid) - tile_iter
-        print(f"    local_iter={local_iter}, local_iter_end={local_iter_end}")
 
-        if iter == tile_iter:
-            host_block = True
-        else:
-            host_block = False
-        # finishing_block: the output tile is finished within this block
-        if cta_end_tile_gid >= tile_iter_end:
-            finishing_block = True
-        else:
-            finishing_block = False
-        print(f"    host_block={host_block}, finishing_block={finishing_block}")
+        host_block = iter == tile_iter
+        stole_last_tile = cta_end_tile_gid == (tile_iter_end - 1)
+
+        local_iter_end = min(tile_iter_end, cta_end_tile_gid) - tile_iter
+        
+        host_is_finishing = (cta_end_tile_gid >= tile_iter_end) or (stole_last_tile and host_block)
+        
+        print(f"    local_iter={local_iter}, local_iter_end={local_iter_end}")
+        print(f"    host_block={host_block}, finishing_block={host_is_finishing}")
+
+        if stole_last_tile:
+            print(f"    *** TILE STOLEN! *** pid={current_pid} is finishing the block for q_idx={q_idx}.")
+            local_iter_end += 1
+            # If a tile is stolen, this workgroup is now responsible for finishing.
+            host_is_finishing = True
+            print(f"    local_iter_end is now {local_iter_end}")
+            print(f"    host_is_finishing is now {host_is_finishing}")
+
+
+        # host_block = iter == tile_iter
+        # stole_last_tile = cta_end_tile_gid == (tile_iter_end - 1)
+
+        # # Determine the number of tiles this WG will process for the current output tile.
+        # local_iter_end = min(tile_iter_end, cta_end_tile_gid) - tile_iter
+        # if stole_last_tile:
+        #     print("stole tile")
+        #     local_iter_end += 1
+
+        # # 'host_is_finishing' tells the host if it's the sole contributor for this tile,
+        # # which means it doesn't need to perform a reduction with other WGs.
+        # host_is_finishing = (cta_end_tile_gid >= tile_iter_end) or (
+        #     stole_last_tile and host_block
+        # )
+        # # local_iter_end = tl.minimum(tile_iter_end, cta_end_tile_gid) - tile_iter
+        # print(f"    local_iter={local_iter}, local_iter_end={local_iter_end}")
+
+        # if iter == tile_iter:
+        #     host_block = True
+        # else:
+        #     host_block = False
+        # # finishing_block: the output tile is finished within this block
+        # if cta_end_tile_gid >= tile_iter_end:
+        #     finishing_block = True
+        # else:
+        #     finishing_block = False
+        # print(f"    host_block={host_block}, finishing_block={host_is_finishing}")
         offs_m = torch.arange(0, BLOCK_M)
         offs_n = torch.arange(0, BLOCK_N)
         offs_k = torch.arange(0, HEAD_DIM)
@@ -514,7 +549,7 @@ def la_persistent(
             )
             # print(f"o_h_offs={o_h_offs}")
             # o_ptrs = Out + o_h_offs
-            if not finishing_block:
+            if not host_is_finishing:
                 # if host not finishing_block: # another CTA is processing the end of the output tile and store partial results
                 """
                 if causal:
@@ -577,10 +612,10 @@ def main():
     batch = 1
     causal = True
     h = 1
-    n_ctx_q = 512
-    n_ctx = [512]
+    n_ctx_q = 448
+    n_ctx = [448]
     d = 128
-    total_programs = 4
+    total_programs = 7
 
     init_dtype = torch.float16
     BLOCK_M = 128

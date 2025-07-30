@@ -18,6 +18,7 @@ from aiter.test_mha_common import (
     generate_random_padding_mask,
     generate_qkv,
 )
+from aiter.ops.triton.lean_atten_bwd_updated_proto import *
 
 logging.basicConfig(level=logging.DEBUG)
 logger = logging.getLogger(__name__)

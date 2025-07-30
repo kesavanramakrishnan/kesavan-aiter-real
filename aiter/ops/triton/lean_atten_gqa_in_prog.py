@@ -65,7 +65,14 @@ def persistent_lean_attention(
 
     N_CTX_Q = q.shape[0] // batch_size
     N_CTX_K = k.shape[0]  # This is the sum of all ctx_n in a batch
-    H = q.shape[1]
+
+    # GQA Support
+    H_Q = q.shape[1]
+    H_KV = k.shape[1]
+    assert H_Q % H_KV == 0, "Number of Q heads must be a multiple of K/V heads for GQA"
+    GQA_FACTOR = H_Q // H_KV
+
+    # H = q.shape[1]
 
     qk_scale = sm_scale * 1.44269504
 
@@ -88,8 +95,8 @@ def persistent_lean_attention(
         batch_size,
         N_CTX_Q,
         N_CTX_K,
-        H,
-        H,
+        H_Q,
+        H_KV,
         BLOCK_M,
         BLOCK_N,
         total_programs,
@@ -149,6 +156,7 @@ def persistent_lean_attention(
         BLOCK_M=BLOCK_M,
         BLOCK_N=BLOCK_N,
         MASKED_BLOCKS=MASKED_BLOCKS,
+        GQA_FACTOR=GQA_FACTOR,
         batch_size=batch_size,
         causal=causal,
         num_m_blocks=num_m_blocks,
@@ -329,6 +337,7 @@ def la_persistent(
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     MASKED_BLOCKS: tl.constexpr,
+    GQA_FACTOR: tl.constexpr,
     batch_size: tl.constexpr,
     causal: tl.constexpr,
     num_m_blocks: tl.constexpr,
@@ -389,6 +398,7 @@ def la_persistent(
                 BLOCK_M=BLOCK_M,
                 BLOCK_N=BLOCK_N,
                 MASKED_BLOCKS=MASKED_BLOCKS,
+                GQA_FACTOR=GQA_FACTOR,
                 batch_size=batch_size,
                 causal=causal,
                 num_m_blocks=num_m_blocks,
@@ -435,6 +445,7 @@ def la_persistent_inner(
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     MASKED_BLOCKS: tl.constexpr,
+    GQA_FACTOR: tl.constexpr,
     batch_size: tl.constexpr,
     causal: tl.constexpr,
     num_m_blocks: tl.constexpr,
@@ -464,7 +475,24 @@ def la_persistent_inner(
     # while iter < cta_end_tile_gid:
     # Calculate index of current head output tile
     # The tiles_per_head is the sum of # BLOCK_N in K/V sequence of all batches
-    tile_head_idx = iter // tiles_per_head
+    # tile_head_idx = iter // tiles_per_head
+
+    # The `iter` variable loops over tiles defined by K/V heads.
+    # So, tile_kv_head_idx is the primary head index.
+    tile_kv_head_idx = iter // tiles_per_head
+    
+    # We need to determine the range of Q heads that correspond to this K/V head.
+    start_q_head_idx = tile_kv_head_idx * GQA_FACTOR
+    # For the purpose of this kernel block, we only need one Q head index.
+    # The logic inside the loop will be implicitly correct because the `tile_idx` and
+    # other calculations are relative to the Q head space. We need to find which
+    # Q head this specific `iter` belongs to.
+    
+    # The total number of tiles across ALL Q heads is `tiles_per_head * GQA_FACTOR`.
+    # `tile_head_idx` is the Q head index.
+    tiles_per_q_head_group = tiles_per_head * GQA_FACTOR
+    q_head_offset = iter // tiles_per_q_head_group
+    tile_head_idx = (iter % tiles_per_q_head_group) // tiles_per_head
 
     # To generate an otuput tile, a loop over [tile_iter, tile_iter_end) lean tiles is needed
     # [tile_iter, tile_iter_end) are in the form of global tile id
@@ -475,13 +503,13 @@ def la_persistent_inner(
         # per_head_tile_size: per head # BLOCK_N of each output tile
         per_head_tile_idx, per_head_tile_size, total_blocks = find_group(
             iter
-            - (tile_head_idx * tiles_per_head)
+            - (tile_kv_head_idx * tiles_per_head)
             - (tile_batch_idx * (tiles_per_head // batch_size)),
             MASKED_BLOCKS,
             num_m_blocks,
         )
         tile_iter = (
-            tile_head_idx * tiles_per_head
+            tile_kv_head_idx * tiles_per_head
             + (tile_batch_idx * (tiles_per_head // batch_size))
             + total_blocks
         )
@@ -491,7 +519,7 @@ def la_persistent_inner(
         ) * num_m_blocks + per_head_tile_idx
     else:
         tile_idx = (
-            tile_head_idx * batch_size
+            tile_kv_head_idx * batch_size
         )  # Output tile idx, 1 output tile per head per batch
         tile_iter = tile_head_idx * tiles_per_head
         if batch_size == 1:
@@ -548,15 +576,16 @@ def la_persistent_inner(
                 batch_num_block_n + tile_batch_idx - 1
             )  # Previous batch size
 
+    kv_head_idx = tile_head_idx // GQA_FACTOR
     k_offs = (
         (b_seq_size + local_iter) * BLOCK_N * stride_kn
-        + tile_head_idx * stride_kh
+        + kv_head_idx * stride_kh
         + offs_n[None, :] * stride_kn
         + offs_k[:, None] * stride_kk
     )
     v_offs = (
         (b_seq_size + local_iter) * BLOCK_N * stride_vn
-        + tile_head_idx * stride_vh
+        + kv_head_idx * stride_vh
         + offs_n[:, None] * stride_vn
         + offs_k[None, :] * stride_vk
     )
