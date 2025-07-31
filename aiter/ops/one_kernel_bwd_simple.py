@@ -135,70 +135,64 @@ def _bwd_dkdv_inner(
 
 
 @triton.jit
-def _bwd_dq_inner(
-    dq,
-    q, K, V, do, m, Delta,
-    sm_scale,
-    stride_qm, stride_qk,
-    stride_kn, stride_kk,
-    stride_vn, stride_vk,
-    stride_deltam,
-    seqlen_q,
-    seqlen_k,
-    BLOCK_M2: tl.constexpr,
-    BLOCK_N2: tl.constexpr,
-    HEAD_DIM: tl.constexpr,
-    start_m,
-    start_n,
-    end_n,
-    num_steps,
-    MASK: tl.constexpr,
+def _bwd_dq_la_inner(
+    dq_acc, q_tile, K_ptr, V_ptr, do_tile, m_tile, Delta_ptr, sm_scale,
+    stride_kn, stride_kd, stride_vn, stride_vd, stride_deltam,
+    max_seqlen_q, max_seqlen_k,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, HEAD_DIM: tl.constexpr,
+    start_m, start_n_loop, num_n_steps,
+    CAUSAL: tl.constexpr,
 ):
     """
-    Inner loop for computing dQ.
-    It iterates over blocks of K and V.
+    Inner loop for dQ. Iterates over K/V blocks for a given Q block.
     """
-    offs_m = start_m + tl.arange(0, BLOCK_M2)
-    offs_k = tl.arange(0, HEAD_DIM)
+    offs_m = start_m + tl.arange(0, BLOCK_M)
+    offs_d = tl.arange(0, HEAD_DIM)
 
-    # Pointers to K and V that will be advanced
-    kT_ptrs = K + offs_k[:, None] * stride_kk
-    vT_ptrs = V + offs_k[:, None] * stride_vk
-    
-    Di = tl.load(Delta + offs_m * stride_deltam, mask=(offs_m < seqlen_q), other=0.0)
+    curr_n = start_n_loop
+    for _ in range(num_n_steps):
+        offs_n = curr_n + tl.arange(0, BLOCK_N)
+        mask_n = offs_n < max_seqlen_k
 
-    curr_n = start_n
-    for _ in range(num_steps):
-        offs_n = curr_n + tl.arange(0, BLOCK_N2)
-        mask_n = offs_n < end_n
+        # Load K and V
+        k_ptrs = K_ptr + (offs_n[:, None] * stride_kn + offs_d[None, :] * stride_kd)
+        v_ptrs = V_ptr + (offs_n[:, None] * stride_vn + offs_d[None, :] * stride_vd)
+        mask_kv = mask_n[:, None] & (offs_d[None, :] < HEAD_DIM)
+
+        k = tl.load(k_ptrs, mask=mask_kv, other=0.0)
+        v = tl.load(v_ptrs, mask=mask_kv, other=0.0)
+
+        # Recompute P = exp(QK^T * sm_scale - M)
+        qk = tl.dot(q_tile, tl.trans(k))
         
-        kT_ptrs_step = kT_ptrs + offs_n[None, :] * stride_kn
-        vT_ptrs_step = vT_ptrs + offs_n[None, :] * stride_vn
+        # --- POTENTIAL BUG FIX AREA ---
+        # Ensure this calculation matches the forward pass exactly.
+        # If the forward pass used exp2, this should too.
+        # p = tl.math.exp2(qk * sm_scale * 1.44269504 - m_tile)
+        p = tl.math.exp2(qk * sm_scale * 1.44269504 - m_tile)
         
-        mask_kT = mask_n[None, :] & (offs_k[:, None] < HEAD_DIM)
+        if CAUSAL:
+            p = tl.where(offs_m[:, None] >= offs_n[None, :], p, 0.0)
 
-        kT = tl.load(kT_ptrs_step, mask=mask_kT, other=0.0)
-        vT = tl.load(vT_ptrs_step, mask=mask_kT, other=0.0)
-
-        # Compute P = exp(QK^T * sm_scale - M)
-        qk = tl.dot(q, kT)
-        qk_scaled = qk * sm_scale
-        p = tl.math.exp(qk_scaled - m)
-
-        if MASK:
-            causal_mask = offs_m[:, None] >= offs_n[None, :]
-            p = tl.where(causal_mask, p, 0.0)
+        # Compute dP = dO @ V^T
+        dp = tl.dot(do_tile, tl.trans(v))
         
-        # Compute dS
-        dp = tl.dot(do, vT)
+        # Load Delta
+        Di = tl.load(Delta_ptr + offs_m * stride_deltam, mask=(offs_m < max_seqlen_q), other=0.0)
+        
+        # Compute dS = P * (dP - D_i)
         ds = p * (dp - Di[:, None])
         
-        # Compute dQ
-        dq += tl.dot(ds.to(kT.type.element_ty), tl.trans(kT))
-
-        curr_n += BLOCK_N2
+        # Apply scaling factor to dS
+        ds_scaled = ds * sm_scale
         
-    return dq
+        # Compute dQ += dS_scaled @ K
+        dq_acc += tl.dot(ds_scaled, k.to(tl.float32))
+        
+        curr_n += BLOCK_N
+        
+    return dq_acc
+
 
 
 @triton.jit
