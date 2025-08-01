@@ -599,12 +599,18 @@ def la_persistent_inner(
         #    qk = tl.where(mask, qk, float("-inf"))
 
         if causal:
-            # Get the starting column index of the current K block
             k_start_n = (b_seq_size + l_iter) * BLOCK_N
-            # Create mask based on absolute sequence positions
-            mask = (q_start_m + offs_m[:, None]) >= (k_start_n + offs_n[None, :])
-            # Apply the mask
-            qk = tl.where(mask, qk, float("-inf"))
+
+            # Check if the entire K-block is in the past.
+            # This is true if the K-block's last element comes before the Q-block's first element.
+            # This comparison of absolute positions is robust and works when BLOCK_M != BLOCK_N.
+            if (k_start_n + BLOCK_N - 1) < q_start_m:
+                # K-block is fully attended to, so do nothing.
+                pass
+            else:
+                # Otherwise, the block is on the diagonal and needs a detailed mask.
+                mask = (q_start_m + offs_m[:, None]) >= (k_start_n + offs_n[None, :])
+                qk = tl.where(mask, qk, float("-inf"))
 
         m_ij = tl.maximum(m_i, tl.max(qk, 1))
 

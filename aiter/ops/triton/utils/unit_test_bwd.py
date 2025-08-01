@@ -57,7 +57,7 @@ def ground_truth_backward(q, k, v, do, sm_scale, causal):
 
 def run_test():
     # --- 1. Define Test Parameters ---
-    BATCH, N_HEADS, SEQLEN_Q, SEQLEN_K, HEAD_DIM = 2, 4, 128, 128, 64
+    BATCH, N_HEADS, SEQLEN_Q, SEQLEN_K, HEAD_DIM = 1, 1, 64, 128, 64
     CAUSAL = True
     DTYPE = torch.float16
     DEVICE = "cuda"
@@ -134,7 +134,7 @@ def run_test():
 
     # Compare dK
     dk_is_close = torch.allclose(dk_triton, dk_ref, atol=atol, rtol=rtol)
-    print(dk_triton)
+    # print(dk_triton)
     print(f"dK allclose: {dk_is_close}")
     print(f"  Max difference in dK: {(dk_triton - dk_ref).abs().max().item()}")
 
