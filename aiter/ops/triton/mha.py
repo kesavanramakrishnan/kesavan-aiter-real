@@ -336,61 +336,116 @@ def _attn_fwd_inner(
             philox_ptrs += BLOCK_N * stride_sn
 
     return acc, l_i, m_i
-
 @triton.jit
-def swizzle_wid_head_first(
+def swizzle_head_first_balanced(
     wid: tl.int32,
+    BATCH: tl.constexpr,
     NUM_Q_HEADS: tl.constexpr,
     NUM_BLOCKS: tl.constexpr,
     NUM_XCD: tl.constexpr,
 ) -> tl.int32:
     """
-    Encapsulates the balanced head-first mapping logic into a single swizzle function.
-    Takes an original wid and returns a new wid that can be decomposed with simple math.
+    Swizzles a workgroup ID to group work by head, mapping all blocks for a
+    given head to the same XCD to maximize K/V cache locality using a branchless design.
     """
-    # Deconstruct the wid into its batch and local components
-    wids_per_batch = NUM_Q_HEADS * NUM_BLOCKS
-    off_z = wid // wids_per_batch
-    local_wid = wid % wids_per_batch
+    """
+    Highly optimized, branchless swizzle function to group work by head, mapping all blocks
+    for a given head to the same XCD to maximize K/V cache locality.
+    """
+    # Get the linear work-group ID from the launcher.
+    linear_wid = tl.program_id(0)
 
-    # 1. Define the size and WID counts for "tall" and "short" head groups.
-    #    This ensures the mapping is balanced even if NUM_Q_HEADS is not divisible by NUM_XCD.
-    heads_per_xcd_short = NUM_Q_HEADS // NUM_XCD
-    heads_per_xcd_tall = heads_per_xcd_short + 1
-    num_tall_xcds = NUM_Q_HEADS % NUM_XCD
-    
-    wids_per_tall_xcd = heads_per_xcd_tall * NUM_BLOCKS
-    wids_per_short_xcd = heads_per_xcd_short * NUM_BLOCKS
-    wids_in_tall_xcds_total = num_tall_xcds * wids_per_tall_xcd
+    # Define the desired locality-aware logical grid: (Batch, XCD, Head-in-XCD, Block).
+    # This is the target layout we want to map our linear WID to.
+    num_heads_per_xcd = (NUM_Q_HEADS + NUM_XCD - 1) // NUM_XCD
+    num_blocks_per_xcd_group = num_heads_per_xcd * NUM_BLOCKS
+    num_blocks_per_batch = NUM_XCD * num_blocks_per_xcd_group
 
-    # 2. Determine the target (q_head, start_m) for the original wid.
-    #    This section is the internal logic of the mapping.
-    is_in_tall_group = local_wid < wids_in_tall_xcds_total
-    
-    # -- Logic for the "tall" path --
-    xcd_idx_tall = local_wid // wids_per_tall_xcd
-    local_wid_in_xcd_tall = local_wid % wids_per_tall_xcd
-    target_q_head_tall = xcd_idx_tall * heads_per_xcd_tall + (local_wid_in_xcd_tall // NUM_BLOCKS)
-    
-    # -- Logic for the "short" path --
-    wid_after_tall = local_wid - wids_in_tall_xcds_total
-    xcd_local_idx_short = wid_after_tall // wids_per_short_xcd
-    local_wid_in_xcd_short = wid_after_tall % wids_per_short_xcd
-    target_q_head_short = (
-        (num_tall_xcds * heads_per_xcd_tall) 
-        + xcd_local_idx_short * heads_per_xcd_short 
-        + (local_wid_in_xcd_short // NUM_BLOCKS)
-    )
+    # Decompose the linear_wid according to this new grid layout to find the target task.
+    z_idx = linear_wid // num_blocks_per_batch
+    wid_in_batch = linear_wid % num_blocks_per_batch
 
-    local_wid_in_xcd = tl.where(is_in_tall_group, local_wid_in_xcd_tall, local_wid_in_xcd_short)
-    target_start_m = local_wid_in_xcd % NUM_BLOCKS
-    target_q_head = tl.where(is_in_tall_group, target_q_head_tall, target_q_head_short)
-    
-    # 3. Reconstruct the swizzled_wid from the target indices using a simple block-major formula.
-    swizzled_local_wid = target_q_head * NUM_BLOCKS + target_start_m
-    
-    # 4. Add the batch offset back and return the final swizzled wid.
-    return off_z * wids_per_batch + swizzled_local_wid
+    xcd_idx = wid_in_batch // num_blocks_per_xcd_group
+    wid_in_xcd = wid_in_batch % num_blocks_per_xcd_group
+
+    h_rank_in_xcd = wid_in_xcd // NUM_BLOCKS
+    m_idx = wid_in_xcd % NUM_BLOCKS
+
+    # Reconstruct the true head index from its XCD and its rank within that XCD.
+    # This mapping ensures that we process heads 0, 4, 8... (all on XCD0),
+    # then 1, 5, 9... (all on XCD1), and so on.
+    h_idx = h_rank_in_xcd * NUM_XCD + xcd_idx
+
+    # The task for this WG is (z_idx, m_idx, h_idx).
+    # Now, we compose the `swizzled_wid` that the original kernel logic will
+    # decompose to get this exact task.
+    # Original kernel's grid is (Batch, Block, Head).
+    # Original mapping: wid = z * (NUM_BLOCKS * NUM_Q_HEADS) + m * NUM_Q_HEADS + h
+    total_heads_x_blocks = NUM_Q_HEADS * NUM_BLOCKS
+    swizzled_wid = z_idx * total_heads_x_blocks + m_idx * NUM_Q_HEADS + h_idx
+
+    # Since we use ceiling division for num_heads_per_xcd, some reconstructed
+    # head indices might be out of bounds if NUM_Q_HEADS is not a multiple of NUM_XCD.
+    # We must map these WGs to a valid task to prevent out-of-bounds access.
+    # We map them to wid=0, which is safe. The kernel will perform some redundant
+    # work, but it will not crash.
+    is_valid_head = h_idx < NUM_Q_HEADS
+    final_wid = tl.where(is_valid_head, swizzled_wid, 0)
+
+    return final_wid
+
+@triton.jit
+def _get_swizzled_head_index(
+    wid,
+    NUM_Q_HEADS: tl.constexpr,
+    NUM_BLOCKS: tl.constexpr,
+    NUM_XCD: tl.constexpr,
+    BATCH: tl.constexpr
+):
+    """
+    Swizzles the work-group ID (wid) to calculate the remapped head index
+    for a blocked scheduling pattern.
+
+    IMPORTANT: This function only returns the swizzled head index. The blocked
+    scheduling logic also remaps the block (`start_m`) and batch (`off_z`)
+    indices. The caller is responsible for calculating these separately using
+    the same logic to ensure the final (head, block, batch) coordinates are correct.
+
+    Args:
+        wid: The global work-group ID from tl.program_id(0).
+        NUM_Q_HEADS: Total number of query heads.
+        NUM_BLOCKS: Total number of blocks along the sequence length dimension.
+        NUM_XCD: The number of hardware units (e.g., XCDs) to schedule across.
+        BATCH: The batch size.
+
+    Returns:
+        The remapped `off_q_head` only.
+    """
+    # --- Deconstruct wid to get batch index and within-batch wid ---
+    # Note: The logic to find the remapped block (`start_m`) and batch (`off_z`)
+    # is part of this calculation, but they are not returned.
+     # --- Deconstruct wid to get batch index and within-batch wid ---
+    WGS_PER_BATCH = NUM_Q_HEADS * NUM_BLOCKS
+    off_z = wid // WGS_PER_BATCH
+    wid_in_batch = wid % WGS_PER_BATCH
+
+    # Determine the number of heads and work-groups per XCD
+    HEADS_PER_XCD = NUM_Q_HEADS // NUM_XCD
+    WGS_PER_XCD = WGS_PER_BATCH // NUM_XCD
+
+    # Determine the target XCD and the local work-group ID within that XCD's share of work
+    xcd_idx = wid_in_batch // WGS_PER_XCD
+    local_wid_in_xcd = wid_in_batch % WGS_PER_XCD
+
+    # Within the XCD's work, maintain the kernel's required block-major ordering.
+    # The head index is the "inner" dimension (changes faster).
+    start_m = local_wid_in_xcd // HEADS_PER_XCD
+    local_head_idx = local_wid_in_xcd % HEADS_PER_XCD
+
+    # Calculate the final, global head index by offsetting by the XCD's starting head.
+    off_q_head = xcd_idx * HEADS_PER_XCD + local_head_idx
+
+    return off_q_head, start_m, off_z
 
 @triton.jit
 def _attn_fwd(
@@ -459,18 +514,56 @@ def _attn_fwd(
     MAPPING_MODE: tl.constexpr,  # 0: aiter, 1: head_first, 2: triton_fa
     USE_REMAP: tl.constexpr,     # True/False for aiter remap functionality
 ):
+    # MAPPING_MODE = 1
     NUM_BLOCKS = (SEQLEN_Q + BLOCK_M - 1) // BLOCK_M
     # calculate offsets
     wid = tl.program_id(
         0
     )  # workgroup id ranging: 0,1,2,...., (BATCH * NUM_Q_HEADS * NUM_BLOCKS - 1)
     
-    swizzled_wid = swizzle_wid_head_first(wid, NUM_Q_HEADS, NUM_BLOCKS, NUM_XCD)
+    # if MAPPING_MODE == 0:  # aiter case
+    #     off_q_head = wid % NUM_Q_HEADS
+    #     off_q_head = remap_xcd(off_q_head, NUM_Q_HEADS, NUM_XCD)
+    #     start_m = (wid // NUM_Q_HEADS) % NUM_BLOCKS
+    #     off_z = (wid // (NUM_BLOCKS * NUM_Q_HEADS)) % BATCH
+    # Conditional remap - only compiled when USE_REMAP is True
+    # if USE_REMAP:
+        
+      
+    # elif MAPPING_MODE == 1:
+        num_xcds = 8
+        blocks_per_xcd = (NUM_BLOCKS + num_xcds - 1) // num_xcds
+        xcd_id = wid % num_xcds
+        local_block_id = wid // num_xcds
+        wid = local_block_id + xcd_id * blocks_per_xcd
+        start_m = wid % NUM_BLOCKS
+        off_q_head = (wid // NUM_BLOCKS) % NUM_Q_HEADS
+        off_z = (wid // NUM_BLOCKS) // NUM_Q_HEADS
+    # off_q_head, start_m, off_z = _get_swizzled_head_index(wid, NUM_Q_HEADS, NUM_BLOCKS, NUM_XCD, BATCH)
+    # off_q_head = wid % NUM_Q_HEADS
+    # off_q_head = _get_swizzled_head_index(wid, NUM_Q_HEADS, NUM_BLOCKS, NUM_XCD, BATCH)
+    # start_m = (wid // NUM_Q_HEADS) % NUM_BLOCKS
+    # off_z = (wid // (NUM_BLOCKS * NUM_Q_HEADS)) % BATCH
+        # off_z, off_q_head, start_m = swizzle_head_first_balanced(wid, NUM_Q_HEADS, NUM_BLOCKS, NUM_XCD)
+        # wid = swizzle_head_first_balanced(wid, BATCH, NUM_Q_HEADS, NUM_BLOCKS, NUM_XCD)
+        # start_m = wid % NUM_BLOCKS
+        # off_q_head = (wid // NUM_BLOCKS) % NUM_Q_HEADS
+        # off_z = wid // (NUM_Q_HEADS * NUM_BLOCKS)
+    
+    # elif MAPPING_MODE == 2: # head first mapping
+    
+    #     chunk_size = NUM_XCD * NUM_BLOCKS
+    #     wid_per_batch = wid // (NUM_Q_HEADS * NUM_BLOCKS)
+    
+    
+    # else: # MAPPING_MODE == 2, triton_fa case
+    #     off_q_head = (wid_per_batch % NUM_XCD) * (NUM_Q_HEADS // NUM_XCD) + (wid_per_batch // chunk_size)
+    #     start_m = (wid_per_batch % chunk_size) // NUM_XCD
+    #     off_z = (wid // (NUM_BLOCKS * NUM_Q_HEADS)) % BATCH
 
+    # swizzled_wid = wid
     # Use a simple, standard decomposition on the new wid
-    start_m = swizzled_wid % NUM_BLOCKS
-    off_q_head = (swizzled_wid // NUM_BLOCKS) % NUM_Q_HEADS
-    off_z = swizzled_wid // (NUM_Q_HEADS * NUM_BLOCKS)
+    
 
     # offsets
     offs_m = start_m * BLOCK_M + tl.arange(0, BLOCK_M)
@@ -1038,9 +1131,15 @@ def _flash_attn_forward(
             "num_stages": 1,
         }
 
+
+    # if mapping_mode == 1:
+    #     work_groups_per_batch = num_q_heads * triton.cdiv(seqlen_q, config["BLOCK_M"])
+    #     grid = (work_groups_per_batch, batch)
+    # else:
     grid = lambda META: (  # noqa: E731
-        batch * num_q_heads * triton.cdiv(seqlen_q, META["BLOCK_M"]),
+    batch * num_q_heads * triton.cdiv(seqlen_q, META["BLOCK_M"]),
     )
+
 
     _attn_fwd[grid](
         q,

@@ -372,8 +372,9 @@ def run_benchmark(custom, args):
 
         # Benchmark mode
         MAPPING_AITER = 0
-        MAPPING_HEAD_FIRST = 1
-        MAPPING_TRITON_FA = 2
+        MAPPING_HEAD_FIRST_K7 = 1
+        MAPPING_HEAD_FIRST_M = 2
+        MAPPING_TRITON_FA = 3
         
         if varlen:
             if args.fp8:
@@ -585,8 +586,8 @@ def parse_args():
         "-mapping_mode", 
         type=int, 
         default=0, 
-        choices=[0, 1, 2],
-        help="Mapping mode: 0=aiter_fa, 1=head_first, 2=triton_fa"
+        choices=[0, 1, 2, 3],
+        help="Mapping mode: 0=aiter_fa, 1=head_first_k7, 2=head_first_m, 3=triton_fa"
     )
     parser.add_argument(
         "-no_remap",

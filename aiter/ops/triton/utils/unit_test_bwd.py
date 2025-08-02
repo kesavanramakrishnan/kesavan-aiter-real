@@ -1,7 +1,8 @@
 import torch
 import math
 import triton
-
+import sys,os
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../../../..")))
 # Assume the code from your Canvas (bwd_la_persistent, etc.) is in this file
 # or has been imported. For this example, I'll paste the launcher function.
 from aiter.ops.triton.lean_atten_bwd_clean import la_backward_persistent
@@ -57,7 +58,7 @@ def ground_truth_backward(q, k, v, do, sm_scale, causal):
 
 def run_test():
     # --- 1. Define Test Parameters ---
-    BATCH, N_HEADS, SEQLEN_Q, SEQLEN_K, HEAD_DIM = 1, 1, 64, 128, 64
+    BATCH, N_HEADS, SEQLEN_Q, SEQLEN_K, HEAD_DIM = 2, 4, 64, 128, 64
     CAUSAL = True
     DTYPE = torch.float16
     DEVICE = "cuda"
@@ -131,7 +132,9 @@ def run_test():
     dq_is_close = torch.allclose(dq_triton, dq_ref, atol=atol, rtol=rtol)
     print(f"dQ allclose: {dq_is_close}")
     print(f"  Max difference in dQ: {(dq_triton - dq_ref).abs().max().item()}")
-
+    print(dq_triton)
+    print ("------")
+    print(dq_ref)
     # Compare dK
     dk_is_close = torch.allclose(dk_triton, dk_ref, atol=atol, rtol=rtol)
     # print(dk_triton)

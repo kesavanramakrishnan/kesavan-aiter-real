@@ -3,6 +3,8 @@ import torch
 import triton
 import triton.language as tl
 
+
+
 # ----------------------------------------------------------------------------
 # Inner compute kernels for the backward pass (No changes needed here)
 # ----------------------------------------------------------------------------
@@ -217,10 +219,11 @@ def bwd_la_persistent(
             else:
                 # ========== COMPUTE PARTIAL dQ ==========
                 item_id = work_item_id - num_dkdv_work_items
-                n_block_idx = item_id % num_n_blocks_2
-                item_id = item_id // num_n_blocks_2
+                # CORRECTED ORDER: Unpack M, then N
                 m_block_idx = item_id % num_m_blocks_2
                 item_id = item_id // num_m_blocks_2
+                n_block_idx = item_id % num_n_blocks_2
+                item_id = item_id // num_n_blocks_2
                 q_head_idx = item_id % num_q_heads
                 batch_idx = item_id // num_q_heads
 
