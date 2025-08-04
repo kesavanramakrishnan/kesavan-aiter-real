@@ -521,16 +521,15 @@ def _attn_fwd(
         0
     )  # workgroup id ranging: 0,1,2,...., (BATCH * NUM_Q_HEADS * NUM_BLOCKS - 1)
     
-    # if MAPPING_MODE == 0:  # aiter case
-    #     off_q_head = wid % NUM_Q_HEADS
-    #     off_q_head = remap_xcd(off_q_head, NUM_Q_HEADS, NUM_XCD)
-    #     start_m = (wid // NUM_Q_HEADS) % NUM_BLOCKS
-    #     off_z = (wid // (NUM_BLOCKS * NUM_Q_HEADS)) % BATCH
+    if MAPPING_MODE == 0:  # aiter case
+        off_q_head = wid % NUM_Q_HEADS
+        start_m = (wid // NUM_Q_HEADS) % NUM_BLOCKS
+        off_z = (wid // (NUM_BLOCKS * NUM_Q_HEADS)) % BATCH
     # Conditional remap - only compiled when USE_REMAP is True
-    # if USE_REMAP:
-        
+        if USE_REMAP:
+            off_q_head = remap_xcd(off_q_head, NUM_Q_HEADS, NUM_XCD)
       
-    # elif MAPPING_MODE == 1:
+    elif MAPPING_MODE == 1:
         num_xcds = 8
         blocks_per_xcd = (NUM_BLOCKS + num_xcds - 1) // num_xcds
         xcd_id = wid % num_xcds
@@ -550,16 +549,15 @@ def _attn_fwd(
         # off_q_head = (wid // NUM_BLOCKS) % NUM_Q_HEADS
         # off_z = wid // (NUM_Q_HEADS * NUM_BLOCKS)
     
-    # elif MAPPING_MODE == 2: # head first mapping
+    elif MAPPING_MODE == 2: # head first mapping
     
-    #     chunk_size = NUM_XCD * NUM_BLOCKS
-    #     wid_per_batch = wid // (NUM_Q_HEADS * NUM_BLOCKS)
+        chunk_size = NUM_XCD * NUM_BLOCKS
+        wid_per_batch = wid // (NUM_Q_HEADS * NUM_BLOCKS)
     
-    
-    # else: # MAPPING_MODE == 2, triton_fa case
-    #     off_q_head = (wid_per_batch % NUM_XCD) * (NUM_Q_HEADS // NUM_XCD) + (wid_per_batch // chunk_size)
-    #     start_m = (wid_per_batch % chunk_size) // NUM_XCD
-    #     off_z = (wid // (NUM_BLOCKS * NUM_Q_HEADS)) % BATCH
+    else: # MAPPING_MODE == 2, triton_fa case
+        off_q_head = (wid_per_batch % NUM_XCD) * (NUM_Q_HEADS // NUM_XCD) + (wid_per_batch // chunk_size)
+        start_m = (wid_per_batch % chunk_size) // NUM_XCD
+        off_z = (wid // (NUM_BLOCKS * NUM_Q_HEADS)) % BATCH
 
     # swizzled_wid = wid
     # Use a simple, standard decomposition on the new wid
