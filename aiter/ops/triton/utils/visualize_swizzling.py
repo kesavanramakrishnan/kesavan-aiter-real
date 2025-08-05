@@ -159,6 +159,7 @@ def visualize_mapping_comparison(
     cbar.set_ticks(np.arange(num_xcds))
     plt.suptitle(f"Mapping Comparison – {num_heads} Heads, {num_blocks} Blocks, {num_xcds} XCDs", fontsize=20, weight='bold')
     plt.show()
+    input("Press Enter to close the plot...")
 
 # =================================================================
 #                            --- HOW TO USE ---

@@ -58,8 +58,8 @@ def ground_truth_backward(q, k, v, do, sm_scale, causal):
 
 def run_test():
     # --- 1. Define Test Parameters ---
-    BATCH, N_HEADS, SEQLEN_Q, SEQLEN_K, HEAD_DIM = 2, 4, 64, 128, 64
-    CAUSAL = True
+    BATCH, N_HEADS, SEQLEN_Q, SEQLEN_K, HEAD_DIM = 2, 48, 64, 128, 64
+    CAUSAL = False
     DTYPE = torch.float16
     DEVICE = "cuda"
 

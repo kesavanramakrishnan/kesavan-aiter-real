@@ -4,10 +4,14 @@ import triton
 import triton.language as tl
 
 
+# ----------------------------------------------------------------------------
+# Triton Kernels (_bwd_dkdv_la_inner, _bwd_dq_la_inner, 
+# _bwd_la_persistent_inner, bwd_la_persistent)
+#
+# No changes are needed in the Triton kernel code from the previous version.
+# The following Python code is the updated launcher.
+# ----------------------------------------------------------------------------
 
-# ----------------------------------------------------------------------------
-# Inner compute kernels for the backward pass (No changes needed here)
-# ----------------------------------------------------------------------------
 
 @triton.jit
 def _bwd_dkdv_la_inner(
@@ -119,9 +123,125 @@ def _bwd_dq_la_inner(
 
     return dq_acc
 
-# ----------------------------------------------------------------------------
-# Main Persistent Backward Kernel with GQA and Cross-Attention Support
-# ----------------------------------------------------------------------------
+@triton.jit
+def _bwd_la_persistent_inner(
+    # Pointers to matrices
+    Q, K, V, sm_scale, DO, O, M, Delta,
+    DQ, DK, DV,
+    # Strides
+    stride_qb, stride_qh, stride_qm, stride_qd,
+    stride_kb, stride_kh, stride_kn, stride_kd,
+    stride_vb, stride_vh, stride_vn, stride_vd,
+    stride_dob, stride_doh, stride_dom, stride_dod,
+    stride_dqb, stride_dqh, stride_dqm, stride_dqd,
+    stride_dkb, stride_dkh, stride_dkn, stride_dkd,
+    stride_dvb, stride_dvh, stride_dvn, stride_dvd,
+    stride_mb, stride_mh, stride_mm,
+    stride_deltab, stride_deltah, stride_deltam,
+    # Scheduling & Workload parameters
+    work_item_id: tl.int32,
+    num_dkdv_work_items: tl.int32,
+    num_q_heads, num_k_heads,
+    max_seqlen_q, max_seqlen_k,
+    num_m_blocks_1, num_m_blocks_2, num_n_blocks_1, num_n_blocks_2,
+    GQA_GROUP_SIZE: tl.constexpr,
+    # Meta-parameters
+    BLOCK_M1: tl.constexpr, BLOCK_N1: tl.constexpr,
+    BLOCK_M2: tl.constexpr, BLOCK_N2: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+    CAUSAL: tl.constexpr,
+):
+    """
+    Processes a single work item for the backward pass.
+    A work item can be either a dK/dV task or a dQ task.
+    """
+    if work_item_id < num_dkdv_work_items:
+        # ========== COMPUTE PARTIAL dK and dV ==========
+        item_id = work_item_id
+        m_block_idx = item_id % num_m_blocks_1
+        item_id = item_id // num_m_blocks_1
+        n_block_idx = item_id % num_n_blocks_1
+        item_id = item_id // num_n_blocks_1
+        q_head_idx = item_id % num_q_heads
+        batch_idx = item_id // num_q_heads
+
+        k_head_idx = q_head_idx // GQA_GROUP_SIZE
+        start_m = m_block_idx * BLOCK_M1
+        start_n = n_block_idx * BLOCK_N1
+
+        dk_partial = tl.zeros([BLOCK_N1, HEAD_DIM], dtype=tl.float32)
+        dv_partial = tl.zeros([BLOCK_N1, HEAD_DIM], dtype=tl.float32)
+
+        offs_n = start_n + tl.arange(0, BLOCK_N1)
+        offs_d = tl.arange(0, HEAD_DIM)
+        mask_kv = (offs_n[:, None] < max_seqlen_k) & (offs_d[None, :] < HEAD_DIM)
+        
+        k_ptrs = K + batch_idx*stride_kb + k_head_idx*stride_kh + offs_n[:,None]*stride_kn + offs_d[None,:]*stride_kd
+        v_ptrs = V + batch_idx*stride_vb + k_head_idx*stride_vh + offs_n[:,None]*stride_vn + offs_d[None,:]*stride_vd
+        k_tile = tl.load(k_ptrs, mask=mask_kv, other=0.0)
+        v_tile = tl.load(v_ptrs, mask=mask_kv, other=0.0)
+
+        Q_ptr = Q + batch_idx * stride_qb + q_head_idx * stride_qh
+        DO_ptr = DO + batch_idx * stride_dob + q_head_idx * stride_doh
+        M_ptr = M + batch_idx * stride_mb + q_head_idx * stride_mh
+        Delta_ptr = Delta + batch_idx * stride_deltab + q_head_idx * stride_deltah
+
+        dk_partial, dv_partial = _bwd_dkdv_la_inner(
+            dk_partial, dv_partial, Q_ptr, k_tile, v_tile, DO_ptr, M_ptr, Delta_ptr, sm_scale,
+            stride_qm, stride_qd, stride_dom, stride_dod, stride_mm, stride_deltam,
+            BLOCK_M1, BLOCK_N1, HEAD_DIM, max_seqlen_q, max_seqlen_k,
+            start_n, start_m, 1,
+            CAUSAL=CAUSAL
+        )
+
+        dv_ptrs_out = DV + batch_idx*stride_dvb + k_head_idx*stride_dvh + offs_n[:,None]*stride_dvn + offs_d[None,:]*stride_dvd
+        dk_ptrs_out = DK + batch_idx*stride_dkb + k_head_idx*stride_dkh + offs_n[:,None]*stride_dkn + offs_d[None,:]*stride_dkd
+        tl.atomic_add(dv_ptrs_out, dv_partial, mask=mask_kv)
+        tl.atomic_add(dk_ptrs_out, dk_partial, mask=mask_kv)
+    else:
+        # ========== COMPUTE PARTIAL dQ ==========
+        item_id = work_item_id - num_dkdv_work_items
+        m_block_idx = item_id % num_m_blocks_2
+        item_id = item_id // num_m_blocks_2
+        n_block_idx = item_id % num_n_blocks_2
+        item_id = item_id // num_n_blocks_2
+        q_head_idx = item_id % num_q_heads
+        batch_idx = item_id // num_q_heads
+
+        k_head_idx = q_head_idx // GQA_GROUP_SIZE
+        start_m = m_block_idx * BLOCK_M2
+        start_n = n_block_idx * BLOCK_N2
+
+        dq_partial = tl.zeros([BLOCK_M2, HEAD_DIM], dtype=tl.float32)
+
+        offs_m = start_m + tl.arange(0, BLOCK_M2)
+        offs_d = tl.arange(0, HEAD_DIM)
+        mask_q = (offs_m[:, None] < max_seqlen_q) & (offs_d[None, :] < HEAD_DIM)
+        
+        q_ptrs = Q + batch_idx*stride_qb + q_head_idx*stride_qh + offs_m[:,None]*stride_qm + offs_d[None,:]*stride_qd
+        do_ptrs = DO + batch_idx*stride_dob + q_head_idx*stride_doh + offs_m[:,None]*stride_dom + offs_d[None,:]*stride_dod
+        m_ptrs = M + batch_idx*stride_mb + q_head_idx*stride_mh + offs_m*stride_mm
+        
+        q_tile = tl.load(q_ptrs, mask=mask_q, other=0.0)
+        do_tile = tl.load(do_ptrs, mask=mask_q, other=0.0)
+        m_tile = tl.load(m_ptrs, mask=(offs_m < max_seqlen_q), other=-float('inf'))[:, None]
+
+        K_ptr = K + batch_idx * stride_kb + k_head_idx * stride_kh
+        V_ptr = V + batch_idx * stride_vb + k_head_idx * stride_vh
+        Delta_ptr = Delta + batch_idx * stride_deltab + q_head_idx * stride_deltah
+
+        dq_partial = _bwd_dq_la_inner(
+            dq_partial, q_tile, K_ptr, V_ptr, do_tile, m_tile, Delta_ptr, sm_scale,
+            stride_kn, stride_kd, stride_vn, stride_vd, stride_deltam,
+            max_seqlen_q, max_seqlen_k,
+            BLOCK_M2, BLOCK_N2, HEAD_DIM,
+            start_m, start_n, 1,
+            CAUSAL=CAUSAL
+        )
+
+        dq_ptrs_out = DQ + batch_idx*stride_dqb + q_head_idx*stride_dqh + offs_m[:,None]*stride_dqm + offs_d[None,:]*stride_dqd
+        tl.atomic_add(dq_ptrs_out, dq_partial, mask=mask_q)
+
 
 @triton.jit
 def bwd_la_persistent(
@@ -156,6 +276,8 @@ def bwd_la_persistent(
     CAUSAL: tl.constexpr,
 ):
     pid = tl.program_id(0)
+    
+    # Determine the range of work items for this program
     if pid < high_load_wgs:
         iter_start = max_tiles_per_wg * pid
         num_tiles_to_process = max_tiles_per_wg
@@ -163,109 +285,91 @@ def bwd_la_persistent(
         iter_start = (max_tiles_per_wg - 1) * (pid - high_load_wgs) + high_load_wgs * max_tiles_per_wg
         num_tiles_to_process = max_tiles_per_wg - 1
 
+    # Loop and process each assigned work item
     for i in range(num_tiles_to_process):
         work_item_id = iter_start + i
-        
         if work_item_id < total_work_items:
-            if work_item_id < num_dkdv_work_items:
-                # ========== COMPUTE PARTIAL dK and dV ==========
-                item_id = work_item_id
-                m_block_idx = item_id % num_m_blocks_1
-                item_id = item_id // num_m_blocks_1
-                n_block_idx = item_id % num_n_blocks_1
-                item_id = item_id // num_n_blocks_1
-                # This is the Q head index
-                q_head_idx = item_id % num_q_heads
-                batch_idx = item_id // num_q_heads
-
-                # GQA: Map Q head to K/V head
-                k_head_idx = q_head_idx // GQA_GROUP_SIZE
-
-                start_m = m_block_idx * BLOCK_M1
-                start_n = n_block_idx * BLOCK_N1
-
-                dk_partial = tl.zeros([BLOCK_N1, HEAD_DIM], dtype=tl.float32)
-                dv_partial = tl.zeros([BLOCK_N1, HEAD_DIM], dtype=tl.float32)
-
-                offs_n = start_n + tl.arange(0, BLOCK_N1)
-                offs_d = tl.arange(0, HEAD_DIM)
-                mask_kv = (offs_n[:, None] < max_seqlen_k) & (offs_d[None, :] < HEAD_DIM)
-                # Use k_head_idx for K and V pointers
-                k_ptrs = K + batch_idx*stride_kb + k_head_idx*stride_kh + offs_n[:,None]*stride_kn + offs_d[None,:]*stride_kd
-                v_ptrs = V + batch_idx*stride_vb + k_head_idx*stride_vh + offs_n[:,None]*stride_vn + offs_d[None,:]*stride_vd
-                k_tile = tl.load(k_ptrs, mask=mask_kv, other=0.0)
-                v_tile = tl.load(v_ptrs, mask=mask_kv, other=0.0)
-
-                # Use q_head_idx for Q, dO, M, Delta pointers
-                Q_ptr = Q + batch_idx * stride_qb + q_head_idx * stride_qh
-                DO_ptr = DO + batch_idx * stride_dob + q_head_idx * stride_doh
-                M_ptr = M + batch_idx * stride_mb + q_head_idx * stride_mh
-                Delta_ptr = Delta + batch_idx * stride_deltab + q_head_idx * stride_deltah
-
-                dk_partial, dv_partial = _bwd_dkdv_la_inner(
-                    dk_partial, dv_partial, Q_ptr, k_tile, v_tile, DO_ptr, M_ptr, Delta_ptr, sm_scale,
-                    stride_qm, stride_qd, stride_dom, stride_dod, stride_mm, stride_deltam,
-                    BLOCK_M1, BLOCK_N1, HEAD_DIM, max_seqlen_q, max_seqlen_k,
-                    start_n, start_m, 1,
-                    CAUSAL=CAUSAL
-                )
-
-                # Use k_head_idx for atomic add pointers
-                dv_ptrs_out = DV + batch_idx*stride_dvb + k_head_idx*stride_dvh + offs_n[:,None]*stride_dvn + offs_d[None,:]*stride_dvd
-                dk_ptrs_out = DK + batch_idx*stride_dkb + k_head_idx*stride_dkh + offs_n[:,None]*stride_dkn + offs_d[None,:]*stride_dkd
-                tl.atomic_add(dv_ptrs_out, dv_partial, mask=mask_kv)
-                tl.atomic_add(dk_ptrs_out, dk_partial, mask=mask_kv)
-
-            else:
-                # ========== COMPUTE PARTIAL dQ ==========
-                item_id = work_item_id - num_dkdv_work_items
-                # CORRECTED ORDER: Unpack M, then N
-                m_block_idx = item_id % num_m_blocks_2
-                item_id = item_id // num_m_blocks_2
-                n_block_idx = item_id % num_n_blocks_2
-                item_id = item_id // num_n_blocks_2
-                q_head_idx = item_id % num_q_heads
-                batch_idx = item_id // num_q_heads
-
-                # GQA: Map Q head to K/V head
-                k_head_idx = q_head_idx // GQA_GROUP_SIZE
-
-                start_m = m_block_idx * BLOCK_M2
-                start_n = n_block_idx * BLOCK_N2
-
-                dq_partial = tl.zeros([BLOCK_M2, HEAD_DIM], dtype=tl.float32)
-
-                offs_m = start_m + tl.arange(0, BLOCK_M2)
-                offs_d = tl.arange(0, HEAD_DIM)
-                mask_q = (offs_m[:, None] < max_seqlen_q) & (offs_d[None, :] < HEAD_DIM)
-                q_ptrs = Q + batch_idx*stride_qb + q_head_idx*stride_qh + offs_m[:,None]*stride_qm + offs_d[None,:]*stride_qd
-                do_ptrs = DO + batch_idx*stride_dob + q_head_idx*stride_doh + offs_m[:,None]*stride_dom + offs_d[None,:]*stride_dod
-                m_ptrs = M + batch_idx*stride_mb + q_head_idx*stride_mh + offs_m*stride_mm
-                q_tile = tl.load(q_ptrs, mask=mask_q, other=0.0)
-                do_tile = tl.load(do_ptrs, mask=mask_q, other=0.0)
-                m_tile = tl.load(m_ptrs, mask=(offs_m < max_seqlen_q), other=-float('inf'))[:, None]
-
-                # Use k_head_idx for K, V pointers
-                K_ptr = K + batch_idx * stride_kb + k_head_idx * stride_kh
-                V_ptr = V + batch_idx * stride_vb + k_head_idx * stride_vh
-                # Use q_head_idx for Delta pointer
-                Delta_ptr = Delta + batch_idx * stride_deltab + q_head_idx * stride_deltah
-
-                dq_partial = _bwd_dq_la_inner(
-                    dq_partial, q_tile, K_ptr, V_ptr, do_tile, m_tile, Delta_ptr, sm_scale,
-                    stride_kn, stride_kd, stride_vn, stride_vd, stride_deltam,
-                    max_seqlen_q, max_seqlen_k,
-                    BLOCK_M2, BLOCK_N2, HEAD_DIM,
-                    start_m, start_n, 1,
-                    CAUSAL=CAUSAL
-                )
-
-                # Use q_head_idx for atomic add pointer
-                dq_ptrs_out = DQ + batch_idx*stride_dqb + q_head_idx*stride_dqh + offs_m[:,None]*stride_dqm + offs_d[None,:]*stride_dqd
-                tl.atomic_add(dq_ptrs_out, dq_partial, mask=mask_q)
+            # Call the inner function to process one tile
+            _bwd_la_persistent_inner(
+                Q, K, V, sm_scale, DO, O, M, Delta,
+                DQ, DK, DV,
+                stride_qb, stride_qh, stride_qm, stride_qd,
+                stride_kb, stride_kh, stride_kn, stride_kd,
+                stride_vb, stride_vh, stride_vn, stride_vd,
+                stride_dob, stride_doh, stride_dom, stride_dod,
+                stride_dqb, stride_dqh, stride_dqm, stride_dqd,
+                stride_dkb, stride_dkh, stride_dkn, stride_dkd,
+                stride_dvb, stride_dvh, stride_dvn, stride_dvd,
+                stride_mb, stride_mh, stride_mm,
+                stride_deltab, stride_deltah, stride_deltam,
+                work_item_id,
+                num_dkdv_work_items,
+                num_q_heads, num_k_heads,
+                max_seqlen_q, max_seqlen_k,
+                num_m_blocks_1, num_m_blocks_2, num_n_blocks_1, num_n_blocks_2,
+                GQA_GROUP_SIZE,
+                BLOCK_M1, BLOCK_N1,
+                BLOCK_M2, BLOCK_N2,
+                HEAD_DIM,
+                CAUSAL,
+            )
 
 # ----------------------------------------------------------------------------
-# Python Launcher for the Persistent Backward Pass
+# REVISED: Scheduling function adapted from the forward pass reference
+# ----------------------------------------------------------------------------
+def get_bwd_scheduling_params(
+    batch_size, num_q_heads, num_k_heads, max_seqlen_q, max_seqlen_k,
+    BLOCK_M1, BLOCK_N1, BLOCK_M2, BLOCK_N2, num_SMs
+):
+    """
+    Calculates scheduling parameters for the backward pass, adapted from the
+    forward pass reference logic.
+    """
+    # Calculate the number of blocks for each workload
+    num_m_blocks_1 = triton.cdiv(max_seqlen_q, BLOCK_M1)
+    num_n_blocks_1 = triton.cdiv(max_seqlen_k, BLOCK_N1)
+    num_m_blocks_2 = triton.cdiv(max_seqlen_q, BLOCK_M2)
+    num_n_blocks_2 = triton.cdiv(max_seqlen_k, BLOCK_N2)
+
+    # Define the workload for each part of the backward pass
+    # Note: Unlike the fwd pass, the bwd pass workload is always a full grid.
+    # The `causal` logic from the fwd pass scheduling is not applicable here.
+    dkdv_tiles = batch_size * num_q_heads * num_m_blocks_1 * num_n_blocks_1
+    dq_tiles = batch_size * num_q_heads * num_m_blocks_2 * num_n_blocks_2
+    
+    # Combine workloads into a single pool of tiles
+    total_tiles = dkdv_tiles + dq_tiles
+
+    if total_tiles == 0:
+        return 0, 0, 0, 0, 0, 0, 0, 0, 0
+
+    # Determine grid size, matching the reference's use of num_SMs
+    num_wgs = num_SMs
+    if total_tiles < num_wgs:
+        num_wgs = total_tiles
+    
+    # Max number of tiles per work-group (task block/CTA)
+    max_tiles_per_wg = triton.cdiv(total_tiles, num_wgs)
+
+    # Number of work-groups that will have the max number of tiles
+    high_load_wgs = total_tiles % num_wgs
+    if high_load_wgs == 0 and total_tiles > 0:
+        high_load_wgs = num_wgs
+
+    return (
+        num_wgs,
+        total_tiles,
+        max_tiles_per_wg,
+        high_load_wgs,
+        dkdv_tiles, # This is the split point, `num_dkdv_work_items`
+        num_m_blocks_1,
+        num_m_blocks_2,
+        num_n_blocks_1,
+        num_n_blocks_2,
+    )
+
+# ----------------------------------------------------------------------------
+# REVISED: Python Launcher using the new scheduling function
 # ----------------------------------------------------------------------------
 
 def la_backward_persistent(
@@ -282,6 +386,7 @@ def la_backward_persistent(
     causal: bool,
     max_seqlen_q: int,
     max_seqlen_k: int,
+    num_sm: int = 108, # Example SM count, should be detected from hardware
 ):
     """
     Backward pass launcher using a persistent, work-centric kernel with atomic reductions.
@@ -294,7 +399,6 @@ def la_backward_persistent(
     batch, _, num_q_heads, head_sz = q.shape
     _, _, num_k_heads, _ = k.shape
     
-    # GQA Support
     gqa_group_size = num_q_heads // num_k_heads
     
     q_bhsd = q.transpose(1, 2).contiguous()
@@ -303,38 +407,31 @@ def la_backward_persistent(
     o_bhsd = o.transpose(1, 2).contiguous()
     do_bhsd = do.transpose(1, 2).contiguous()
     
-    # Create output tensors in the layout expected by the kernel
-    dq_bhsd = torch.empty_like(q_bhsd)
-    dk_bhsd = torch.empty_like(k_bhsd)
-    dv_bhsd = torch.empty_like(v_bhsd)
-    
-    dq_bhsd.zero_()
-    dk_bhsd.zero_()
-    dv_bhsd.zero_()
+    dq_bhsd = torch.zeros_like(q_bhsd)
+    dk_bhsd = torch.zeros_like(k_bhsd)
+    dv_bhsd = torch.zeros_like(v_bhsd)
 
     delta = torch.sum(o_bhsd * do_bhsd, dim=-1, keepdim=False)
 
-    num_m_blocks_1 = triton.cdiv(max_seqlen_q, config["BLOCK_M1"])
-    num_n_blocks_1 = triton.cdiv(max_seqlen_k, config["BLOCK_N1"])
-    num_m_blocks_2 = triton.cdiv(max_seqlen_q, config["BLOCK_M2"])
-    num_n_blocks_2 = triton.cdiv(max_seqlen_k, config["BLOCK_N2"])
+    # Use a fixed number of work-groups based on SM count, per the reference
+    num_wgs = num_sm * 4
 
-    # Define the total workload.
-    num_dkdv_work_items = batch * num_q_heads * num_n_blocks_1 * num_m_blocks_1
-    num_dq_work_items = batch * num_q_heads * num_m_blocks_2 * num_n_blocks_2
-    total_work_items = num_dkdv_work_items + num_dq_work_items
-
-    num_wgs = 108 * 4 
-    if total_work_items < num_wgs:
-        num_wgs = total_work_items if total_work_items > 0 else 1
-
-    max_tiles_per_wg = triton.cdiv(total_work_items, num_wgs)
-    high_load_wgs = total_work_items % num_wgs
-    if high_load_wgs == 0 and total_work_items > 0:
-        high_load_wgs = num_wgs
+    # REVISED: Calculate scheduling params using the adapted function
+    (num_wgs, total_work_items, max_tiles_per_wg, high_load_wgs, num_dkdv_work_items,
+     num_m_blocks_1, num_m_blocks_2, num_n_blocks_1, num_n_blocks_2
+    ) = get_bwd_scheduling_params(
+        batch, num_q_heads, num_k_heads, max_seqlen_q, max_seqlen_k,
+        config["BLOCK_M1"], config["BLOCK_N1"], config["BLOCK_M2"], config["BLOCK_N2"], num_wgs
+    )
+    
+    if total_work_items == 0:
+        dq.copy_(dq_bhsd.transpose(1, 2))
+        dk.copy_(dk_bhsd.transpose(1, 2))
+        dv.copy_(dv_bhsd.transpose(1, 2))
+        return
 
     grid = (num_wgs,)
-
+    
     bwd_la_persistent[grid](
         q_bhsd, k_bhsd, v_bhsd, sm_scale, do_bhsd, o_bhsd, softmax_lse, delta,
         dq_bhsd, dk_bhsd, dv_bhsd,

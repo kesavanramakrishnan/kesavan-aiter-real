@@ -395,57 +395,41 @@ def swizzle_head_first_balanced(
     return final_wid
 
 @triton.jit
-def _get_swizzled_head_index(
-    wid,
+def swizzle_head_first(
+    wid: tl.int32,
+    BATCH: tl.constexpr,
     NUM_Q_HEADS: tl.constexpr,
     NUM_BLOCKS: tl.constexpr,
     NUM_XCD: tl.constexpr,
-    BATCH: tl.constexpr
-):
+) -> tl.int32:
     """
-    Swizzles the work-group ID (wid) to calculate the remapped head index
-    for a blocked scheduling pattern.
+    Remaps to head first swizzling.
 
-    IMPORTANT: This function only returns the swizzled head index. The blocked
-    scheduling logic also remaps the block (`start_m`) and batch (`off_z`)
-    indices. The caller is responsible for calculating these separately using
-    the same logic to ensure the final (head, block, batch) coordinates are correct.
-
-    Args:
-        wid: The global work-group ID from tl.program_id(0).
-        NUM_Q_HEADS: Total number of query heads.
-        NUM_BLOCKS: Total number of blocks along the sequence length dimension.
-        NUM_XCD: The number of hardware units (e.g., XCDs) to schedule across.
-        BATCH: The batch size.
-
-    Returns:
-        The remapped `off_q_head` only.
+    NOTE: This logic assumes NUM_Q_HEADS is perfectly divisible by NUM_XCD.
     """
-    # --- Deconstruct wid to get batch index and within-batch wid ---
-    # Note: The logic to find the remapped block (`start_m`) and batch (`off_z`)
-    # is part of this calculation, but they are not returned.
-     # --- Deconstruct wid to get batch index and within-batch wid ---
+    
+    # Total work-groups per batch item
     WGS_PER_BATCH = NUM_Q_HEADS * NUM_BLOCKS
-    off_z = wid // WGS_PER_BATCH
+    
+    # Isolate the ID within the current batch item
     wid_in_batch = wid % WGS_PER_BATCH
 
-    # Determine the number of heads and work-groups per XCD
-    HEADS_PER_XCD = NUM_Q_HEADS // NUM_XCD
-    WGS_PER_XCD = WGS_PER_BATCH // NUM_XCD
+    # The target batch index is the same in both schemes
+    z_idx = wid // WGS_PER_BATCH
 
-    # Determine the target XCD and the local work-group ID within that XCD's share of work
-    xcd_idx = wid_in_batch // WGS_PER_XCD
-    local_wid_in_xcd = wid_in_batch % WGS_PER_XCD
+    # Chunk size for the head-first mapping
+    chunk_size = NUM_XCD * NUM_BLOCKS
 
-    # Within the XCD's work, maintain the kernel's required block-major ordering.
-    # The head index is the "inner" dimension (changes faster).
-    start_m = local_wid_in_xcd // HEADS_PER_XCD
-    local_head_idx = local_wid_in_xcd % HEADS_PER_XCD
+    # Calculate the target head and block indices using your original logic
+    h_idx = (wid_in_batch % NUM_XCD) * (NUM_Q_HEADS // NUM_XCD) + (wid_in_batch // chunk_size)
+    m_idx = (wid_in_batch % chunk_size) // NUM_XCD
 
-    # Calculate the final, global head index by offsetting by the XCD's starting head.
-    off_q_head = xcd_idx * HEADS_PER_XCD + local_head_idx
+    # --- Step 2: Reconstruct the new wid from the target coordinates ---
+    # This uses the inverse of the simple decomposition formula:
+    # new_wid = z * (NUM_BLOCKS * NUM_Q_HEADS) + m * NUM_Q_HEADS + h
+    swizzled_wid = z_idx * WGS_PER_BATCH + m_idx * NUM_Q_HEADS + h_idx
 
-    return off_q_head, start_m, off_z
+    return swizzled_wid
 
 @triton.jit
 def _attn_fwd(
@@ -523,37 +507,24 @@ def _attn_fwd(
     
     if MAPPING_MODE == 0:  # aiter case
         off_q_head = wid % NUM_Q_HEADS
+        # off_q_head = remap_xcd(off_q_head, NUM_Q_HEADS, NUM_XCD)
         start_m = (wid // NUM_Q_HEADS) % NUM_BLOCKS
         off_z = (wid // (NUM_BLOCKS * NUM_Q_HEADS)) % BATCH
-    # Conditional remap - only compiled when USE_REMAP is True
-        if USE_REMAP:
-            off_q_head = remap_xcd(off_q_head, NUM_Q_HEADS, NUM_XCD)
-      
+# Conditional remap - only compiled when USE_REMAP is True
+    # if USE_REMAP:
     elif MAPPING_MODE == 1:
-        num_xcds = 8
-        blocks_per_xcd = (NUM_BLOCKS + num_xcds - 1) // num_xcds
-        xcd_id = wid % num_xcds
-        local_block_id = wid // num_xcds
-        wid = local_block_id + xcd_id * blocks_per_xcd
-        start_m = wid % NUM_BLOCKS
-        off_q_head = (wid // NUM_BLOCKS) % NUM_Q_HEADS
-        off_z = (wid // NUM_BLOCKS) // NUM_Q_HEADS
-    # off_q_head, start_m, off_z = _get_swizzled_head_index(wid, NUM_Q_HEADS, NUM_BLOCKS, NUM_XCD, BATCH)
-    # off_q_head = wid % NUM_Q_HEADS
-    # off_q_head = _get_swizzled_head_index(wid, NUM_Q_HEADS, NUM_BLOCKS, NUM_XCD, BATCH)
-    # start_m = (wid // NUM_Q_HEADS) % NUM_BLOCKS
-    # off_z = (wid // (NUM_BLOCKS * NUM_Q_HEADS)) % BATCH
-        # off_z, off_q_head, start_m = swizzle_head_first_balanced(wid, NUM_Q_HEADS, NUM_BLOCKS, NUM_XCD)
-        # wid = swizzle_head_first_balanced(wid, BATCH, NUM_Q_HEADS, NUM_BLOCKS, NUM_XCD)
-        # start_m = wid % NUM_BLOCKS
-        # off_q_head = (wid // NUM_BLOCKS) % NUM_Q_HEADS
-        # off_z = wid // (NUM_Q_HEADS * NUM_BLOCKS)
+        wid = swizzle_head_first(wid, BATCH, NUM_Q_HEADS, NUM_BLOCKS, NUM_XCD)
+        off_q_head = wid % NUM_Q_HEADS
+        start_m = (wid // NUM_Q_HEADS) % NUM_BLOCKS
+        off_z = (wid // (NUM_BLOCKS * NUM_Q_HEADS)) % BATCH
     
     elif MAPPING_MODE == 2: # head first mapping
-    
         chunk_size = NUM_XCD * NUM_BLOCKS
-        wid_per_batch = wid // (NUM_Q_HEADS * NUM_BLOCKS)
-    
+        wid_per_batch = wid % (NUM_Q_HEADS * NUM_BLOCKS)
+
+        off_q_head = (wid_per_batch % NUM_XCD) * (NUM_Q_HEADS // NUM_XCD) + (wid_per_batch // chunk_size)
+        start_m = (wid_per_batch % chunk_size) // NUM_XCD
+        off_z = (wid // (NUM_BLOCKS * NUM_Q_HEADS)) % BATCH
     else: # MAPPING_MODE == 2, triton_fa case
         off_q_head = (wid_per_batch % NUM_XCD) * (NUM_Q_HEADS // NUM_XCD) + (wid_per_batch // chunk_size)
         start_m = (wid_per_batch % chunk_size) // NUM_XCD
