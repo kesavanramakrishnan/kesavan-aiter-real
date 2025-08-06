@@ -326,32 +326,66 @@ def get_num_splits_and_buffer_sizes(
         num_splits,
         even_split,
     )
-@triton.jit
-def swizzle_tile_id_for_lean(
-    logical_tile_id: tl.int32,
-    NUM_HEADS: tl.constexpr,
-    TILES_PER_HEAD: tl.constexpr,
-    NUM_XCD: tl.constexpr,  # This is total_programs
+    
+@triton.jit    
+def swizzle_by_grouping(
+    pid: tl.int32,
+    GROUP_SIZE: tl.constexpr,
 ) -> tl.int32:
     """
-    Remaps a logical tile ID to a physical tile ID to improve cache locality.
-    It groups heads onto different XCDs (the hardware execution units), so that
-    work-groups running on adjacent XCDs are more likely to work on the same
-    set of heads, maximizing K/V cache reuse.
+    Swizzles the program ID to improve locality by grouping consecutive PIDs.
+    This is a simpler pattern that is compatible with Stream-K style reduction.
 
-    NOTE: This logic assumes NUM_HEADS is perfectly divisible by NUM_XCD for
-    optimal mapping.
+    - pid: The original program ID from tl.program_id(0).
+    - GROUP_SIZE: The number of consecutive PIDs to group together.
+                  Should be a power of 2 (e.g., 2, 4, 8).
     """
-    chunk_size = NUM_XCD * TILES_PER_HEAD
+    # Find the ID of the group this pid belongs to.
+    group_id = pid // GROUP_SIZE
+    # Find the pid's position within its group.
+    pid_in_group = pid % GROUP_SIZE
 
-    # Decompose logical_tile_id to find its target physical coordinates
-    phys_head_idx = (logical_tile_id % NUM_XCD) * (NUM_HEADS // NUM_XCD) + (logical_tile_id // chunk_size)
-    phys_tile_in_head_idx = (logical_tile_id % chunk_size) // NUM_XCD
+    # Interleave the group_id and pid_in_group to create the new ID.
+    # This sends a whole group to one hardware unit before moving to the next.
+    swizzled_pid = group_id + (pid_in_group * (tl.num_programs(0) // GROUP_SIZE))
 
-    # Reconstruct the physical tile ID from the new coordinates
-    physical_tile_id = phys_head_idx * TILES_PER_HEAD + phys_tile_in_head_idx
+    return swizzled_pid
 
-    return physical_tile_id
+@triton.jit
+def swizzle_z_order(
+    pid: tl.int32,
+    NUM_HEADS: tl.constexpr,
+    NUM_M_BLOCKS: tl.constexpr,
+) -> tl.int32:
+    """
+    Remaps a program ID (pid) to a Z-order curve to improve 2D locality.
+    This maps work-groups for (head, m_block) that are close in 2D
+    to be close in the 1D hardware scheduling sequence.
+    """
+    # Decompose the original pid into 2D coordinates
+    head_idx = pid % NUM_HEADS
+    m_block_idx = pid // NUM_HEADS
+
+    # Interleave the bits of the 2D coordinates to create the Z-order index.
+    # This is a simplified implementation for demonstration.
+    # A full implementation would handle arbitrary bit lengths.
+    x = m_block_idx
+    y = head_idx
+
+    # A compact bit-interleaving function for up to 16 bits each
+    x = (x | (x << 8)) & 0x00FF00FF
+    x = (x | (x << 4)) & 0x0F0F0F0F
+    x = (x | (x << 2)) & 0x33333333
+    x = (x | (x << 1)) & 0x55555555
+
+    y = (y | (y << 8)) & 0x00FF00FF
+    y = (y | (y << 4)) & 0x0F0F0F0F
+    y = (y | (y << 2)) & 0x33333333
+    y = (y | (y << 1)) & 0x55555555
+
+    swizzled_pid = x | (y << 1)
+
+    return swizzled_pid
 
 @triton.jit
 def find_group(x, MASKED_BLOCKS: tl.constexpr, num_m_blocks: tl.constexpr):
@@ -441,6 +475,14 @@ def la_persistent(
         current_pid = pod_pid
     else:
         current_pid = tl.program_id(0)
+        
+    GROUP_SIZE = 12
+        
+    current_pid = swizzle_by_grouping(current_pid, GROUP_SIZE)
+    
+    # current_pid = swizzle_z_order(current_pid, NUM_HEADS, num_m_blocks)
+
+
 
     if current_pid < high_load_wgs:
         iter = max_tiles_per_wg * current_pid
@@ -585,14 +627,8 @@ def la_persistent_inner(
     # while iter < cta_end_tile_gid:
     # Calculate index of current head output tile
     # The tiles_per_head is the sum of # BLOCK_N in K/V sequence of all batches
-    physical_iter = swizzle_tile_id_for_lean(iter, NUM_HEADS, TILES_PER_HEAD_CONST, NUM_XCD)
-
-    # 2. Use the physical ID ONLY to determine the target head.
-    tile_head_idx = physical_iter // tiles_per_head
-
-    # 3. Use the original, unswizzled 'iter' to get the logical position WITHIN that head's workload.
-    logical_tile_in_head_idx = iter % tiles_per_head
-
+    
+    tile_head_idx = iter // tiles_per_head
     # To generate an otuput tile, a loop over [tile_iter, tile_iter_end) lean tiles is needed
     # [tile_iter, tile_iter_end) are in the form of global tile id
     if causal:
@@ -711,26 +747,14 @@ def la_persistent_inner(
 
         # Apply the causal mask
         #    qk = tl.where(mask, qk, float("-inf"))
-
+        
         if causal:
             # Get the starting column index of the current K block
             k_start_n = (b_seq_size + l_iter) * BLOCK_N
-
-            # High-level check: Is the K-block safely in the past?
-            if (k_start_n + BLOCK_N - 1) >= q_start_m:
-                # Otherwise, the block is on or near the diagonal and needs a detailed mask.
-                # 1. The standard causal mask based on absolute positions.
-                causal_mask = (q_start_m + offs_m[:, None]) >= (k_start_n + offs_n[None, :])
-
-                # 2. A second mask to handle the BLOCK_M > BLOCK_N case.
-                q_block_id = (q_start_m + offs_m[:, None]) // BLOCK_N
-                k_block_id = l_iter # In the causal case l_iter is the k_block_id
-                
-                block_m_mask = q_block_id >= k_block_id
-                # 3. Combine the masks. Both must be true.
-                final_mask = causal_mask & block_m_mask
-                
-                qk = tl.where(final_mask, qk, float("-inf"))
+            # Create mask based on absolute sequence positions
+            mask = (q_start_m + offs_m[:, None]) >= (k_start_n + offs_n[None, :])
+            # Apply the mask
+            qk = tl.where(mask, qk, float("-inf"))
 
         m_ij = tl.maximum(m_i, tl.max(qk, 1))
 

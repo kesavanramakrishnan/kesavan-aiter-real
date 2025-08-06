@@ -17,11 +17,9 @@ import numpy as np
 import matplotlib.pyplot as plt
 import seaborn as sns
 from matplotlib.colors import ListedColormap
-from typing import Dict, Any, Callable
+from typing import Dict, Any
 
 # Import the necessary functions from our other scripts
-# Note: Ensure swizzle_visualizer.py and mha_tracer.py are in the same directory
-# or accessible in the Python path.
 from swizzle_visualizer import (
     visualize_theoretical_mapping, 
     swizzle_mha_wid_balanced_python, 
@@ -39,12 +37,10 @@ def visualize_traced_mapping(
     mha_config: Dict[str, Any],
     traced_output: torch.Tensor,
     get_xcd_id_fn: Callable[[int, Dict[str, Any]], int],
-    title: str = "Actual (Traced) Swizzle Pattern",
-    output_filename: str = None
+    title: str = "Actual (Traced) Swizzle Pattern"
 ):
     """
     Visualizes the actual mapping derived from the tracer kernel's output.
-    Saves the plot to a file if a filename is provided.
     """
     num_heads = mha_config['NUM_Q_HEADS']
     num_xcds = mha_config['NUM_XCDS']
@@ -98,13 +94,7 @@ def visualize_traced_mapping(
             ax.text(b_idx, h_idx, f"XCD\n{xcd_id}", ha="center", va="center", color=text_color, fontsize=9, weight='bold', linespacing=1.5)
 
     plt.suptitle(f"{num_heads} Heads, {num_blocks} Blocks, {num_xcds} XCDs", fontsize=20, weight='bold')
-    
-    if output_filename:
-        plt.savefig(output_filename, bbox_inches='tight', dpi=150)
-        print(f"Saved plot to {output_filename}")
-    else:
-        plt.show()
-    plt.close(fig) # Close the figure to free memory
+    plt.show()
 
 # =================================================================
 #                            MAIN
@@ -124,50 +114,28 @@ def main():
         "NUM_XCDS": 4, # Number of hardware units (e.g., XCDs)
     }
 
-    # The original visualize_theoretical_mapping also needs to be updated to save files.
-    # For simplicity, we'll just call the updated traced mapping function with a theoretical map.
-    # This requires generating the theoretical map first.
-    num_h = mha_config_to_test['NUM_Q_HEADS']
-    num_b = cdiv(mha_config_to_test['SEQLEN_Q'], mha_config_to_test['BLOCK_M'])
-    theoretical_traced_output = torch.zeros(1, mha_config_to_test['SEQLEN_Q'], num_h, mha_config_to_test['HEAD_SZ'])
-    
-    temp_config = mha_config_to_test.copy()
-    temp_config['NUM_BLOCKS'] = num_b
-    
-    for h in range(num_h):
-        for b in range(num_b):
-            original_wid = h * num_b + b
-            # In the theoretical case, the work_group_id is the original_wid
-            theoretical_traced_output[0, b * temp_config['BLOCK_M']:(b+1)*temp_config['BLOCK_M'], h, :] = original_wid
-
-
-    print("--- Step 1: Visualizing and Saving Theoretical Mapping ---")
-    visualize_traced_mapping(
-        mha_config=mha_config_to_test.copy(),
-        traced_output=theoretical_traced_output,
+    print("--- Step 1: Visualizing Theoretical Mapping ---")
+    visualize_theoretical_mapping(
+        mha_config=mha_config_to_test.copy(), # Use a copy to avoid mutation
+        swizzle_fn=swizzle_mha_wid_balanced_python,
         get_xcd_id_fn=get_xcd_id_for_head_balanced,
-        title="Theoretical (Expected) Swizzle Pattern",
-        output_filename="theoretical_mapping.png"
+        title="Theoretical (Expected) Swizzle Pattern"
     )
 
     print("\n--- Step 2: Running Tracer Kernel for Actual Mapping ---")
     traced_output_tensor = flash_attn_tracer_func(mha_config_to_test)
     print("Tracer kernel finished.")
 
-    print("\n--- Step 3: Visualizing and Saving Actual (Traced) Mapping ---")
+    print("\n--- Step 3: Visualizing Actual (Traced) Mapping ---")
     visualize_traced_mapping(
         mha_config=mha_config_to_test.copy(), # Use a copy
         traced_output=traced_output_tensor,
         get_xcd_id_fn=get_xcd_id_for_head_balanced,
-        title="Actual (Traced from Kernel) Swizzle Pattern",
-        output_filename="actual_mapping.png"
+        title="Actual (Traced from Kernel) Swizzle Pattern"
     )
     
     print("\nVerification complete. Compare the two plots to confirm correctness.")
 
 
 if __name__ == '__main__':
-    # The traceback indicates a library incompatibility.
-    # This can often be resolved by reinstalling numpy and pandas.
-    # e.g., pip install --upgrade --force-reinstall numpy pandas
     main()

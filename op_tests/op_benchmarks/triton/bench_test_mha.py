@@ -6,7 +6,9 @@ import pytest
 import logging
 import numpy as np
 import triton
-import sys
+import sys, os
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "../../..")))
+
 
 from aiter.ops.triton.mha import (
     flash_attn_func,
@@ -104,6 +106,7 @@ for CAUSAL in [True]:
         triton.testing.Benchmark(
             x_names=["BATCH", "NUM_Q_HEADS", "NUM_K_HEADS", "SEQLEN_Q", "SEQLEN_K", "HEAD_SZ", "DROPOUT", "RETURN_LSE", "RETURN_SOFTMAX", "FP8"],
             x_vals=[
+                (1, 64, 64, 8192, 8192, 128, 0.0, False, False, False),
                 (2, 64, 64, 8192, 8192, 128, 0.0, False, False, False),
  #               (1, 64, 16, [131072], 128, 304, torch.float16, 16, 64, 2, 4),
  #               (1, 64, 16, [262144], 128, 304, torch.float16, 16, 64, 2, 4),

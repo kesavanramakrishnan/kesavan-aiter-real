@@ -7,7 +7,8 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../.
 import torch
 import triton
 
-from aiter.ops.triton.lean_atten import persistent_lean_attention
+# --- CHANGE 1: Import the low-level kernel directly ---
+from aiter.ops.triton.lean_atten_val import _persistent_lean_attention
 
 from bisect import bisect_right
 
@@ -170,74 +171,16 @@ configs.append(
             "num_warps",
         ],
         x_vals=[
-            (False, 2, 64, 16, [65536, 65536], 128, 912, torch.float16, 16, 128, 2, 4),
-            (False, 1, 64, 16, [131072], 128, 912, torch.float16, 16, 128, 2, 4),
-            (False, 1, 64, 16, [262144], 64, 912, torch.float16, 16, 64, 2, 4),
-            (False, 1, 64, 16, [524288], 64, 912, torch.float16, 16, 64, 2, 4),
-            (False, 2, 96, 16, [32768, 32768], 128, 912, torch.float16, 16, 128, 2, 4),
-            (False, 1, 96, 16, [65536], 128, 912, torch.float16, 16, 128, 2, 4),
-            (False, 1, 96, 16, [131072], 128, 912, torch.float16, 16, 128, 2, 4),
-            (False, 1, 96, 16, [262144], 64, 912, torch.float16, 16, 64, 2, 4),
-            (False, 1, 96, 16, [524288], 16, 912, torch.float16, 16, 256, 1, 4),  #
-            (False, 1, 96, 16, [1048576], 16, 912, torch.float16, 16, 256, 1, 4),  #
-            (False, 1, 128, 16, [32768], 128, 912, torch.float16, 16, 128, 2, 4),
-            (False, 1, 128, 16, [65536], 128, 912, torch.float16, 16, 128, 2, 4),
-            (False, 1, 128, 16, [131072], 128, 912, torch.float16, 16, 128, 2, 4),
-            (False, 1, 128, 16, [262144], 64, 912, torch.float16, 16, 64, 2, 4),
-            (False, 1, 128, 16, [524288], 16, 912, torch.float16, 16, 256, 1, 4),  #
-            (
-                False,
-                3,
-                64,
-                16,
-                [4096, 32768, 65536],
-                128,
-                912,
-                torch.float16,
-                16,
-                128,
-                2,
-                4,
-            ),
-            (
-                False,
-                8,
-                64,
-                16,
-                [1024, 1024, 2048, 2048, 4096, 4096, 32768, 65536],
-                128,
-                912,
-                torch.float16,
-                16,
-                128,
-                2,
-                4,
-            ),
-            (
-                True,
-                1,
-                64,
-                8192,
-                [8192],
-                128,
-                304,
-                torch.float16,
-                128,
-                64,
-                2,
-                4,
-            ),  # Causal=1,
-            (True, 2, 64, 2048, [2048, 2048], 128, 304, torch.float16, 128, 64, 2, 4),
+            # A few example test cases. Add more as needed.
+            # (False, 2, 64, 16, [65536, 65536], 128, 912, torch.float16, 16, 128, 2, 4),
+            (True, 1, 64, 8192, [8192, 8192], 128, 304, torch.float16, 128, 64, 2, 4),
         ],
         line_arg="provider",
         line_vals=["triton"],
         line_names=["Triton(ms)"],
-        # styles=[('red', '-'), ('blue', '-')],
         ylabel="ms",
         plot_name="lean-attention-",
-        args={
-            # "causal": causal,
-        },
+        args={},
     )
 )
 
@@ -278,14 +221,14 @@ def bench_lean_attention(
         BLOCK_N=BLOCK_N,
     )
     max_output_tile_cnt = max_output_tile_cnt + 4
+    
     # N_CTX is a list of context lengthes for all the req in a batch
     # First, calculate #BLOCK_N for each context length "list_num_block_n"
     # Second, Convert it to a list of assumulative lengthes "list_sum_block_n"
     # Third, convert list to a tensor "batch_num_block_n"
-    for s in n_ctx:
-        list_num_block_n = [
-            (int(str(s).strip()) + BLOCK_N - 1) // BLOCK_N for s in n_ctx
-        ]
+    list_num_block_n = [
+        (int(str(s).strip()) + BLOCK_N - 1) // BLOCK_N for s in n_ctx
+    ]
     len_sum = 0
     list_sum_block_n = []
     for i in range(batch):
@@ -313,8 +256,9 @@ def bench_lean_attention(
 
     locks = torch.zeros((total_programs,), device=q.device, dtype=torch.int32)
 
-    # Triton LeanAttention output
-    fn = lambda: persistent_lean_attention(  # noqa: E731
+    # --- CHANGE 2: Call the low-level function directly with all arguments ---
+    # This now matches the working call from test_la.py
+    fn = lambda: _persistent_lean_attention(  # noqa: E731
         q,
         k,
         v,
