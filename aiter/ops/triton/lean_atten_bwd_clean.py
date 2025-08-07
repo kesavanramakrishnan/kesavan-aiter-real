@@ -44,11 +44,12 @@ def _bwd_dkdv_la_inner(
         do = tl.load(do_ptrs, mask=mask_q, other=0.0)
 
         # Load softmax stats (log-sum-exp)
-        m_vals = tl.load(M_ptr + offs_m * stride_mm, mask=mask_m, other=0.0)
+        m_vals = tl.load(M_ptr + offs_m * stride_mm, mask=mask_m, other=-float('inf'))
 
         # Recompute P = exp(QK^T * sm_scale - M)
         qk = tl.dot(q, k_tile_T)
         p = tl.math.exp(qk * sm_scale - m_vals[:, None])
+        p = tl.where(m_vals[:, None] == -float('inf'), 0.0, p)
 
         if CAUSAL:
             causal_mask = (offs_m[:, None] >= (offs_n[None, :] + max_seqlen_q - max_seqlen_k))
@@ -63,7 +64,7 @@ def _bwd_dkdv_la_inner(
         # Compute dS, then dK
         dp = tl.dot(do, tl.trans(v_tile))
         ds = p * (dp - Di[:, None])
-        ds = ds * sm_scale
+        # ds = ds * sm_scale
         dk_acc += tl.dot(tl.trans(ds).to(q.type.element_ty), q)
 
         curr_m += BLOCK_M
@@ -101,6 +102,7 @@ def _bwd_dq_la_inner(
         # Compute P = exp(QK^T * sm_scale - M)
         qk = tl.dot(q_tile, tl.trans(k))
         p = tl.math.exp(qk * sm_scale - m_tile)
+        p = tl.where(m_tile == -float('inf'), 0.0, p)
 
         if CAUSAL:
             causal_mask = (offs_m[:, None] >= (offs_n[None, :] + max_seqlen_q - max_seqlen_k))
@@ -114,7 +116,7 @@ def _bwd_dq_la_inner(
 
         # Compute dS
         ds = p * (dp - Di[:, None])
-        ds = ds * sm_scale
+        # ds = ds * sm_scale
 
         # Compute dQ
         dq_acc += tl.dot(ds.to(k.dtype), k)
@@ -197,7 +199,7 @@ def _bwd_la_persistent_inner(
         dv_ptrs_out = DV + batch_idx*stride_dvb + k_head_idx*stride_dvh + offs_n[:,None]*stride_dvn + offs_d[None,:]*stride_dvd
         dk_ptrs_out = DK + batch_idx*stride_dkb + k_head_idx*stride_dkh + offs_n[:,None]*stride_dkn + offs_d[None,:]*stride_dkd
         tl.atomic_add(dv_ptrs_out, dv_partial, mask=mask_kv)
-        tl.atomic_add(dk_ptrs_out, dk_partial, mask=mask_kv)
+        tl.atomic_add(dk_ptrs_out, dk_partial * sm_scale, mask=mask_kv)
     else:
         # ========== COMPUTE PARTIAL dQ ==========
         item_id = work_item_id - num_dkdv_work_items
@@ -240,7 +242,7 @@ def _bwd_la_persistent_inner(
         )
 
         dq_ptrs_out = DQ + batch_idx*stride_dqb + q_head_idx*stride_dqh + offs_m[:,None]*stride_dqm + offs_d[None,:]*stride_dqd
-        tl.atomic_add(dq_ptrs_out, dq_partial, mask=mask_q)
+        tl.atomic_add(dq_ptrs_out, dq_partial * sm_scale, mask=mask_q)
 
 
 @triton.jit

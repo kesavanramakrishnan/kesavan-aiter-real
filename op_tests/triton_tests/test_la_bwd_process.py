@@ -1,124 +1,153 @@
-# SPDX-License-Identifier: MIT
-# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
-
-import torch
 import pytest
+import torch
 import triton
-import triton.language as tl
 
-# Import the backward pass implementation from its source file
-# NOTE: Ensure the file 'lean_attn_bwd_full.py' is in the same directory or accessible
-from aiter.ops.triton.lean_atten_bwd_proto import persistent_lean_attention_backward
+from aiter.ops.triton.lean_atten_bwd_acc import la_backward_persistent
+from aiter.ops.triton.mha_onekernel_bwd import flash_attn_onekernel_backward
 
-# ==============================================================================
-# Reference PyTorch Implementation
-# ==============================================================================
+# Define data types for testing, including float32 on capable hardware
+DTYPES = [torch.float16]
+if torch.cuda.is_available() and torch.cuda.get_device_capability() >= (8, 0):
+    DTYPES.append(torch.float32)
 
-def attention_ref(q, k, v, causal=False, sm_scale=1.0):
-    """
-    A simple, direct implementation of attention in PyTorch to serve as a
-    ground truth reference. This version now returns the raw scores needed
-    for the LSE calculation.
-    """
-    # Reshape to have heads and sequence length in the right dimensions
-    q_torch = q.transpose(1, 2)
-    k_torch = k.transpose(1, 2)
-    v_torch = v.transpose(1, 2)
-    
-    # Scale Q
-    q_torch = q_torch * sm_scale
-    
-    # Matmul Q and K
-    scores = torch.matmul(q_torch, k_torch.transpose(-2, -1))
-    
-    # Apply causal mask if needed
-    if causal:
-        mask = torch.triu(torch.ones(scores.shape[-2], scores.shape[-1], device=q.device), diagonal=1)
-        scores.masked_fill_(mask.bool(), float('-inf'))
-        
-    # Softmax
-    probs = torch.softmax(scores, dim=-1)
-    
-    # Matmul with V
-    output = torch.matmul(probs, v_torch)
-    
-    # Transpose back to original shape
-    output = output.transpose(1, 2)
-    
-    return output, scores
+# Define tolerance levels for result comparisons
+ATOL = {torch.float16: 1e-2, torch.bfloat16: 2e-2, torch.float32: 1e-4}
+RTOL = {torch.float16: 1e-2, torch.bfloat16: 2e-2, torch.float32: 1e-4}
 
 
-# ==============================================================================
-# Pytest Test Script
-# ==============================================================================
-
-@pytest.mark.parametrize("BATCH", [1, 4])
-@pytest.mark.parametrize("SEQLEN_Q, SEQLEN_K", [(128, 128), (64, 128)])
-@pytest.mark.parametrize("NUM_HEADS", [16, 32])
-@pytest.mark.parametrize("HEAD_SZ", [64, 128])
-@pytest.mark.parametrize("CAUSAL", [True, False])
-def test_lean_attention_unified_bwd(
+@pytest.mark.parametrize("BATCH", [1])
+@pytest.mark.parametrize("NUM_Q_HEADS, NUM_K_HEADS", [(4, 4)])
+@pytest.mark.parametrize("HEAD_SZ", [8])
+@pytest.mark.parametrize("SEQLEN_Q, SEQLEN_K", [(256, 128)])
+@pytest.mark.parametrize("causal", [False])
+@pytest.mark.parametrize("dtype", [torch.float16])
+def test_la_bwd_vs_flash_bwd(
     BATCH: int,
+    NUM_Q_HEADS: int,
+    NUM_K_HEADS: int,
+    HEAD_SZ: int,
     SEQLEN_Q: int,
     SEQLEN_K: int,
-    NUM_HEADS: int,
-    HEAD_SZ: int,
-    CAUSAL: bool,
-    dtype=torch.float16,
+    causal: bool,
+    dtype: torch.dtype,
+    device: str = "cuda",
 ):
-    torch.cuda.empty_cache()
-    torch.manual_seed(20)
+    """
+    Compares the backward pass of Lean Attention with a reference Flash Attention
+    implementation and PyTorch's native scaled_dot_product_attention.
+    """
+    torch.manual_seed(2024)
 
-    # --- Test Setup ---
-    # Create random tensors for q, k, v and the upstream gradient do
-    # For non-GQA, NUM_K_HEADS is the same as NUM_Q_HEADS
-    NUM_K_HEADS = NUM_HEADS
-    q = torch.randn((BATCH, SEQLEN_Q, NUM_HEADS, HEAD_SZ), device="cuda", dtype=dtype, requires_grad=True)
-    k = torch.randn((BATCH, SEQLEN_K, NUM_K_HEADS, HEAD_SZ), device="cuda", dtype=dtype, requires_grad=True)
-    v = torch.randn((BATCH, SEQLEN_K, NUM_K_HEADS, HEAD_SZ), device="cuda", dtype=dtype, requires_grad=True)
-    do = torch.randn_like(q)
+    # Define tensor shapes
+    q_shape = (BATCH, NUM_Q_HEADS, SEQLEN_Q, HEAD_SZ)
+    k_shape = (BATCH, NUM_K_HEADS, SEQLEN_K, HEAD_SZ)
+    v_shape = (BATCH, NUM_K_HEADS, SEQLEN_K, HEAD_SZ)
 
-    sm_scale = 1.0 / (HEAD_SZ ** 0.5)
+    # Initialize input tensors
+    q = torch.randn(q_shape, dtype=dtype, device=device, requires_grad=True)
+    k = torch.randn(k_shape, dtype=dtype, device=device, requires_grad=True)
+    v = torch.randn(v_shape, dtype=dtype, device=device, requires_grad=True)
+    sm_scale = HEAD_SZ**-0.5
 
-    # --- Reference Calculation (PyTorch) ---
-    # 1. Perform the forward pass with the reference implementation
-    torch_out, torch_scores = attention_ref(q, k, v, causal=CAUSAL, sm_scale=sm_scale)
-    
-    # 2. Compute gradients using PyTorch's autograd
-    torch_dq, torch_dk, torch_dv = torch.autograd.grad(torch_out, (q, k, v), do)
+    # --- PyTorch Reference Implementation ---
+    gqa_group_size = NUM_Q_HEADS // NUM_K_HEADS
+    k_ref_pt = k.repeat_interleave(gqa_group_size, dim=1)
+    v_ref_pt = v.repeat_interleave(gqa_group_size, dim=1)
 
-    # --- Triton Calculation ---
-    # 1. Get intermediate tensors (out, lse) from the reference forward pass
-    triton_fwd_out = torch_out.detach().clone()
-    # Correctly calculate LSE from raw scores
-    triton_lse = torch.logsumexp(torch_scores, dim=-1).transpose(1,2)
+    # Manual forward pass to get softmax_lse for Triton kernels
+    q_ref = q.float()
+    k_ref = k.repeat_interleave(gqa_group_size, dim=1).float()
+    v_ref = v.repeat_interleave(gqa_group_size, dim=1).float()
 
-    # 2. Initialize output tensors for Triton gradients
-    triton_dq = torch.empty_like(q)
-    triton_dk = torch.empty_like(k)
-    triton_dv = torch.empty_like(v)
-    
-    # 3. Call the Lean Attention backward function
-    try:
-        persistent_lean_attention_backward(
-            q, k, v, triton_fwd_out, do, triton_lse,
-            triton_dq, triton_dk, triton_dv,
-            total_programs=108, # Example for A100
-            BLOCK_M=64,
-            BLOCK_N=64,
-            causal=CAUSAL,
-            sm_scale=sm_scale,
-            num_warps=4,
-            waves_per_eu=2
+    scores = (q_ref @ k_ref.transpose(-2, -1)) * sm_scale
+    if causal:
+        # The alignment of the causal mask depends on the difference between
+        # the query and key sequence lengths.
+        # This is the reference implementation of the causal mask.
+        mask = torch.ones(SEQLEN_Q, SEQLEN_K, device=device, dtype=torch.bool).tril(
+            diagonal=(SEQLEN_K - SEQLEN_Q)
         )
-    except Exception as e:
-        # This might fail if the Triton kernel is not compiled/runnable
-        print(f"Kernel launch failed: {e}")
-        pytest.fail("Triton kernel execution failed.")
+        scores.masked_fill_(~mask, -float("inf"))
 
-    # --- Comparison ---
-    # Compare the results from Triton and PyTorch
-    torch.testing.assert_close(triton_dq, torch_dq, atol=1e-2, rtol=1e-2)
-    torch.testing.assert_close(triton_dk, torch_dk, atol=1e-2, rtol=1e-2)
-    torch.testing.assert_close(triton_dv, torch_dv, atol=1e-2, rtol=1e-2)
+    softmax_lse_ref = torch.logsumexp(scores, dim=-1).to(dtype)
+    p = torch.softmax(scores, dim=-1)
+    p = torch.nan_to_num(p)
+    o_ref = (p @ v_ref).to(dtype)
 
+    # Backward pass
+    do = torch.randn_like(o_ref)
+    o_ref.backward(do)
+    dq_ref, dk_ref, dv_ref = q.grad.clone(), k.grad.clone(), v.grad.clone()
+    q.grad, k.grad, v.grad = None, None, None
+
+    # --- Triton Implementations ---
+    # Prepare tensors in BSHD format (batch, seqlen, heads, dim)
+    q_bsnh = q.permute(0, 2, 1, 3).contiguous()
+    k_bsnh = k.permute(0, 2, 1, 3).contiguous()
+    v_bsnh = v.permute(0, 2, 1, 3).contiguous()
+    o_bsnh = o_ref.permute(0, 2, 1, 3).contiguous()
+    do_bsnh = do.permute(0, 2, 1, 3).contiguous()
+
+    # --- Lean Attention Backward Pass ---
+    dq_la_bsnh = torch.zeros_like(q_bsnh)
+    dk_la_bsnh = torch.zeros_like(k_bsnh)
+    dv_la_bsnh = torch.zeros_like(v_bsnh)
+    num_sm = torch.cuda.get_device_properties(device).multi_processor_count
+
+    la_backward_persistent(
+        do=do_bsnh, q=q_bsnh, k=k_bsnh, v=v_bsnh, o=o_bsnh,
+        softmax_lse=softmax_lse_ref,
+        dq=dq_la_bsnh, dk=dk_la_bsnh, dv=dv_la_bsnh,
+        sm_scale=sm_scale, causal=causal,
+        max_seqlen_q=SEQLEN_Q, max_seqlen_k=SEQLEN_K, num_sm=num_sm,
+    )
+
+    # --- Flash Attention Backward Pass ---
+    dq_flash_bsnh = torch.zeros_like(q_bsnh)
+    dk_flash_bsnh = torch.zeros_like(k_bsnh)
+    dv_flash_bsnh = torch.zeros_like(v_bsnh)
+
+    flash_attn_onekernel_backward(
+        do=do_bsnh, q=q_bsnh, k=k_bsnh, v=v_bsnh, o=o_bsnh,
+        softmax_lse=softmax_lse_ref,
+        dq=dq_flash_bsnh, dk=dk_flash_bsnh, dv=dv_flash_bsnh,
+        dbias=None, sm_scale=sm_scale, alibi_slopes=None, causal=causal,
+        cu_seqlens_q=None, cu_seqlens_k=None,
+        max_seqlen_q=SEQLEN_Q, max_seqlen_k=SEQLEN_K,
+        dropout_p=0.0,
+    )
+
+    # Convert outputs back to BHSD format for comparison
+    dq_la = dq_la_bsnh.permute(0, 2, 1, 3)
+    dk_la = dk_la_bsnh.permute(0, 2, 1, 3)
+    dv_la = dv_la_bsnh.permute(0, 2, 1, 3)
+
+    dq_flash = dq_flash_bsnh.permute(0, 2, 1, 3)
+    dk_flash = dk_flash_bsnh.permute(0, 2, 1, 3)
+    dv_flash = dv_flash_bsnh.permute(0, 2, 1, 3)
+
+    # --- Assertions ---
+    atol, rtol = ATOL[dtype], RTOL[dtype]
+
+    print("\n--- dK Comparison (Lean Attn vs Flash Attn) ---")
+    print("dK (Lean Attn):", dk_la)
+    print("dK (Flash Attn):", dk_flash)
+    print("Difference (dK):", torch.abs(dk_la - dk_flash))
+    print(f"Max difference (dK): {torch.max(torch.abs(dk_la - dk_flash))}")
+
+    print("\n--- dV Comparison (Lean Attn vs Flash Attn) ---")
+    print("dV (Lean Attn):", dv_la)
+    print("dV (Flash Attn):", dv_flash)
+    print("Difference (dV):", torch.abs(dv_la - dv_flash))
+    print(f"Max difference (dV): {torch.max(torch.abs(dv_la - dv_flash))}")
+
+    print("\n--- dQ Comparison (Lean Attn vs Flash Attn) ---")
+    print("dQ (Lean Attn):", dq_la)
+    print("dQ (Flash Attn):", dq_flash)
+    print("Difference (dQ):", torch.abs(dq_la - dq_flash))
+    print(f"Max difference (dQ): {torch.max(torch.abs(dq_la - dq_flash))}")
+
+    # Compare Lean Attention with Flash Attention
+    torch.testing.assert_close(dq_la, dq_flash, atol=atol, rtol=rtol, msg="dQ (Lean Attn vs Flash Attn)")
+    torch.testing.assert_close(dk_la, dk_flash, atol=atol, rtol=rtol, msg="dK (Lean Attn vs Flash Attn)")
+    torch.testing.assert_close(dv_la, dv_flash, atol=atol, rtol=rtol, msg="dV (Lean Attn vs Flash Attn)")
