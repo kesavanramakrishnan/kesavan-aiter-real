@@ -131,7 +131,8 @@ def _bwd_la_persistent_inner(
     Q, K, V, sm_scale, DO, O, M, Delta,
     DQ, DK, DV,
     # Partial results buffers for host-based reduction
-    DK_partials, DV_partials, locks,
+    DK_partials, DV_partials, locks_dkdv,
+    DQ_partials, locks_dq,
     # Strides
     stride_qb, stride_qh, stride_qm, stride_qd,
     stride_kb, stride_kh, stride_kn, stride_kd,
@@ -149,6 +150,7 @@ def _bwd_la_persistent_inner(
     max_seqlen_q, max_seqlen_k,
     # Scheduling for host reduction
     work_per_dk_block,
+    work_per_dq_block,
     num_m_blocks_1, num_m_blocks_2, num_n_blocks_1, num_n_blocks_2,
     GQA_GROUP_SIZE: tl.constexpr,
     # Meta-parameters
@@ -182,8 +184,8 @@ def _bwd_la_persistent_inner(
         
         q_head_idx = k_head_idx * GQA_GROUP_SIZE + q_head_group_idx
 
-        # The first worker in the block is the host.
-        is_host = (work_in_dk_block_id == 0)
+        # Make the last worker in the block the host, so all workers are scheduled before it
+        is_host = (work_in_dk_block_id == (work_per_dk_block - 1))
 
         start_m = m_block_idx * BLOCK_M1
         start_n = n_block_idx * BLOCK_N1
@@ -194,6 +196,9 @@ def _bwd_la_persistent_inner(
 
         offs_n = start_n + tl.arange(0, BLOCK_N1)
         offs_d = tl.arange(0, HEAD_DIM)
+        # Local indices for partial buffers (always 0..BLOCK_N1-1, 0..HEAD_DIM-1)
+        local_n = tl.arange(0, BLOCK_N1)
+        local_d = tl.arange(0, HEAD_DIM)
         mask_kv = (offs_n[:, None] < max_seqlen_k) & (offs_d[None, :] < HEAD_DIM)
         
         k_ptrs = K + batch_idx*stride_kb + k_head_idx*stride_kh + offs_n[:,None]*stride_kn + offs_d[None,:]*stride_kd
@@ -218,18 +223,18 @@ def _bwd_la_persistent_inner(
         # Host-based reduction logic
         if is_host:
             # Loop through all other work items that contribute to this dK/dV block
-            for i in range(1, work_per_dk_block):
+            for i in range(0, work_per_dk_block - 1):
                 # Wait for the worker CTA to signal that it's done
-                while tl.atomic_cas(locks + dk_block_id * work_per_dk_block + i, 1, 1) != 1:
+                while tl.atomic_cas(locks_dkdv + dk_block_id * work_per_dk_block + i, 1, 1) != 1:
                     pass
                 
                 # Load the partial results from the worker
                 worker_work_item_id = dk_block_id * work_per_dk_block + i
-                dk_worker_partial_ptr = DK_partials + worker_work_item_id * (BLOCK_N1 * HEAD_DIM) + offs_n[:, None] * HEAD_DIM + offs_d[None, :]
-                dv_worker_partial_ptr = DV_partials + worker_work_item_id * (BLOCK_N1 * HEAD_DIM) + offs_n[:, None] * HEAD_DIM + offs_d[None, :]
+                dk_worker_partial_ptr = DK_partials + worker_work_item_id * (BLOCK_N1 * HEAD_DIM) + local_n[:, None] * HEAD_DIM + local_d[None, :]
+                dv_worker_partial_ptr = DV_partials + worker_work_item_id * (BLOCK_N1 * HEAD_DIM) + local_n[:, None] * HEAD_DIM + local_d[None, :]
 
-                dk_worker_partial = tl.load(dk_worker_partial_ptr, mask=mask_kv)
-                dv_worker_partial = tl.load(dv_worker_partial_ptr, mask=mask_kv)
+                dk_worker_partial = tl.load(dk_worker_partial_ptr)
+                dv_worker_partial = tl.load(dv_worker_partial_ptr)
 
                 # Accumulate the worker's results
                 dk_accumulator += dk_worker_partial
@@ -244,30 +249,32 @@ def _bwd_la_persistent_inner(
         else:
             # If this is not the host, write partial results to temporary storage
             # and signal completion.
-            dk_partial_ptrs = DK_partials + work_item_id * (BLOCK_N1 * HEAD_DIM) + offs_n[:, None] * HEAD_DIM + offs_d[None, :]
-            dv_partial_ptrs = DV_partials + work_item_id * (BLOCK_N1 * HEAD_DIM) + offs_n[:, None] * HEAD_DIM + offs_d[None, :]
+            dk_partial_ptrs = DK_partials + work_item_id * (BLOCK_N1 * HEAD_DIM) + local_n[:, None] * HEAD_DIM + local_d[None, :]
+            dv_partial_ptrs = DV_partials + work_item_id * (BLOCK_N1 * HEAD_DIM) + local_n[:, None] * HEAD_DIM + local_d[None, :]
 
-            tl.store(dk_partial_ptrs, dk_accumulator, mask=mask_kv)
-            tl.store(dv_partial_ptrs, dv_accumulator, mask=mask_kv)
+            tl.store(dk_partial_ptrs, dk_accumulator, cache_modifier=".wt")
+            tl.store(dv_partial_ptrs, dv_accumulator, cache_modifier=".wt")
             
             # Signal that this worker has completed its task
-            tl.atomic_xchg(locks + work_item_id, 1)
+            tl.atomic_xchg(locks_dkdv + work_item_id, 1)
     
     else:
-        # ========== COMPUTE PARTIAL dQ ==========
-        item_id = work_item_id - num_dkdv_work_items
-        m_block_idx = item_id % num_m_blocks_2
-        item_id = item_id // num_m_blocks_2
-        n_block_idx = item_id % num_n_blocks_2
-        item_id = item_id // num_n_blocks_2
-        q_head_idx = item_id % num_q_heads
-        batch_idx = item_id // num_q_heads
+        # ========== COMPUTE PARTIAL dQ with host reduction ==========
+        local_id = work_item_id - num_dkdv_work_items
+        dq_block_id = local_id // work_per_dq_block
+        work_in_dq_block_id = local_id % work_per_dq_block
+
+        temp = dq_block_id
+        m_block_idx = temp % num_m_blocks_2
+        temp //= num_m_blocks_2
+        q_head_idx = temp % num_q_heads
+        batch_idx = temp // num_q_heads
 
         k_head_idx = q_head_idx // GQA_GROUP_SIZE
         start_m = m_block_idx * BLOCK_M2
-        start_n = n_block_idx * BLOCK_N2
+        start_n = work_in_dq_block_id * BLOCK_N2
 
-        dq_partial = tl.zeros([BLOCK_M2, HEAD_DIM], dtype=tl.float32)
+        dq_accumulator = tl.zeros([BLOCK_M2, HEAD_DIM], dtype=tl.float32)
 
         offs_m = start_m + tl.arange(0, BLOCK_M2)
         offs_d = tl.arange(0, HEAD_DIM)
@@ -285,8 +292,8 @@ def _bwd_la_persistent_inner(
         V_ptr = V + batch_idx * stride_vb + k_head_idx * stride_vh
         Delta_ptr = Delta + batch_idx * stride_deltab + q_head_idx * stride_deltah
 
-        dq_partial = _bwd_dq_la_inner(
-            dq_partial, q_tile, K_ptr, V_ptr, do_tile, m_tile, Delta_ptr, sm_scale,
+        dq_accumulator = _bwd_dq_la_inner(
+            dq_accumulator, q_tile, K_ptr, V_ptr, do_tile, m_tile, Delta_ptr, sm_scale,
             stride_kn, stride_kd, stride_vn, stride_vd, stride_deltam,
             max_seqlen_q, max_seqlen_k,
             BLOCK_M2, BLOCK_N2, HEAD_DIM,
@@ -294,8 +301,27 @@ def _bwd_la_persistent_inner(
             CAUSAL=CAUSAL
         )
 
-        dq_ptrs_out = DQ + batch_idx*stride_dqb + q_head_idx*stride_dqh + offs_m[:,None]*stride_dqm + offs_d[None,:]*stride_dqd
-        tl.atomic_add(dq_ptrs_out, dq_partial * sm_scale, mask=mask_q)
+        # Host is last work in the block
+        is_host = (work_in_dq_block_id == (work_per_dq_block - 1))
+        local_m = tl.arange(0, BLOCK_M2)
+        local_d = tl.arange(0, HEAD_DIM)
+
+        if is_host:
+            for i in range(0, work_per_dq_block - 1):
+                while tl.atomic_cas(locks_dq + dq_block_id * work_per_dq_block + i, 1, 1) != 1:
+                    pass
+                worker_local_item_id = dq_block_id * work_per_dq_block + i
+                dq_worker_ptr = DQ_partials + worker_local_item_id * (BLOCK_M2 * HEAD_DIM) + local_m[:, None] * HEAD_DIM + local_d[None, :]
+                dq_worker_partial = tl.load(dq_worker_ptr)
+                dq_accumulator += dq_worker_partial
+
+            dq_ptrs_out = DQ + batch_idx*stride_dqb + q_head_idx*stride_dqh + offs_m[:,None]*stride_dqm + offs_d[None,:]*stride_dqd
+            tl.store(dq_ptrs_out, (dq_accumulator * sm_scale).to(DQ.dtype.element_ty), mask=mask_q)
+        else:
+            my_local_item_id = local_id
+            dq_partial_ptr = DQ_partials + my_local_item_id * (BLOCK_M2 * HEAD_DIM) + local_m[:, None] * HEAD_DIM + local_d[None, :]
+            tl.store(dq_partial_ptr, dq_accumulator, cache_modifier=".wt")
+            tl.atomic_xchg(locks_dq + dq_block_id * work_per_dq_block + work_in_dq_block_id, 1)
 
 
 @triton.jit
@@ -304,7 +330,8 @@ def bwd_la_persistent(
     Q, K, V, sm_scale, DO, O, M, Delta,
     DQ, DK, DV,
     # Partial results buffers for host-based reduction
-    DK_partials, DV_partials, locks,
+    DK_partials, DV_partials, locks_dkdv,
+    DQ_partials, locks_dq,
     # Strides
     stride_qb, stride_qh, stride_qm, stride_qd,
     stride_kb, stride_kh, stride_kn, stride_kd,
@@ -326,6 +353,7 @@ def bwd_la_persistent(
     max_seqlen_q, max_seqlen_k,
     # Scheduling for host reduction
     work_per_dk_block,
+    work_per_dq_block,
     num_m_blocks_1, num_m_blocks_2, num_n_blocks_1, num_n_blocks_2,
     GQA_GROUP_SIZE: tl.constexpr,
     # Meta-parameters
@@ -352,7 +380,8 @@ def bwd_la_persistent(
             _bwd_la_persistent_inner(
                 Q, K, V, sm_scale, DO, O, M, Delta,
                 DQ, DK, DV,
-                DK_partials, DV_partials, locks,
+                DK_partials, DV_partials, locks_dkdv,
+                DQ_partials, locks_dq,
                 stride_qb, stride_qh, stride_qm, stride_qd,
                 stride_kb, stride_kh, stride_kn, stride_kd,
                 stride_vb, stride_vh, stride_vn, stride_vd,
@@ -367,6 +396,7 @@ def bwd_la_persistent(
                 num_q_heads, num_k_heads,
                 max_seqlen_q, max_seqlen_k,
                 work_per_dk_block,
+                work_per_dq_block,
                 num_m_blocks_1, num_m_blocks_2, num_n_blocks_1, num_n_blocks_2,
                 GQA_GROUP_SIZE,
                 BLOCK_M1, BLOCK_N1,
@@ -395,15 +425,18 @@ def get_bwd_scheduling_params(
     # Define the workload for each part of the backward pass
     dkdv_work_items = batch_size * num_k_heads * num_n_blocks_1
     work_per_dk_block = num_m_blocks_1 * gqa_group_size
+    # For dQ, each (batch, q_head, m_block) reduces over all n_blocks
+    dq_work_items = batch_size * num_q_heads * num_m_blocks_2
+    work_per_dq_block = num_n_blocks_2
     
     total_dkdv_work_items = dkdv_work_items * work_per_dk_block
-    dq_tiles = batch_size * num_q_heads * num_m_blocks_2 * num_n_blocks_2
+    total_dq_work_items = dq_work_items * work_per_dq_block
     
     # Combine workloads into a single pool of tiles
-    total_tiles = total_dkdv_work_items + dq_tiles
+    total_tiles = total_dkdv_work_items + total_dq_work_items
 
     if total_tiles == 0:
-        return 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
+        return 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
 
     # Determine grid size, matching the reference's use of num_SMs
     num_wgs = num_SMs
@@ -425,6 +458,7 @@ def get_bwd_scheduling_params(
         high_load_wgs,
         total_dkdv_work_items, # This is the split point, `num_dkdv_work_items`
         work_per_dk_block,
+        work_per_dq_block,
         num_m_blocks_1,
         num_m_blocks_2,
         num_n_blocks_1,
@@ -481,7 +515,7 @@ def la_backward_persistent(
 
     # REVISED: Calculate scheduling params using the adapted function
     (num_wgs, total_work_items, max_tiles_per_wg, high_load_wgs, num_dkdv_work_items,
-     work_per_dk_block, num_m_blocks_1, num_m_blocks_2, num_n_blocks_1, num_n_blocks_2
+     work_per_dk_block, work_per_dq_block, num_m_blocks_1, num_m_blocks_2, num_n_blocks_1, num_n_blocks_2
     ) = get_bwd_scheduling_params(
         batch, num_q_heads, num_k_heads, max_seqlen_q, max_seqlen_k,
         config["BLOCK_M1"], config["BLOCK_N1"], config["BLOCK_M2"], config["BLOCK_N2"], num_wgs, gqa_group_size
@@ -491,7 +525,12 @@ def la_backward_persistent(
     num_dk_blocks = (num_dkdv_work_items // work_per_dk_block)
     dk_partials = torch.empty((num_dk_blocks, work_per_dk_block, config["BLOCK_N1"], head_sz), dtype=torch.float32, device=q.device)
     dv_partials = torch.empty((num_dk_blocks, work_per_dk_block, config["BLOCK_N1"], head_sz), dtype=torch.float32, device=q.device)
-    locks = torch.zeros((num_dk_blocks, work_per_dk_block), dtype=torch.int32, device=q.device)
+    locks_dkdv = torch.zeros((num_dk_blocks, work_per_dk_block), dtype=torch.int32, device=q.device)
+
+    # dQ partials: shape per work item is (BLOCK_M2, HEAD_DIM)
+    num_dq_blocks = batch * num_q_heads * num_m_blocks_2
+    dq_partials = torch.empty((num_dq_blocks, work_per_dq_block, config["BLOCK_M2"], head_sz), dtype=torch.float32, device=q.device)
+    locks_dq = torch.zeros((num_dq_blocks, work_per_dq_block), dtype=torch.int32, device=q.device)
 
     if total_work_items == 0:
         dq.copy_(dq_bhsd.transpose(1, 2))
@@ -504,7 +543,8 @@ def la_backward_persistent(
     bwd_la_persistent[grid](
         q_bhsd, k_bhsd, v_bhsd, sm_scale, do_bhsd, o_bhsd, softmax_lse, delta,
         dq_bhsd, dk_bhsd, dv_bhsd,
-        dk_partials, dv_partials, locks,
+        dk_partials, dv_partials, locks_dkdv,
+        dq_partials, locks_dq,
         q_bhsd.stride(0), q_bhsd.stride(1), q_bhsd.stride(2), q_bhsd.stride(3),
         k_bhsd.stride(0), k_bhsd.stride(1), k_bhsd.stride(2), k_bhsd.stride(3),
         v_bhsd.stride(0), v_bhsd.stride(1), v_bhsd.stride(2), v_bhsd.stride(3),
@@ -521,6 +561,7 @@ def la_backward_persistent(
         num_q_heads, num_k_heads,
         max_seqlen_q, max_seqlen_k,
         work_per_dk_block,
+        work_per_dq_block,
         num_m_blocks_1, num_m_blocks_2, num_n_blocks_1, num_n_blocks_2,
         gqa_group_size,
         HEAD_DIM=head_sz,
