@@ -28,8 +28,6 @@ def _bwd_dkdv_la_inner(
     offs_n = start_n + tl.arange(0, BLOCK_N)
     offs_d = tl.arange(0, HEAD_DIM)
 
-    k_tile_T = tl.trans(k_tile)
-
     curr_m = start_m_loop
     for _ in range(num_m_steps):
         offs_m = curr_m + tl.arange(0, BLOCK_M)
@@ -46,26 +44,30 @@ def _bwd_dkdv_la_inner(
         # Load softmax stats (log-sum-exp)
         m_vals = tl.load(M_ptr + offs_m * stride_mm, mask=mask_m, other=-float('inf'))
 
-        # Recompute P = exp(QK^T * sm_scale - M)
-        qk = tl.dot(q, k_tile_T)
-        p = tl.math.exp(qk * sm_scale - m_vals[:, None])
-        p = tl.where(m_vals[:, None] == -float('inf'), 0.0, p)
+        # Transposed-domain recompute: KQT and operate with P^T
+        # kq = K_tile @ Q^T -> [BLOCK_N, BLOCK_M]
+        kq = tl.dot(k_tile, tl.trans(q))
+        # p_T[j,i] = exp(kq[j,i] * sm_scale - m_vals[i])
+        p_T = tl.math.exp(kq * sm_scale - m_vals[None, :])
+        p_T = tl.where(m_vals[None, :] == -float('inf'), 0.0, p_T)
 
         if CAUSAL:
-            causal_mask = (offs_m[:, None] >= (offs_n[None, :] + max_seqlen_q - max_seqlen_k))
-            p = tl.where(causal_mask, p, 0.0)
+            # causal mask transposed: allow only when q_pos >= k_pos
+            causal_mask_T = (offs_m[None, :] >= (offs_n[:, None] + max_seqlen_q - max_seqlen_k))
+            p_T = tl.where(causal_mask_T, p_T, 0.0)
 
         # Load Delta
         Di = tl.load(Delta_ptr + offs_m * stride_deltam, mask=mask_m, other=0.0)
 
-        # Compute dV
-        dv_acc += tl.dot(tl.trans(p).to(do.type.element_ty), do)
+        # Compute dV: dV += P^T @ dO -> use transposed-domain p_T directly
+        dv_acc += tl.dot(p_T.to(do.type.element_ty), do)
 
-        # Compute dS, then dK
-        dp = tl.dot(do, tl.trans(v_tile))
-        ds = p * (dp - Di[:, None])
-        # ds = ds * sm_scale
-        dk_acc += tl.dot(tl.trans(ds).to(q.type.element_ty), q)
+        # Compute dS in transposed domain, then dK
+        # dp_T = (dO @ V^T)^T = V @ dO^T -> [BLOCK_N, BLOCK_M]
+        dp_T = tl.dot(v_tile, tl.trans(do))
+        ds_T = p_T * (dp_T - Di[None, :])
+        # ds_T = ds_T * sm_scale (scaling applied at store site as before)
+        dk_acc += tl.dot(ds_T.to(q.dtype), q)
 
         curr_m += BLOCK_M
 
