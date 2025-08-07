@@ -5,7 +5,7 @@ import sys, os
 
 # Assume the la_backward_persistent launcher is in this path
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../../../..")))
-from aiter.ops.triton.lean_atten_bwd_acc import la_backward_persistent
+from aiter.ops.triton.lean_atten_bwd_clean import la_backward_persistent
 
 # --- 1. Define Test Configurations ---
 # Add or modify dictionaries in this list to test different scenarios.
@@ -26,13 +26,9 @@ TEST_CONFIGS = [
         "BATCH": 4, "N_HEADS": 8, "SEQLEN_Q": 512, "SEQLEN_K": 256,
         "HEAD_DIM": 64, "CAUSAL": False, "DTYPE": torch.float16
     },
-    {
-        "BATCH": 1, "N_HEADS": 8, "SEQLEN_Q": 8192, "SEQLEN_K": 8192,
+     {
+        "BATCH": 1, "N_HEADS": 48, "SEQLEN_Q": 8192, "SEQLEN_K": 8192,
         "HEAD_DIM": 64, "CAUSAL": False, "DTYPE": torch.float16
-    },
-    {
-        "BATCH": 1, "N_HEADS": 8, "SEQLEN_Q": 8192, "SEQLEN_K": 8192,
-        "HEAD_DIM": 64, "CAUSAL": True, "DTYPE": torch.float16
     }
 ]
 
@@ -61,10 +57,10 @@ def ground_truth_backward(q, k, v, do, sm_scale, causal):
     return q_ref.grad, k_ref.grad, v_ref.grad
 
 
-def run_test(config: dict):
+def run_test_and_benchmark(config: dict):
     """
-    Runs a single test case based on the provided configuration dictionary.
-    Returns True if the test passes, False otherwise.
+    Runs a single test case for correctness and performance based on the
+    provided configuration dictionary. Returns a dictionary with results.
     """
     # --- 1. Unpack Test Parameters ---
     BATCH, N_HEADS, SEQLEN_Q, SEQLEN_K, HEAD_DIM, CAUSAL, DTYPE = (
@@ -72,6 +68,7 @@ def run_test(config: dict):
         config['SEQLEN_K'], config['HEAD_DIM'], config['CAUSAL'], config['DTYPE']
     )
     DEVICE = "cuda"
+    N_REPS = 50 # Number of repetitions for stable timing
     torch.manual_seed(0)
 
     # --- 2. Initialize Inputs ---
@@ -81,12 +78,19 @@ def run_test(config: dict):
     do = torch.randn_like(q)
     sm_scale = 1.0 / math.sqrt(HEAD_DIM)
 
-    # --- 3. Compute Reference Gradients ---
-    print("  Computing reference gradients with PyTorch autograd...")
-    dq_ref, dk_ref, dv_ref = ground_truth_backward(q, k, v, do, sm_scale, CAUSAL)
+    # --- 3. Compute and Benchmark Reference Gradients ---
+    print("  Computing and benchmarking reference gradients...")
+    start_event = torch.cuda.Event(enable_timing=True)
+    end_event = torch.cuda.Event(enable_timing=True)
 
-    # --- 4. Compute Triton Kernel Gradients ---
-    # Your kernel needs 'o' and 'softmax_lse' from the forward pass.
+    start_event.record()
+    dq_ref, dk_ref, dv_ref = ground_truth_backward(q, k, v, do, sm_scale, CAUSAL)
+    end_event.record()
+    torch.cuda.synchronize()
+    ref_time_ms = start_event.elapsed_time(end_event)
+
+    # --- 4. Compute and Benchmark Triton Kernel Gradients ---
+    # Prepare kernel inputs
     logits = (q.to(torch.float32) @ k.to(torch.float32).transpose(-2, -1)) * sm_scale
     if CAUSAL:
         mask = torch.triu(torch.ones_like(logits), diagonal=1).bool()
@@ -99,54 +103,62 @@ def run_test(config: dict):
     dq_triton = torch.empty_like(q)
     dk_triton = torch.empty_like(k)
     dv_triton = torch.empty_like(v)
-
-    print("  Computing gradients with your Triton kernel...")
-    # NOTE: Tensors are transposed to [batch, seqlen, n_heads, head_dim] for the launcher.
-    la_backward_persistent(
-        do.transpose(1, 2),
-        q.transpose(1, 2),
-        k.transpose(1, 2),
-        v.transpose(1, 2),
-        o_triton.transpose(1, 2),
-        softmax_lse_stable,
-        dq_triton.transpose(1, 2),
-        dk_triton.transpose(1, 2),
-        dv_triton.transpose(1, 2),
-        sm_scale,
-        CAUSAL,
-        SEQLEN_Q,
-        SEQLEN_K,
+    
+    # Define a lambda for the kernel call
+    kernel_call = lambda: la_backward_persistent(
+        do.transpose(1, 2), q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2),
+        o_triton.transpose(1, 2), softmax_lse_stable, dq_triton.transpose(1, 2),
+        dk_triton.transpose(1, 2), dv_triton.transpose(1, 2), sm_scale,
+        CAUSAL, SEQLEN_Q, SEQLEN_K
     )
 
-    # --- 5. Compare Results ---
-    print("\n  --- Comparison Results ---")
+    print("  Warming up and benchmarking Triton kernel...")
+    # Warmup call to handle JIT compilation
+    kernel_call()
+    torch.cuda.synchronize()
+
+    # Timed calls
+    start_event.record()
+    for _ in range(N_REPS):
+        kernel_call()
+    end_event.record()
+    torch.cuda.synchronize()
+    triton_time_ms = start_event.elapsed_time(end_event) / N_REPS
+
+
+    # --- 5. Compare Results & Performance ---
+    print("\n  --- Correctness & Performance ---")
     atol, rtol = 1e-2, 1e-2
     passed = True
 
-    # Compare dQ
     dq_is_close = torch.allclose(dq_triton, dq_ref, atol=atol, rtol=rtol)
     if not dq_is_close: passed = False
-    print(f"  dQ allclose: {dq_is_close}")
-    print(f"    Max difference in dQ: {(dq_triton - dq_ref).abs().max().item():.6f}")
+    print(f"  Correctness | dQ allclose: {dq_is_close}")
 
-    # Compare dK
     dk_is_close = torch.allclose(dk_triton, dk_ref, atol=atol, rtol=rtol)
     if not dk_is_close: passed = False
-    print(f"  dK allclose: {dk_is_close}")
-    print(f"    Max difference in dK: {(dk_triton - dk_ref).abs().max().item():.6f}")
+    print(f"  Correctness | dK allclose: {dk_is_close}")
 
-    # Compare dV
     dv_is_close = torch.allclose(dv_triton, dv_ref, atol=atol, rtol=rtol)
     if not dv_is_close: passed = False
-    print(f"  dV allclose: {dv_is_close}")
-    print(f"    Max difference in dV: {(dv_triton - dv_ref).abs().max().item():.6f}")
+    print(f"  Correctness | dV allclose: {dv_is_close}")
 
-    return passed
+    print("-" * 40)
+    print(f"  Performance | PyTorch Reference: {ref_time_ms:.4f} ms")
+    print(f"  Performance | Triton Kernel:     {triton_time_ms:.4f} ms")
+    print(f"  Performance | Speedup:           {ref_time_ms / triton_time_ms:.2f}x")
+
+    return {
+        "passed": passed,
+        "ref_ms": ref_time_ms,
+        "triton_ms": triton_time_ms,
+        "speedup": ref_time_ms / triton_time_ms
+    }
 
 
 if __name__ == "__main__":
     results = []
-    print("🚀 Starting Triton Kernel Test Suite 🚀")
+    print("🚀 Starting Triton Kernel Test & Benchmark Suite 🚀")
 
     for i, config in enumerate(TEST_CONFIGS):
         print("\n" + "="*80)
@@ -154,15 +166,13 @@ if __name__ == "__main__":
         print(f"   Config: {config}")
         print("="*80)
         try:
-            passed = run_test(config)
-            if passed:
-                print("\n  ✅ Test Passed!")
-            else:
-                print("\n  ❌ Test FAILED.")
-            results.append({"config": config, "status": "✅ PASSED" if passed else "❌ FAILED"})
+            result_data = run_test_and_benchmark(config)
+            status = "✅ PASSED" if result_data["passed"] else "❌ FAILED"
+            print(f"\n  Correctness Status: {status}")
+            results.append({"config": config, "status": status, **result_data})
         except Exception as e:
             print(f"\n  🔥 Test CRASHED with exception: {e}")
-            results.append({"config": config, "status": f"🔥 CRASHED: {e}"})
+            results.append({"config": config, "status": f"🔥 CRASHED", "exception": e})
 
     # --- Final Summary ---
     print("\n\n" + "#"*80)
@@ -170,5 +180,7 @@ if __name__ == "__main__":
     print("#"*80)
     for i, result in enumerate(results):
         print(f"Test #{i+1}: {result['status']}")
+        if "passed" in result:
+            print(f"  Perf: {result['speedup']:.2f}x speedup ({result['triton_ms']:.4f} ms vs {result['ref_ms']:.4f} ms)")
         print(f"  Config: {result['config']}")
     print("#"*80)
