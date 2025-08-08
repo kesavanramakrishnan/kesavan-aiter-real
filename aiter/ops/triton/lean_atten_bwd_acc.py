@@ -2,7 +2,503 @@ import math
 import torch
 import triton
 import triton.language as tl
+@triton.jit
+def bwd_dkdv_streamk_tile(
+    Q, K, V, sm_scale, DO, O, M, Delta,
+    DK, DV,
+    DKp, DVp, locks,
+    stride_qb, stride_qh, stride_qm, stride_qd,
+    stride_kb, stride_kh, stride_kn, stride_kd,
+    stride_vb, stride_vh, stride_vn, stride_vd,
+    stride_dob, stride_doh, stride_dom, stride_dod,
+    stride_dkb, stride_dkh, stride_dkn, stride_dkd,
+    stride_dvb, stride_dvh, stride_dvn, stride_dvd,
+    stride_mb, stride_mh, stride_mm,
+    stride_deltab, stride_deltah, stride_deltam,
+    batch_idx, k_head_idx, n_block_idx,
+    num_q_heads, num_k_heads,
+    max_seqlen_q, max_seqlen_k,
+    GQA_GROUP_SIZE: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+    CAUSAL: tl.constexpr,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    # Swizzle to improve locality (match forward grouping)
+    GROUP_SIZE = 12
+    pid = (pid // GROUP_SIZE) + (pid % GROUP_SIZE) * (tl.num_programs(0) // GROUP_SIZE)
 
+    # Determine this CTA's slice over m-block iterations
+    num_m_blocks = tl.cdiv(max_seqlen_q, BLOCK_M)
+    tiles_per_cta = tl.cdiv(num_m_blocks, tl.num_programs(0))
+    start_m_block = tiles_per_cta * pid
+    end_m_block = tl.minimum(num_m_blocks, start_m_block + tiles_per_cta)
+    num_participating = tl.cdiv(num_m_blocks, tiles_per_cta)
+    if pid >= num_participating:
+        return
+
+    # Tile coordinates
+    start_n = n_block_idx * BLOCK_N
+    offs_n = start_n + tl.arange(0, BLOCK_N)
+    offs_d = tl.arange(0, HEAD_DIM)
+    mask_kv = (offs_n[:, None] < max_seqlen_k) & (offs_d[None, :] < HEAD_DIM)
+
+    # Load K, V tile
+    k_ptrs = K + batch_idx*stride_kb + k_head_idx*stride_kh + offs_n[:,None]*stride_kn + offs_d[None,:]*stride_kd
+    v_ptrs = V + batch_idx*stride_vb + k_head_idx*stride_vh + offs_n[:,None]*stride_vn + offs_d[None,:]*stride_vd
+    k_tile = tl.load(k_ptrs, mask=mask_kv, other=0.0)
+    v_tile = tl.load(v_ptrs, mask=mask_kv, other=0.0)
+
+    # Accumulators per CTA
+    dk_acc = tl.zeros([BLOCK_N, HEAD_DIM], dtype=tl.float32)
+    dv_acc = tl.zeros([BLOCK_N, HEAD_DIM], dtype=tl.float32)
+
+    # GQA mapping
+    q_head_base = k_head_idx * GQA_GROUP_SIZE
+
+    # Iterate over m blocks assigned to this CTA
+    for m_block_idx in range(start_m_block, end_m_block):
+        start_m = m_block_idx * BLOCK_M
+        offs_m = start_m + tl.arange(0, BLOCK_M)
+        mask_m = offs_m < max_seqlen_q
+
+        for g in range(GQA_GROUP_SIZE):
+            q_head_idx = q_head_base + g
+            Q_ptr = Q + batch_idx*stride_qb + q_head_idx*stride_qh
+            DO_ptr = DO + batch_idx*stride_dob + q_head_idx*stride_doh
+            M_ptr = M + batch_idx*stride_mb + q_head_idx*stride_mh
+            Delta_ptr = Delta + batch_idx*stride_deltab + q_head_idx*stride_deltah
+
+            q_ptrs = Q_ptr + (offs_m[:, None] * stride_qm + offs_d[None, :] * stride_qd)
+            do_ptrs = DO_ptr + (offs_m[:, None] * stride_dom + offs_d[None, :] * stride_dod)
+            mask_q = mask_m[:, None] & (offs_d[None, :] < HEAD_DIM)
+
+            q = tl.load(q_ptrs, mask=mask_q, other=0.0)
+            do = tl.load(do_ptrs, mask=mask_q, other=0.0)
+            m_vals = tl.load(M_ptr + offs_m * stride_mm, mask=mask_m, other=-float('inf'))
+
+            # Transposed domain P^T
+            kq = tl.dot(k_tile, tl.trans(q))
+            p_T = tl.math.exp(kq * sm_scale - m_vals[None, :])
+            p_T = tl.where(m_vals[None, :] == -float('inf'), 0.0, p_T)
+            if CAUSAL:
+                causal_mask_T = (offs_m[None, :] >= (offs_n[:, None] + max_seqlen_q - max_seqlen_k))
+                p_T = tl.where(causal_mask_T, p_T, 0.0)
+
+            # dV and dK accumulation
+            dv_acc += tl.dot(p_T.to(do.type.element_ty), do)
+            dp_T = tl.dot(v_tile, tl.trans(do))
+            Di = tl.load(Delta_ptr + offs_m * stride_deltam, mask=mask_m, other=0.0)
+            ds_T = p_T * (dp_T - Di[None, :])
+            dk_acc += tl.dot(ds_T.to(q.dtype), q)
+
+    # Write per-CTA partials and signal
+    dk_ptrs = DKp + pid * (BLOCK_N*HEAD_DIM) + offs_n[:, None] * HEAD_DIM + offs_d[None, :]
+    dv_ptrs = DVp + pid * (BLOCK_N*HEAD_DIM) + offs_n[:, None] * HEAD_DIM + offs_d[None, :]
+    tl.store(dk_ptrs, dk_acc, cache_modifier=".wt")
+    tl.store(dv_ptrs, dv_acc, cache_modifier=".wt")
+    tl.atomic_xchg(locks + pid, 1)
+
+    # Host CTA reduces and writes final
+    # Use CTA 0 as host for simplicity
+    if pid == 0:
+        acc_dk = dk_acc
+        acc_dv = dv_acc
+        # Reduce over participating CTAs only
+        for cta in range(1, num_participating):
+            while tl.atomic_cas(locks + cta, 1, 1) != 1:
+                pass
+            dk_cta_ptrs = DKp + cta * (BLOCK_N*HEAD_DIM) + offs_n[:, None] * HEAD_DIM + offs_d[None, :]
+            dv_cta_ptrs = DVp + cta * (BLOCK_N*HEAD_DIM) + offs_n[:, None] * HEAD_DIM + offs_d[None, :]
+            dk_cta = tl.load(dk_cta_ptrs)
+            dv_cta = tl.load(dv_cta_ptrs)
+            acc_dk += dk_cta
+            acc_dv += dv_cta
+            tl.atomic_xchg(locks + cta, 0)
+
+        # Vectorized half-split store along HEAD_DIM like forward
+        offs_half = tl.arange(0, HEAD_DIM // 2)
+        dv_out0 = DV + batch_idx*stride_dvb + k_head_idx*stride_dvh + offs_n[:,None]*stride_dvn + offs_half[None, :]*stride_dvd
+        dv_out1 = DV + batch_idx*stride_dvb + k_head_idx*stride_dvh + offs_n[:,None]*stride_dvn + (offs_half[None, :]+(HEAD_DIM // 2))*stride_dvd
+        dk_out0 = DK + batch_idx*stride_dkb + k_head_idx*stride_dkh + offs_n[:,None]*stride_dkn + offs_half[None, :]*stride_dkd
+        dk_out1 = DK + batch_idx*stride_dkb + k_head_idx*stride_dkh + offs_n[:,None]*stride_dkn + (offs_half[None, :]+(HEAD_DIM // 2))*stride_dkd
+        # reshape/permutation to avoid slicing
+        dv_rs = tl.reshape(acc_dv, (BLOCK_N, 2, HEAD_DIM // 2))
+        dv_pm = tl.permute(dv_rs, (0, 2, 1))
+        dv0, dv1 = tl.split(dv_pm)
+        dk_rs = tl.reshape(acc_dk, (BLOCK_N, 2, HEAD_DIM // 2))
+        dk_pm = tl.permute(dk_rs, (0, 2, 1))
+        dk0, dk1 = tl.split(dk_pm)
+        # masks per row
+        mask_row = (offs_n < max_seqlen_k)[:, None]
+        tl.store(dv_out0, dv0.to(DV.dtype.element_ty), mask=mask_row)
+        tl.store(dv_out1, dv1.to(DV.dtype.element_ty), mask=mask_row)
+        tl.store(dk_out0, (dk0 * sm_scale).to(DK.dtype.element_ty), mask=mask_row)
+        tl.store(dk_out1, (dk1 * sm_scale).to(DK.dtype.element_ty), mask=mask_row)
+
+
+@triton.jit
+def bwd_dkdv_streamk_persistent(
+    Q, K, V, sm_scale, DO, O, M, Delta,
+    DK, DV,
+    DKp, DVp, locks,
+    stride_qb, stride_qh, stride_qm, stride_qd,
+    stride_kb, stride_kh, stride_kn, stride_kd,
+    stride_vb, stride_vh, stride_vn, stride_vd,
+    stride_dob, stride_doh, stride_dom, stride_dod,
+    stride_dkb, stride_dkh, stride_dkn, stride_dkd,
+    stride_dvb, stride_dvh, stride_dvn, stride_dvd,
+    stride_mb, stride_mh, stride_mm,
+    stride_deltab, stride_deltah, stride_deltam,
+    batch_size, num_q_heads, num_k_heads,
+    max_seqlen_q, max_seqlen_k,
+    num_m_blocks, num_n_blocks,
+    total_tiles, high_load_wgs, max_tiles_per_wg,
+    GQA_GROUP_SIZE: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+    CAUSAL: tl.constexpr,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
+    PARTICIPATING: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    num_ctas = tl.num_programs(0)
+    num_groups = num_ctas // PARTICIPATING
+    group_id = pid // PARTICIPATING
+    lane = pid % PARTICIPATING
+
+    # Schedule tiles by group_id (host CTA group per tile), not by pid
+    if group_id < high_load_wgs:
+        iter_start = max_tiles_per_wg * group_id
+        num_tiles_to_process = max_tiles_per_wg
+    else:
+        iter_start = (max_tiles_per_wg - 1) * (group_id - high_load_wgs) + high_load_wgs * max_tiles_per_wg
+        num_tiles_to_process = max_tiles_per_wg - 1
+
+    tiles_this = num_tiles_to_process
+    if iter_start + tiles_this > total_tiles:
+        tiles_this = total_tiles - iter_start
+    if tiles_this < 0:
+        tiles_this = 0
+    for i in range(tiles_this):
+        tile_gid = iter_start + i
+        # Map tile id -> (batch, k_head, n_block)
+        tmp = tile_gid
+        n_block_idx = tmp % num_n_blocks
+        tmp //= num_n_blocks
+        k_head_idx = tmp % num_k_heads
+        batch_idx = tmp // num_k_heads
+
+        # Split m_blocks across lanes within this group
+        num_participating = tl.minimum(PARTICIPATING, num_m_blocks)
+        tiles_per_lane = tl.cdiv(num_m_blocks, num_participating)
+        start_m_block = tiles_per_lane * lane
+        end_m_block = tl.minimum(num_m_blocks, start_m_block + tiles_per_lane)
+        if lane < num_participating:
+
+            start_n = n_block_idx * BLOCK_N
+            offs_n = start_n + tl.arange(0, BLOCK_N)
+            offs_d = tl.arange(0, HEAD_DIM)
+            mask_kv = (offs_n[:, None] < max_seqlen_k) & (offs_d[None, :] < HEAD_DIM)
+
+            k_ptrs = K + batch_idx*stride_kb + k_head_idx*stride_kh + offs_n[:,None]*stride_kn + offs_d[None,:]*stride_kd
+            v_ptrs = V + batch_idx*stride_vb + k_head_idx*stride_vh + offs_n[:,None]*stride_vn + offs_d[None,:]*stride_vd
+            k_ptrs = tl.multiple_of(k_ptrs, (16, 1))
+            v_ptrs = tl.multiple_of(v_ptrs, (1, 16))
+            k_tile = tl.load(k_ptrs, mask=mask_kv, other=0.0)
+            v_tile = tl.load(v_ptrs, mask=mask_kv, other=0.0)
+
+            dk_acc = tl.zeros([BLOCK_N, HEAD_DIM], dtype=tl.float32)
+            dv_acc = tl.zeros([BLOCK_N, HEAD_DIM], dtype=tl.float32)
+            q_head_base = k_head_idx * GQA_GROUP_SIZE
+
+            for m_block_idx in range(start_m_block, end_m_block):
+                start_m = m_block_idx * BLOCK_M
+                offs_m = start_m + tl.arange(0, BLOCK_M)
+                mask_m = offs_m < max_seqlen_q
+                for g in range(GQA_GROUP_SIZE):
+                    q_head_idx = q_head_base + g
+                    Q_ptr = Q + batch_idx*stride_qb + q_head_idx*stride_qh
+                    DO_ptr = DO + batch_idx*stride_dob + q_head_idx*stride_doh
+                    M_ptr = M + batch_idx*stride_mb + q_head_idx*stride_mh
+                    Delta_ptr = Delta + batch_idx*stride_deltab + q_head_idx*stride_deltah
+                    q_ptrs = Q_ptr + (offs_m[:, None] * stride_qm + offs_d[None, :] * stride_qd)
+                    do_ptrs = DO_ptr + (offs_m[:, None] * stride_dom + offs_d[None, :] * stride_dod)
+                    mask_q = mask_m[:, None] & (offs_d[None, :] < HEAD_DIM)
+                    q_ptrs = tl.multiple_of(q_ptrs, (1, 16))
+                    q = tl.load(q_ptrs, mask=mask_q, other=0.0)
+                    do = tl.load(do_ptrs, mask=mask_q, other=0.0)
+                    m_vals = tl.load(M_ptr + offs_m * stride_mm, mask=mask_m, other=-float('inf'))
+                    kq = tl.dot(k_tile, tl.trans(q))
+                    p_T = tl.math.exp(kq * sm_scale - m_vals[None, :])
+                    p_T = tl.where(m_vals[None, :] == -float('inf'), 0.0, p_T)
+                    if CAUSAL:
+                        causal_mask_T = (offs_m[None, :] >= (offs_n[:, None] + max_seqlen_q - max_seqlen_k))
+                        p_T = tl.where(causal_mask_T, p_T, 0.0)
+                    dv_acc += tl.dot(p_T.to(do.type.element_ty), do)
+                    dp_T = tl.dot(v_tile, tl.trans(do))
+                    Di = tl.load(Delta_ptr + offs_m * stride_deltam, mask=mask_m, other=0.0)
+                    ds_T = p_T * (dp_T - Di[None, :])
+                    dk_acc += tl.dot(ds_T.to(q.dtype), q)
+
+            # Per-CTA partial store and signal (use local indices)
+            local_n = tl.arange(0, BLOCK_N)
+            local_d = tl.arange(0, HEAD_DIM)
+            dk_ptrs = DKp + pid * (BLOCK_N*HEAD_DIM) + local_n[:, None] * HEAD_DIM + local_d[None, :]
+            dv_ptrs = DVp + pid * (BLOCK_N*HEAD_DIM) + local_n[:, None] * HEAD_DIM + local_d[None, :]
+            tl.store(dk_ptrs, dk_acc, cache_modifier=".wt")
+            tl.store(dv_ptrs, dv_acc, cache_modifier=".wt")
+            tl.atomic_xchg(locks + pid, 1)
+
+            # Host CTA reduction for participating CTAs in this group
+            if lane == 0:
+                acc_dk = dk_acc
+                acc_dv = dv_acc
+                for l in range(1, num_participating):
+                    cta = group_id * PARTICIPATING + l
+                    while tl.atomic_cas(locks + cta, 1, 1) != 1:
+                        pass
+                    dk_cta_ptrs = DKp + cta * (BLOCK_N*HEAD_DIM) + local_n[:, None] * HEAD_DIM + local_d[None, :]
+                    dv_cta_ptrs = DVp + cta * (BLOCK_N*HEAD_DIM) + local_n[:, None] * HEAD_DIM + local_d[None, :]
+                    dk_cta = tl.load(dk_cta_ptrs)
+                    dv_cta = tl.load(dv_cta_ptrs)
+                    acc_dk += dk_cta
+                    acc_dv += dv_cta
+                    tl.atomic_xchg(locks + cta, 0)
+
+                # Vectorized store halves
+                offs_half = tl.arange(0, HEAD_DIM // 2)
+                dv_out0 = DV + batch_idx*stride_dvb + k_head_idx*stride_dvh + offs_n[:,None]*stride_dvn + offs_half[None, :]*stride_dvd
+                dv_out1 = DV + batch_idx*stride_dvb + k_head_idx*stride_dvh + offs_n[:,None]*stride_dvn + (offs_half[None, :]+(HEAD_DIM // 2))*stride_dvd
+                dk_out0 = DK + batch_idx*stride_dkb + k_head_idx*stride_dkh + offs_n[:,None]*stride_dkn + offs_half[None, :]*stride_dkd
+                dk_out1 = DK + batch_idx*stride_dkb + k_head_idx*stride_dkh + offs_n[:,None]*stride_dkn + (offs_half[None, :]+(HEAD_DIM // 2))*stride_dkd
+                dv_rs = tl.reshape(acc_dv, (BLOCK_N, 2, HEAD_DIM // 2))
+                dv_pm = tl.permute(dv_rs, (0, 2, 1))
+                dv0, dv1 = tl.split(dv_pm)
+                dk_rs = tl.reshape(acc_dk, (BLOCK_N, 2, HEAD_DIM // 2))
+                dk_pm = tl.permute(dk_rs, (0, 2, 1))
+                dk0, dk1 = tl.split(dk_pm)
+                mask_row = (offs_n < max_seqlen_k)[:, None]
+                tl.store(dv_out0, dv0.to(DV.dtype.element_ty), mask=mask_row)
+                tl.store(dv_out1, dv1.to(DV.dtype.element_ty), mask=mask_row)
+                tl.store(dk_out0, (dk0 * sm_scale).to(DK.dtype.element_ty), mask=mask_row)
+                tl.store(dk_out1, (dk1 * sm_scale).to(DK.dtype.element_ty), mask=mask_row)
+            
+def bwd_dq_streamk_tile(
+    Q, K, V, sm_scale, DO, O, M, Delta,
+    DQ,
+    DQp, locks,
+    stride_qb, stride_qh, stride_qm, stride_qd,
+    stride_kb, stride_kh, stride_kn, stride_kd,
+    stride_vb, stride_vh, stride_vn, stride_vd,
+    stride_dob, stride_doh, stride_dom, stride_dod,
+    stride_dqb, stride_dqh, stride_dqm, stride_dqd,
+    stride_mb, stride_mh, stride_mm,
+    stride_deltab, stride_deltah, stride_deltam,
+    batch_idx, q_head_idx, m_block_idx,
+    num_q_heads, num_k_heads,
+    max_seqlen_q, max_seqlen_k,
+    GQA_GROUP_SIZE: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+    CAUSAL: tl.constexpr,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
+):
+    pid = tl.program_id(0)
+
+    # Partition N blocks among CTAs
+    num_n_blocks = tl.cdiv(max_seqlen_k, BLOCK_N)
+    tiles_per_cta = tl.cdiv(num_n_blocks, tl.num_programs(0))
+    start_n_block = tiles_per_cta * pid
+    end_n_block = tl.minimum(num_n_blocks, start_n_block + tiles_per_cta)
+
+    # Tile coordinates
+    start_m = m_block_idx * BLOCK_M
+    offs_m = start_m + tl.arange(0, BLOCK_M)
+    offs_d = tl.arange(0, HEAD_DIM)
+    mask_q = (offs_m[:, None] < max_seqlen_q) & (offs_d[None, :] < HEAD_DIM)
+
+    # Pointers
+    k_head_idx = q_head_idx // GQA_GROUP_SIZE
+
+    q_ptrs = Q + batch_idx*stride_qb + q_head_idx*stride_qh + offs_m[:,None]*stride_qm + offs_d[None,:]*stride_qd
+    do_ptrs = DO + batch_idx*stride_dob + q_head_idx*stride_doh + offs_m[:,None]*stride_dom + offs_d[None,:]*stride_dod
+    m_ptrs = M + batch_idx*stride_mb + q_head_idx*stride_mh + offs_m*stride_mm
+
+    q_tile = tl.load(q_ptrs, mask=mask_q, other=0.0)
+    do_tile = tl.load(do_ptrs, mask=mask_q, other=0.0)
+    m_tile = tl.load(m_ptrs, mask=(offs_m < max_seqlen_q), other=-float('inf'))[:, None]
+    Di = tl.load(Delta + batch_idx*stride_deltab + q_head_idx*stride_deltah + offs_m*stride_deltam, mask=(offs_m < max_seqlen_q), other=0.0)
+
+    dq_acc = tl.zeros([BLOCK_M, HEAD_DIM], dtype=tl.float32)
+
+    # Iterate assigned N blocks
+    for n_block in range(start_n_block, end_n_block):
+        start_n = n_block * BLOCK_N
+        offs_n = start_n + tl.arange(0, BLOCK_N)
+        mask_n = offs_n < max_seqlen_k
+        mask_kv = mask_n[:, None] & (offs_d[None, :] < HEAD_DIM)
+
+        k_ptrs = K + batch_idx*stride_kb + k_head_idx*stride_kh + offs_n[:,None]*stride_kn + offs_d[None,:]*stride_kd
+        v_ptrs = V + batch_idx*stride_vb + k_head_idx*stride_vh + offs_n[:,None]*stride_vn + offs_d[None,:]*stride_vd
+        k = tl.load(k_ptrs, mask=mask_kv, other=0.0)
+        v = tl.load(v_ptrs, mask=mask_kv, other=0.0)
+
+        # Compute P = exp(QK^T * sm_scale - M)
+        qk = tl.dot(q_tile, tl.trans(k))
+        p = tl.math.exp(qk * sm_scale - m_tile)
+        p = tl.where(m_tile == -float('inf'), 0.0, p)
+        if CAUSAL:
+            causal_mask = (offs_m[:, None] >= (offs_n[None, :] + max_seqlen_q - max_seqlen_k))
+            p = tl.where(causal_mask, p, 0.0)
+
+        dp = tl.dot(do_tile, tl.trans(v))
+        ds = p * (dp - Di[:, None])
+        dq_acc += tl.dot(ds.to(k.dtype), k)
+
+    # Write per-CTA partial and signal
+    local_m = tl.arange(0, BLOCK_M)
+    local_d = tl.arange(0, HEAD_DIM)
+    dq_ptrs = DQp + pid * (BLOCK_M*HEAD_DIM) + local_m[:, None] * HEAD_DIM + local_d[None, :]
+    tl.store(dq_ptrs, dq_acc, cache_modifier=".wt")
+    tl.atomic_xchg(locks + pid, 1)
+
+    # Host reduces and writes
+    if pid == 0:
+        acc_dq = dq_acc
+        for cta in range(1, tl.num_programs(0)):
+            while tl.atomic_cas(locks + cta, 1, 1) != 1:
+                pass
+            dq_cta_ptrs = DQp + cta * (BLOCK_M*HEAD_DIM) + local_m[:, None] * HEAD_DIM + local_d[None, :]
+            dq_cta = tl.load(dq_cta_ptrs)
+            acc_dq += dq_cta
+
+        dq_out = DQ + batch_idx*stride_dqb + q_head_idx*stride_dqh + offs_m[:,None]*stride_dqm + offs_d[None,:]*stride_dqd
+        tl.store(dq_out, (acc_dq * sm_scale).to(DQ.dtype.element_ty), mask=mask_q)
+
+
+@triton.jit
+def bwd_dq_streamk_persistent(
+    Q, K, V, sm_scale, DO, O, M, Delta,
+    DQ,
+    DQp, locks,
+    stride_qb, stride_qh, stride_qm, stride_qd,
+    stride_kb, stride_kh, stride_kn, stride_kd,
+    stride_vb, stride_vh, stride_vn, stride_vd,
+    stride_dob, stride_doh, stride_dom, stride_dod,
+    stride_dqb, stride_dqh, stride_dqm, stride_dqd,
+    stride_mb, stride_mh, stride_mm,
+    stride_deltab, stride_deltah, stride_deltam,
+    batch_size, num_q_heads, num_k_heads,
+    max_seqlen_q, max_seqlen_k,
+    num_m_blocks, num_n_blocks,
+    total_tiles, high_load_wgs, max_tiles_per_wg,
+    GQA_GROUP_SIZE: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+    CAUSAL: tl.constexpr,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
+    PARTICIPATING: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    num_ctas = tl.num_programs(0)
+    num_groups = num_ctas // PARTICIPATING
+    group_id = pid // PARTICIPATING
+    lane = pid % PARTICIPATING
+
+    if group_id < high_load_wgs:
+        iter_start = max_tiles_per_wg * group_id
+        num_tiles_to_process = max_tiles_per_wg
+    else:
+        iter_start = (max_tiles_per_wg - 1) * (group_id - high_load_wgs) + high_load_wgs * max_tiles_per_wg
+        num_tiles_to_process = max_tiles_per_wg - 1
+
+    # Slice n_blocks across lanes in the group
+    num_participating = tl.minimum(PARTICIPATING, num_n_blocks)
+    tiles_per_lane = tl.cdiv(num_n_blocks, num_participating)
+    start_n_block = tiles_per_lane * lane
+    end_n_block = tl.minimum(num_n_blocks, start_n_block + tiles_per_lane)
+
+    tiles_this = num_tiles_to_process
+    if iter_start + tiles_this > total_tiles:
+        tiles_this = total_tiles - iter_start
+    if tiles_this < 0:
+        tiles_this = 0
+    for i in range(tiles_this):
+        tile_gid = iter_start + i
+        # Map tile id -> (batch, q_head, m_block)
+        tmp = tile_gid
+        m_block_idx = tmp % num_m_blocks
+        tmp //= num_m_blocks
+        q_head_idx = tmp % num_q_heads
+        batch_idx = tmp // num_q_heads
+
+        start_m = m_block_idx * BLOCK_M
+        offs_m = start_m + tl.arange(0, BLOCK_M)
+        offs_d = tl.arange(0, HEAD_DIM)
+        mask_q = (offs_m[:, None] < max_seqlen_q) & (offs_d[None, :] < HEAD_DIM)
+        k_head_idx = q_head_idx // GQA_GROUP_SIZE
+
+        q_ptrs = Q + batch_idx*stride_qb + q_head_idx*stride_qh + offs_m[:,None]*stride_qm + offs_d[None,:]*stride_qd
+        do_ptrs = DO + batch_idx*stride_dob + q_head_idx*stride_doh + offs_m[:,None]*stride_dom + offs_d[None,:]*stride_dod
+        m_ptrs = M + batch_idx*stride_mb + q_head_idx*stride_mh + offs_m*stride_mm
+        q_ptrs = tl.multiple_of(q_ptrs, (1, 16))
+        q_tile = tl.load(q_ptrs, mask=mask_q, other=0.0)
+        do_tile = tl.load(do_ptrs, mask=mask_q, other=0.0)
+        m_tile = tl.load(m_ptrs, mask=(offs_m < max_seqlen_q), other=-float('inf'))[:, None]
+        Di = tl.load(Delta + batch_idx*stride_deltab + q_head_idx*stride_deltah + offs_m*stride_deltam, mask=(offs_m < max_seqlen_q), other=0.0)
+
+        dq_acc = tl.zeros([BLOCK_M, HEAD_DIM], dtype=tl.float32)
+
+        if lane < num_participating:
+            for n_block in range(start_n_block, end_n_block):
+                start_n = n_block * BLOCK_N
+                offs_n = start_n + tl.arange(0, BLOCK_N)
+                mask_n = offs_n < max_seqlen_k
+                mask_kv = mask_n[:, None] & (offs_d[None, :] < HEAD_DIM)
+
+                k_ptrs = K + batch_idx*stride_kb + k_head_idx*stride_kh + offs_n[:,None]*stride_kn + offs_d[None,:]*stride_kd
+                v_ptrs = V + batch_idx*stride_vb + k_head_idx*stride_vh + offs_n[:,None]*stride_vn + offs_d[None,:]*stride_vd
+                k_ptrs = tl.multiple_of(k_ptrs, (16, 1))
+                v_ptrs = tl.multiple_of(v_ptrs, (1, 16))
+                k = tl.load(k_ptrs, mask=mask_kv, other=0.0)
+                v = tl.load(v_ptrs, mask=mask_kv, other=0.0)
+
+                qk = tl.dot(q_tile, tl.trans(k))
+                p = tl.math.exp(qk * sm_scale - m_tile)
+                p = tl.where(m_tile == -float('inf'), 0.0, p)
+                if CAUSAL:
+                    causal_mask = (offs_m[:, None] >= (offs_n[None, :] + max_seqlen_q - max_seqlen_k))
+                    p = tl.where(causal_mask, p, 0.0)
+
+                dp = tl.dot(do_tile, tl.trans(v))
+                ds = p * (dp - Di[:, None])
+                dq_acc += tl.dot(ds.to(k.dtype), k)
+
+        # Per-CTA partial
+        local_m = tl.arange(0, BLOCK_M)
+        local_d = tl.arange(0, HEAD_DIM)
+        dq_ptrs = DQp + pid * (BLOCK_M*HEAD_DIM) + local_m[:, None] * HEAD_DIM + local_d[None, :]
+        tl.store(dq_ptrs, dq_acc, cache_modifier=".wt")
+        tl.atomic_xchg(locks + pid, 1)
+
+        if lane == 0:
+            acc_dq = dq_acc
+            for l in range(1, num_participating):
+                cta = group_id * PARTICIPATING + l
+                while tl.atomic_cas(locks + cta, 1, 1) != 1:
+                    pass
+                dq_cta_ptrs = DQp + cta * (BLOCK_M*HEAD_DIM) + local_m[:, None] * HEAD_DIM + local_d[None, :]
+                dq_cta = tl.load(dq_cta_ptrs)
+                acc_dq += dq_cta
+                tl.atomic_xchg(locks + cta, 0)
+
+            offs_half = tl.arange(0, HEAD_DIM // 2)
+            dq_out0 = DQ + batch_idx*stride_dqb + q_head_idx*stride_dqh + offs_m[:,None]*stride_dqm + offs_half[None,:]*stride_dqd
+            dq_out1 = DQ + batch_idx*stride_dqb + q_head_idx*stride_dqh + offs_m[:,None]*stride_dqm + (offs_half[None,:]+(HEAD_DIM//2))*stride_dqd
+            dq_rs = tl.reshape(acc_dq, (BLOCK_M, 2, HEAD_DIM // 2))
+            dq_pm = tl.permute(dq_rs, (0, 2, 1))
+            dq0, dq1 = tl.split(dq_pm)
+            mask_row = (offs_m < max_seqlen_q)[:, None]
+            tl.store(dq_out0, (dq0 * sm_scale).to(DQ.dtype.element_ty), mask=mask_row)
+            tl.store(dq_out1, (dq1 * sm_scale).to(DQ.dtype.element_ty), mask=mask_row)
 
 # ----------------------------------------------------------------------------
 # Triton Kernels (_bwd_dkdv_la_inner, _bwd_dq_la_inner, 
@@ -191,7 +687,7 @@ def _bwd_la_persistent_inner(
 
         start_m = m_block_idx * BLOCK_M1
         start_n = n_block_idx * BLOCK_N1
-        
+
         # Accumulators for the partial results, in high precision
         dk_accumulator = tl.zeros([BLOCK_N1, HEAD_DIM], dtype=tl.float32)
         dv_accumulator = tl.zeros([BLOCK_N1, HEAD_DIM], dtype=tl.float32)
@@ -513,62 +1009,82 @@ def la_backward_persistent(
     delta = torch.sum(o_bhsd * do_bhsd, dim=-1, keepdim=False)
 
     # Use a fixed number of work-groups based on SM count, per the reference
-    num_wgs = num_sm * 4
+    num_wgs = num_sm
 
-    # REVISED: Calculate scheduling params using the adapted function
-    (num_wgs, total_work_items, max_tiles_per_wg, high_load_wgs, num_dkdv_work_items,
-     work_per_dk_block, work_per_dq_block, num_m_blocks_1, num_m_blocks_2, num_n_blocks_1, num_n_blocks_2
-    ) = get_bwd_scheduling_params(
-        batch, num_q_heads, num_k_heads, max_seqlen_q, max_seqlen_k,
-        config["BLOCK_M1"], config["BLOCK_N1"], config["BLOCK_M2"], config["BLOCK_N2"], num_wgs, gqa_group_size
-    )
-    
-    # Allocate buffers for partial results and locks for host-based reduction
-    num_dk_blocks = (num_dkdv_work_items // work_per_dk_block)
-    dk_partials = torch.empty((num_dk_blocks, work_per_dk_block, config["BLOCK_N1"], head_sz), dtype=torch.float32, device=q.device)
-    dv_partials = torch.empty((num_dk_blocks, work_per_dk_block, config["BLOCK_N1"], head_sz), dtype=torch.float32, device=q.device)
-    locks_dkdv = torch.zeros((num_dk_blocks, work_per_dk_block), dtype=torch.int32, device=q.device)
+    # Persistent dK/dV (Stream-K)
+    BLOCK_M1 = config["BLOCK_M1"]; BLOCK_N1 = config["BLOCK_N1"]
+    num_m_blocks_1 = (max_seqlen_q + BLOCK_M1 - 1) // BLOCK_M1
+    num_n_blocks_1 = (max_seqlen_k + BLOCK_N1 - 1) // BLOCK_N1
+    total_tiles_dkdv = batch * num_k_heads * num_n_blocks_1
+    # Multi-CTA grid; group PARTICIPATING CTAs per tile like forward
+    PARTICIPATING = 4
+    total_programs = num_wgs * PARTICIPATING
+    grid_dkdv = (total_programs,)
+    max_tiles_per_wg_dkdv = triton.cdiv(total_tiles_dkdv, num_wgs)
+    high_load_wgs_dkdv = total_tiles_dkdv % num_wgs
+    if high_load_wgs_dkdv == 0 and total_tiles_dkdv > 0:
+        high_load_wgs_dkdv = num_wgs
 
-    # dQ partials: shape per work item is (BLOCK_M2, HEAD_DIM)
-    num_dq_blocks = batch * num_q_heads * num_m_blocks_2
-    dq_partials = torch.empty((num_dq_blocks, work_per_dq_block, config["BLOCK_M2"], head_sz), dtype=torch.float32, device=q.device)
-    locks_dq = torch.zeros((num_dq_blocks, work_per_dq_block), dtype=torch.int32, device=q.device)
+    # Per-CTA scratch sized by total programs
+    DKp = torch.empty((total_programs, BLOCK_N1, head_sz), dtype=torch.float32, device=q.device)
+    DVp = torch.empty((total_programs, BLOCK_N1, head_sz), dtype=torch.float32, device=q.device)
+    locks = torch.zeros((total_programs,), dtype=torch.int32, device=q.device)
 
-    if total_work_items == 0:
-        dq.copy_(dq_bhsd.transpose(1, 2))
-        dk.copy_(dk_bhsd.transpose(1, 2))
-        dv.copy_(dv_bhsd.transpose(1, 2))
-        return
-
-    grid = (num_wgs,)
-    
-    bwd_la_persistent[grid](
+    bwd_dkdv_streamk_persistent[grid_dkdv](
         q_bhsd, k_bhsd, v_bhsd, sm_scale, do_bhsd, o_bhsd, softmax_lse, delta,
-        dq_bhsd, dk_bhsd, dv_bhsd,
-        dk_partials, dv_partials, locks_dkdv,
-        dq_partials, locks_dq,
+        dk_bhsd, dv_bhsd,
+        DKp, DVp, locks,
+        q_bhsd.stride(0), q_bhsd.stride(1), q_bhsd.stride(2), q_bhsd.stride(3),
+        k_bhsd.stride(0), k_bhsd.stride(1), k_bhsd.stride(2), k_bhsd.stride(3),
+        v_bhsd.stride(0), v_bhsd.stride(1), v_bhsd.stride(2), v_bhsd.stride(3),
+        do_bhsd.stride(0), do_bhsd.stride(1), do_bhsd.stride(2), do_bhsd.stride(3),
+        dk_bhsd.stride(0), dk_bhsd.stride(1), dk_bhsd.stride(2), dk_bhsd.stride(3),
+        dv_bhsd.stride(0), dv_bhsd.stride(1), dv_bhsd.stride(2), dv_bhsd.stride(3),
+        softmax_lse.stride(0), softmax_lse.stride(1), softmax_lse.stride(2),
+        delta.stride(0), delta.stride(1), delta.stride(2),
+        batch, num_q_heads, num_k_heads,
+        max_seqlen_q, max_seqlen_k,
+        num_m_blocks_1, num_n_blocks_1,
+        total_tiles_dkdv, high_load_wgs_dkdv, max_tiles_per_wg_dkdv,
+        gqa_group_size,
+        HEAD_DIM=head_sz,
+        CAUSAL=causal,
+        BLOCK_M=BLOCK_M1, BLOCK_N=BLOCK_N1, PARTICIPATING=PARTICIPATING,
+    )
+
+    # Persistent dQ (Stream-K)
+    BLOCK_M2 = config["BLOCK_M2"]; BLOCK_N2 = config["BLOCK_N2"]
+    num_m_blocks_2 = (max_seqlen_q + BLOCK_M2 - 1) // BLOCK_M2
+    num_n_blocks_2 = (max_seqlen_k + BLOCK_N2 - 1) // BLOCK_N2
+    total_tiles_dq = batch * num_q_heads * num_m_blocks_2
+    grid_dq = (total_programs,)
+    max_tiles_per_wg_dq = triton.cdiv(total_tiles_dq, num_wgs)
+    high_load_wgs_dq = total_tiles_dq % num_wgs
+    if high_load_wgs_dq == 0 and total_tiles_dq > 0:
+        high_load_wgs_dq = num_wgs
+
+    DQp = torch.empty((total_programs, BLOCK_M2, head_sz), dtype=torch.float32, device=q.device)
+    locks_q = torch.zeros((total_programs,), dtype=torch.int32, device=q.device)
+
+    bwd_dq_streamk_persistent[grid_dq](
+        q_bhsd, k_bhsd, v_bhsd, sm_scale, do_bhsd, o_bhsd, softmax_lse, delta,
+        dq_bhsd,
+        DQp, locks_q,
         q_bhsd.stride(0), q_bhsd.stride(1), q_bhsd.stride(2), q_bhsd.stride(3),
         k_bhsd.stride(0), k_bhsd.stride(1), k_bhsd.stride(2), k_bhsd.stride(3),
         v_bhsd.stride(0), v_bhsd.stride(1), v_bhsd.stride(2), v_bhsd.stride(3),
         do_bhsd.stride(0), do_bhsd.stride(1), do_bhsd.stride(2), do_bhsd.stride(3),
         dq_bhsd.stride(0), dq_bhsd.stride(1), dq_bhsd.stride(2), dq_bhsd.stride(3),
-        dk_bhsd.stride(0), dk_bhsd.stride(1), dk_bhsd.stride(2), dk_bhsd.stride(3),
-        dv_bhsd.stride(0), dv_bhsd.stride(1), dv_bhsd.stride(2), dv_bhsd.stride(3),
         softmax_lse.stride(0), softmax_lse.stride(1), softmax_lse.stride(2),
         delta.stride(0), delta.stride(1), delta.stride(2),
-        total_work_items,
-        high_load_wgs,
-        max_tiles_per_wg,
-        num_dkdv_work_items,
-        num_q_heads, num_k_heads,
+        batch, num_q_heads, num_k_heads,
         max_seqlen_q, max_seqlen_k,
-        work_per_dk_block,
-        work_per_dq_block,
-        num_m_blocks_1, num_m_blocks_2, num_n_blocks_1, num_n_blocks_2,
+        num_m_blocks_2, num_n_blocks_2,
+        total_tiles_dq, high_load_wgs_dq, max_tiles_per_wg_dq,
         gqa_group_size,
         HEAD_DIM=head_sz,
         CAUSAL=causal,
-        **config,
+        BLOCK_M=BLOCK_M2, BLOCK_N=BLOCK_N2, PARTICIPATING=PARTICIPATING,
     )
 
     dq.copy_(dq_bhsd.transpose(1, 2))

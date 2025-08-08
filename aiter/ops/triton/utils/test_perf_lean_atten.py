@@ -5,7 +5,7 @@ import sys, os
 
 # Add project root to Python path
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../../../..")))
-from aiter.ops.triton.lean_atten_bwd_clean import la_backward_persistent
+from aiter.ops.triton.lean_atten_bwd_acc import la_backward_persistent
 from aiter.ops.triton.mha_onekernel_bwd import flash_attn_onekernel_backward
 
 # --- 1. Define Test Configurations ---
