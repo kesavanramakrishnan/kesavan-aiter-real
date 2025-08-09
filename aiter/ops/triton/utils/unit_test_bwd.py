@@ -5,7 +5,7 @@ import sys, os
 
 # Assume the la_backward_persistent launcher is in this path
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../../../..")))
-from aiter.ops.triton.lean_atten_bwd_clean import la_backward_persistent
+from aiter.ops.triton.lean_atten_bwd_acc import persistent_lean_attention_bwd as la_backward_persistent
 
 # --- 1. Define Test Configurations ---
 # Add or modify dictionaries in this list to test different scenarios.
@@ -101,22 +101,40 @@ def run_test(config: dict):
     dv_triton = torch.empty_like(v)
 
     print("  Computing gradients with your Triton kernel...")
-    # NOTE: Tensors are transposed to [batch, seqlen, n_heads, head_dim] for the launcher.
+    # NOTE: Tensors are reshaped to [B*Seqlen, H, head_dim] and concatenated for K/V
+    q_flat = q.transpose(1, 2).reshape(BATCH * SEQLEN_Q, N_HEADS, HEAD_DIM).contiguous()
+    k_flat = k.transpose(1, 2).reshape(BATCH * SEQLEN_K, N_HEADS, HEAD_DIM).contiguous()
+    v_flat = v.transpose(1, 2).reshape(BATCH * SEQLEN_K, N_HEADS, HEAD_DIM).contiguous()
+    do_flat = do.transpose(1, 2).reshape(BATCH * SEQLEN_Q, N_HEADS, HEAD_DIM).contiguous()
+    o_flat = o_triton.transpose(1, 2).reshape(BATCH * SEQLEN_Q, N_HEADS, HEAD_DIM).contiguous()
+
+    dq_out_flat = torch.zeros_like(q_flat)
+    dk_out_flat = torch.zeros_like(k_flat)
+    dv_out_flat = torch.zeros_like(v_flat)
+
+    # Compute batch_num_block_n when necessary
+    # default BLOCK_N for tests (avoid loading json config)
+    BLOCK_N = 64
+    num_n_blocks = (SEQLEN_K + BLOCK_N - 1) // BLOCK_N
+    batch_num_block_n = None
+    if (not CAUSAL) and (BATCH > 1):
+        batch_num_block_n = (
+            torch.arange(1, BATCH + 1, device=DEVICE, dtype=torch.int32) * num_n_blocks
+        )
+
     la_backward_persistent(
-        do.transpose(1, 2),
-        q.transpose(1, 2),
-        k.transpose(1, 2),
-        v.transpose(1, 2),
-        o_triton.transpose(1, 2),
-        softmax_lse_stable,
-        dq_triton.transpose(1, 2),
-        dk_triton.transpose(1, 2),
-        dv_triton.transpose(1, 2),
-        sm_scale,
-        CAUSAL,
-        SEQLEN_Q,
-        SEQLEN_K,
+        q=q_flat, k=k_flat, v=v_flat, do=do_flat, o=o_flat,
+        softmax_lse=softmax_lse_stable,
+        dq=dq_out_flat, dk=dk_out_flat, dv=dv_out_flat,
+        batch_num_block_n=batch_num_block_n,
+        batch_size=BATCH,
+        sm_scale=sm_scale,
+        causal=CAUSAL,
     )
+
+    dq_triton.copy_(dq_out_flat.view(BATCH, SEQLEN_Q, N_HEADS, HEAD_DIM).transpose(1, 2))
+    dk_triton.copy_(dk_out_flat.view(BATCH, SEQLEN_K, N_HEADS, HEAD_DIM).transpose(1, 2))
+    dv_triton.copy_(dv_out_flat.view(BATCH, SEQLEN_K, N_HEADS, HEAD_DIM).transpose(1, 2))
 
     # --- 5. Compare Results ---
     print("\n  --- Comparison Results ---")
@@ -126,20 +144,29 @@ def run_test(config: dict):
     # Compare dQ
     dq_is_close = torch.allclose(dq_triton, dq_ref, atol=atol, rtol=rtol)
     if not dq_is_close: passed = False
+    dq_diff = (dq_triton - dq_ref).abs()
+    dq_tol = atol + rtol * dq_ref.abs()
+    dq_mismatch_pct = (dq_diff > dq_tol).float().mean().item() * 100
     print(f"  dQ allclose: {dq_is_close}")
-    print(f"    Max difference in dQ: {(dq_triton - dq_ref).abs().max().item():.6f}")
+    print(f"    % mismatched in dQ: {dq_mismatch_pct:.6f}%")
 
     # Compare dK
+    dk_diff = (dk_triton - dk_ref).abs()
+    dk_tol = atol + rtol * dk_ref.abs()
+    dk_mismatch_pct = (dk_diff > dk_tol).float().mean().item() * 100
     dk_is_close = torch.allclose(dk_triton, dk_ref, atol=atol, rtol=rtol)
     if not dk_is_close: passed = False
     print(f"  dK allclose: {dk_is_close}")
-    print(f"    Max difference in dK: {(dk_triton - dk_ref).abs().max().item():.6f}")
+    print(f"    % mismatched in dK: {dk_mismatch_pct:.6f}%")
 
     # Compare dV
+    dv_diff = (dv_triton - dv_ref).abs()
+    dv_tol = atol + rtol * dv_ref.abs()
+    dv_mismatch_pct = (dv_diff > dv_tol).float().mean().item() * 100
     dv_is_close = torch.allclose(dv_triton, dv_ref, atol=atol, rtol=rtol)
     if not dv_is_close: passed = False
     print(f"  dV allclose: {dv_is_close}")
-    print(f"    Max difference in dV: {(dv_triton - dv_ref).abs().max().item():.6f}")
+    print(f"    % mismatched in dV: {dv_mismatch_pct:.6f}%")
 
     return passed
 

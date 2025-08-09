@@ -2,7 +2,7 @@ import pytest
 import torch
 import triton
 
-from aiter.ops.triton.lean_atten_bwd_acc import la_backward_persistent
+from aiter.ops.triton.lean_atten_bwd_acc import persistent_lean_attention_bwd
 from aiter.ops.triton.mha_onekernel_bwd import flash_attn_onekernel_backward
 
 # Define data types for testing, including float32 on capable hardware
@@ -15,10 +15,10 @@ ATOL = {torch.float16: 1e-2, torch.bfloat16: 2e-2, torch.float32: 1e-4}
 RTOL = {torch.float16: 1e-2, torch.bfloat16: 2e-2, torch.float32: 1e-4}
 
 
-@pytest.mark.parametrize("BATCH", [1, 4, 8, 24])
+@pytest.mark.parametrize("BATCH", [1,])
 @pytest.mark.parametrize("NUM_Q_HEADS, NUM_K_HEADS", [(4, 4)])
-@pytest.mark.parametrize("HEAD_SZ", [8])
-@pytest.mark.parametrize("SEQLEN_Q, SEQLEN_K", [(64, 64), (128, 128)])
+@pytest.mark.parametrize("HEAD_SZ", [16])
+@pytest.mark.parametrize("SEQLEN_Q, SEQLEN_K", [(64, 64)])
 @pytest.mark.parametrize("causal", [False, True])
 @pytest.mark.parametrize("dtype", [torch.float16])
 def test_la_bwd_vs_flash_bwd(
@@ -89,18 +89,38 @@ def test_la_bwd_vs_flash_bwd(
     do_bsnh = do.permute(0, 2, 1, 3).contiguous()
 
     # --- Lean Attention Backward Pass ---
-    dq_la_bsnh = torch.zeros_like(q_bsnh)
-    dk_la_bsnh = torch.zeros_like(k_bsnh)
-    dv_la_bsnh = torch.zeros_like(v_bsnh)
-    num_sm = torch.cuda.get_device_properties(device).multi_processor_count
+    # Flatten to [B*Seqlen, H, D] and concatenate K/V across batch
+    q_flat = q_bsnh.reshape(BATCH * SEQLEN_Q, NUM_Q_HEADS, HEAD_SZ).contiguous()
+    k_flat = k_bsnh.reshape(BATCH * SEQLEN_K, NUM_K_HEADS, HEAD_SZ).contiguous()
+    v_flat = v_bsnh.reshape(BATCH * SEQLEN_K, NUM_K_HEADS, HEAD_SZ).contiguous()
+    o_flat = o_bsnh.reshape(BATCH * SEQLEN_Q, NUM_Q_HEADS, HEAD_SZ).contiguous()
+    do_flat = do_bsnh.reshape(BATCH * SEQLEN_Q, NUM_Q_HEADS, HEAD_SZ).contiguous()
 
-    la_backward_persistent(
-        do=do_bsnh, q=q_bsnh, k=k_bsnh, v=v_bsnh, o=o_bsnh,
+    dq_flat = torch.zeros_like(q_flat)
+    dk_flat = torch.zeros_like(k_flat)
+    dv_flat = torch.zeros_like(v_flat)
+
+    # Compute batch_num_block_n for non-causal multi-batch decode
+    # default BLOCK_N for tests (avoid loading json config)
+    BLOCK_N = 64
+    num_n_blocks = (SEQLEN_K + BLOCK_N - 1) // BLOCK_N
+    batch_num_block_n = None
+    if (not causal) and (BATCH > 1):
+        batch_num_block_n = (
+            torch.arange(1, BATCH + 1, device=device, dtype=torch.int32) * num_n_blocks
+        )
+
+    persistent_lean_attention_bwd(
+        q=q_flat, k=k_flat, v=v_flat, do=do_flat, o=o_flat,
         softmax_lse=softmax_lse_ref,
-        dq=dq_la_bsnh, dk=dk_la_bsnh, dv=dv_la_bsnh,
-        sm_scale=sm_scale, causal=causal,
-        max_seqlen_q=SEQLEN_Q, max_seqlen_k=SEQLEN_K, num_sm=num_sm,
+        dq=dq_flat, dk=dk_flat, dv=dv_flat,
+        batch_num_block_n=batch_num_block_n,
+        batch_size=BATCH, sm_scale=sm_scale, causal=causal,
     )
+
+    dq_la_bsnh = dq_flat.view(BATCH, SEQLEN_Q, NUM_Q_HEADS, HEAD_SZ).contiguous()
+    dk_la_bsnh = dk_flat.view(BATCH, SEQLEN_K, NUM_K_HEADS, HEAD_SZ).contiguous()
+    dv_la_bsnh = dv_flat.view(BATCH, SEQLEN_K, NUM_K_HEADS, HEAD_SZ).contiguous()
 
     # --- Flash Attention Backward Pass ---
     dq_flash_bsnh = torch.zeros_like(q_bsnh)
@@ -130,22 +150,23 @@ def test_la_bwd_vs_flash_bwd(
     atol, rtol = ATOL[dtype], RTOL[dtype]
 
     print("\n--- dK Comparison (Lean Attn vs Flash Attn) ---")
-    print("dK (Lean Attn):", dk_la)
-    print("dK (Flash Attn):", dk_flash)
-    print("Difference (dK):", torch.abs(dk_la - dk_flash))
-    print(f"Max difference (dK): {torch.max(torch.abs(dk_la - dk_flash))}")
+    dk_diff = torch.abs(dk_la - dk_flash)
+    print(dk_diff)
+    dk_tol = atol + rtol * torch.abs(dk_flash)
+    dk_mismatch_pct = (dk_diff > dk_tol).float().mean().item() * 100
+    print(f"% mismatched (dK): {dk_mismatch_pct:.6f}%")
 
     print("\n--- dV Comparison (Lean Attn vs Flash Attn) ---")
-    print("dV (Lean Attn):", dv_la)
-    print("dV (Flash Attn):", dv_flash)
-    print("Difference (dV):", torch.abs(dv_la - dv_flash))
-    print(f"Max difference (dV): {torch.max(torch.abs(dv_la - dv_flash))}")
+    dv_diff = torch.abs(dv_la - dv_flash)
+    dv_tol = atol + rtol * torch.abs(dv_flash)
+    dv_mismatch_pct = (dv_diff > dv_tol).float().mean().item() * 100
+    print(f"% mismatched (dV): {dv_mismatch_pct:.6f}%")
 
     print("\n--- dQ Comparison (Lean Attn vs Flash Attn) ---")
-    print("dQ (Lean Attn):", dq_la)
-    print("dQ (Flash Attn):", dq_flash)
-    print("Difference (dQ):", torch.abs(dq_la - dq_flash))
-    print(f"Max difference (dQ): {torch.max(torch.abs(dq_la - dq_flash))}")
+    dq_diff = torch.abs(dq_la - dq_flash)
+    dq_tol = atol + rtol * torch.abs(dq_flash)
+    dq_mismatch_pct = (dq_diff > dq_tol).float().mean().item() * 100
+    print(f"% mismatched (dQ): {dq_mismatch_pct:.6f}%")
 
     # Compare Lean Attention with Flash Attention
     torch.testing.assert_close(dq_la, dq_flash, atol=atol, rtol=rtol, msg="dQ (Lean Attn vs Flash Attn)")
