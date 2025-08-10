@@ -5,11 +5,15 @@ import sys, os
 
 # Add project root to Python path
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../../../..")))
-from aiter.ops.triton.lean_atten_bwd_acc import la_backward_persistent
+from aiter.ops.triton.lean_atten_bwd_acc import persistent_lean_attention_bwd as la_backward_persistent
 from aiter.ops.triton.mha_onekernel_bwd import flash_attn_onekernel_backward
 
 # --- 1. Define Test Configurations ---
 TEST_CONFIGS = [
+    {
+        "BATCH": 1, "N_HEADS": 6, "SEQLEN_Q": 64, "SEQLEN_K": 64,
+        "HEAD_DIM": 64, "CAUSAL": True, "DTYPE": torch.float16
+    },
     {
         "BATCH": 2, "N_HEADS": 48, "SEQLEN_Q": 64, "SEQLEN_K": 128,
         "HEAD_DIM": 64, "CAUSAL": False, "DTYPE": torch.float16
@@ -29,6 +33,14 @@ TEST_CONFIGS = [
      {
         "BATCH": 1, "N_HEADS": 48, "SEQLEN_Q": 8192, "SEQLEN_K": 8192,
         "HEAD_DIM": 64, "CAUSAL": False, "DTYPE": torch.float16
+    },
+     {
+        "BATCH": 1, "N_HEADS": 16, "SEQLEN_Q": 16384, "SEQLEN_K": 16384,
+        "HEAD_DIM": 64, "CAUSAL": False, "DTYPE": torch.float16
+    },
+     {
+        "BATCH": 1, "N_HEADS": 16, "SEQLEN_Q": 16384, "SEQLEN_K": 16384,
+        "HEAD_DIM": 64, "CAUSAL": True, "DTYPE": torch.float16
     }
 ]
 
@@ -102,22 +114,41 @@ def run_test_and_benchmark(config: dict):
     dk_la = torch.empty_like(k)
     dv_la = torch.empty_like(v)
     
-    # Transpose from BHSD to BSHD for the kernel
+    # Transpose from BHSD to BSHD for the kernel and flatten to [B*Seqlen, H, D]
     q_bshd = q.transpose(1, 2).contiguous()
     k_bshd = k.transpose(1, 2).contiguous()
     v_bshd = v.transpose(1, 2).contiguous()
     o_bshd = o_ref.transpose(1, 2).contiguous()
     do_bshd = do.transpose(1, 2).contiguous()
-    dq_la_bshd = dq_la.transpose(1, 2).contiguous()
-    dk_la_bshd = dk_la.transpose(1, 2).contiguous()
-    dv_la_bshd = dv_la.transpose(1, 2).contiguous()
-    num_sm = torch.cuda.get_device_properties(DEVICE).multi_processor_count
 
-    la_kernel_call = lambda: la_backward_persistent(
-        do_bshd, q_bshd, k_bshd, v_bshd, o_bshd, softmax_lse_stable,
-        dq_la_bshd, dk_la_bshd, dv_la_bshd, sm_scale,
-        CAUSAL, SEQLEN_Q, SEQLEN_K, num_sm=num_sm
-    )
+    q_flat = q_bshd.reshape(BATCH * SEQLEN_Q, N_HEADS, HEAD_DIM).contiguous()
+    k_flat = k_bshd.reshape(BATCH * SEQLEN_K, N_HEADS, HEAD_DIM).contiguous()
+    v_flat = v_bshd.reshape(BATCH * SEQLEN_K, N_HEADS, HEAD_DIM).contiguous()
+    o_flat = o_bshd.reshape(BATCH * SEQLEN_Q, N_HEADS, HEAD_DIM).contiguous()
+    do_flat = do_bshd.reshape(BATCH * SEQLEN_Q, N_HEADS, HEAD_DIM).contiguous()
+
+    dq_la_flat = torch.zeros_like(q_flat)
+    dk_la_flat = torch.zeros_like(k_flat)
+    dv_la_flat = torch.zeros_like(v_flat)
+
+    # Build batch_num_block_n for decode (non-causal) multi-batch
+    batch_num_block_n = None
+    if (not CAUSAL) and (BATCH > 1):
+        BLOCK_N = 64
+        per_batch_blocks = (SEQLEN_K + BLOCK_N - 1) // BLOCK_N
+        batch_num_block_n = (
+            torch.arange(1, BATCH + 1, device=DEVICE, dtype=torch.int32) * per_batch_blocks
+        )
+
+    def la_kernel_call():
+        la_backward_persistent(
+            q=q_flat, k=k_flat, v=v_flat, do=do_flat, o=o_flat,
+            softmax_lse=softmax_lse_stable,
+            dq=dq_la_flat, dk=dk_la_flat, dv=dv_la_flat,
+            batch_num_block_n=batch_num_block_n,
+            batch_size=BATCH, sm_scale=sm_scale, causal=CAUSAL,
+        )
+
     la_kernel_call() # Warmup
     torch.cuda.synchronize()
     start_event.record()
@@ -133,13 +164,15 @@ def run_test_and_benchmark(config: dict):
     dk_flash_bshd = torch.empty_like(k_bshd)
     dv_flash_bshd = torch.empty_like(v_bshd)
 
-    flash_kernel_call = lambda: flash_attn_onekernel_backward(
-        do=do_bshd, q=q_bshd, k=k_bshd, v=v_bshd, o=o_bshd,
-        softmax_lse=softmax_lse_stable, dq=dq_flash_bshd, dk=dk_flash_bshd, dv=dv_flash_bshd,
-        dbias=None, sm_scale=sm_scale, alibi_slopes=None, causal=CAUSAL,
-        cu_seqlens_q=None, cu_seqlens_k=None, max_seqlen_q=SEQLEN_Q,
-        max_seqlen_k=SEQLEN_K, dropout_p=0.0
-    )
+    def flash_kernel_call():
+        flash_attn_onekernel_backward(
+            do=do_bshd, q=q_bshd, k=k_bshd, v=v_bshd, o=o_bshd,
+            softmax_lse=softmax_lse_stable, dq=dq_flash_bshd, dk=dk_flash_bshd, dv=dv_flash_bshd,
+            dbias=None, sm_scale=sm_scale, alibi_slopes=None, causal=CAUSAL,
+            cu_seqlens_q=None, cu_seqlens_k=None, max_seqlen_q=SEQLEN_Q,
+            max_seqlen_k=SEQLEN_K, dropout_p=0.0
+        )
+    
     flash_kernel_call() # Warmup
     torch.cuda.synchronize()
     start_event.record()
@@ -151,6 +184,11 @@ def run_test_and_benchmark(config: dict):
 
     # --- Compare Results & Performance ---
     atol, rtol = 1e-2, 1e-2
+    # Copy back flattened outputs to BHSD layout
+    dq_la_bshd = dq_la_flat.view(BATCH, SEQLEN_Q, N_HEADS, HEAD_DIM).contiguous()
+    dk_la_bshd = dk_la_flat.view(BATCH, SEQLEN_K, N_HEADS, HEAD_DIM).contiguous()
+    dv_la_bshd = dv_la_flat.view(BATCH, SEQLEN_K, N_HEADS, HEAD_DIM).contiguous()
+
     dq_la, dk_la, dv_la = dq_la_bshd.transpose(1, 2), dk_la_bshd.transpose(1, 2), dv_la_bshd.transpose(1, 2)
     la_passed = all([
         torch.allclose(dq_la, dq_ref, atol=atol, rtol=rtol),

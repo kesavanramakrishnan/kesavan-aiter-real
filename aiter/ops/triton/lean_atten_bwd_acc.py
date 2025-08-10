@@ -456,7 +456,7 @@ def la_bwd_kv_persistent(
     batch_idx = 0
     n_block_in_batch = 0
     if CAUSAL:
-        num_n_blocks_per_batch = tl.load(batch_num_block_n)
+        num_n_blocks_per_batch = total_n_blocks_all_batches // B
         batch_idx = n_linear // num_n_blocks_per_batch
         n_block_in_batch = n_linear % num_n_blocks_per_batch
         b_seq_size = batch_idx * num_n_blocks_per_batch
@@ -746,12 +746,19 @@ def la_bwd_q_streamk(
     # Process each assigned LeanTile
     for i in range(0, num_to_process):
         iter = iter_start + i
-        if iter < total_tiles:
+        valid = iter < total_tiles
 
-            # Map LeanTile id to (tile_head_idx, tile_batch_idx, per_head_tile_idx) and local iter range
-            tile_head_idx = iter // tiles_per_head
+        # Map LeanTile id to (tile_head_idx, tile_batch_idx, per_head_tile_idx) and local iter range
+        tile_head_idx_raw = iter // tiles_per_head
+        tile_head_idx = tl.minimum(tile_head_idx_raw, H - 1)
+        # defaults to avoid use before set when invalid
+        tile_batch_idx = 0
+        per_head_tile_idx = 0
+        tile_iter = 0
+        tile_iter_end = 0
+        tile_idx = 0
 
-        if CAUSAL:
+        if CAUSAL and valid:
             per_head_span = tl.maximum(1, tiles_per_head // batch_size)
             tile_batch_idx = (iter % tiles_per_head) // per_head_span
             per_head_tile_idx, per_head_tile_size, total_blocks = find_group(
@@ -762,7 +769,7 @@ def la_bwd_q_streamk(
             tile_iter = tile_head_idx * tiles_per_head + tile_batch_idx * per_head_span + total_blocks
             tile_iter_end = tile_iter + per_head_tile_size
             tile_idx = (tile_head_idx * batch_size + tile_batch_idx) * num_m_blocks + per_head_tile_idx
-        else:
+        elif (not CAUSAL) and valid:
             tile_idx = tile_head_idx * batch_size
             tile_iter = tile_head_idx * tiles_per_head
             # derive per-batch req sizes
@@ -779,12 +786,13 @@ def la_bwd_q_streamk(
                 prev_size = cum
             tile_idx = tile_head_idx * batch_size + tile_batch_idx
         # Compute local iter bounds for this CTA
-        local_iter = iter - tile_iter
+        local_iter = tl.where(valid, iter - tile_iter, 0)
         # In Stream-K, each iter processes one k/v block of the current output tile
         # So we limit to a single LeanTile per iter
-        local_iter_end = local_iter + 1
+        local_iter_end = tl.where(valid, local_iter + 1, 0)
 
-        host_block = (local_iter == 0)
+        # Mask all subsequent loads/computes with `valid` so we don't use continue
+        host_block = (local_iter == 0) & valid
         finishing_block = False  # Will be determined by split computation below when reducing
 
         # Derive memory offsets
@@ -822,11 +830,11 @@ def la_bwd_q_streamk(
             + (q_idx * BLOCK_M + offs_m) * stride_deltam
         )
 
-        q_tile = tl.load(q_ptrs)
-        do_tile = tl.load(do_ptrs)
-        m_rows = tl.load(m_ptrs, mask=(offs_m < BLOCK_M), other=-float("inf"))
-        delta_rows = tl.load(delta_ptrs, mask=(offs_m < BLOCK_M), other=0.0)
-
+        q_tile = tl.load(q_ptrs, mask=valid)
+        do_tile = tl.load(do_ptrs, mask=valid)
+        m_rows = tl.load(m_ptrs, mask=((offs_m < BLOCK_M) & valid), other=-float("inf"))
+        delta_rows = tl.load(delta_ptrs, mask=((offs_m < BLOCK_M) & valid), other=0.0)
+        
         # Initialize accumulator for this output tile segment
         dq_acc = tl.zeros([BLOCK_M, HEAD_DIM], dtype=tl.float32)
 
@@ -983,12 +991,18 @@ def persistent_lean_attention_bwd(
     )
     locks = torch.zeros((total_programs,), device=q.device, dtype=torch.int32)
 
-    # If no ragged decode, supply a dummy tensor
+    # If no ragged decode, build cumulative n-blocks per batch for non-causal; single-element for B==1
     if batch_num_block_n is None:
         num_n_blocks_total = (N_CTX_K + BLOCK_N - 1) // BLOCK_N
-        batch_num_block_n = torch.tensor(
-            [num_n_blocks_total * (i + 1) for i in range(batch_size)], device=q.device, dtype=torch.int32
-        ) if (not causal and batch_size > 1) else torch.tensor([tiles_per_head // max(1, batch_size)], device=q.device, dtype=torch.int32)
+        if not causal:
+            if batch_size > 1:
+                per_batch_blocks = num_n_blocks_total // batch_size
+                batch_num_block_n = (torch.arange(1, batch_size + 1, device=q.device, dtype=torch.int32) * per_batch_blocks)
+            else:
+                batch_num_block_n = torch.tensor([num_n_blocks_total], device=q.device, dtype=torch.int32)
+        else:
+            # not used in causal paths; provide a sane placeholder
+            batch_num_block_n = torch.tensor([num_n_blocks_total // max(1, batch_size)], device=q.device, dtype=torch.int32)
 
     # Compute Delta on host: sum(dO * O) per row
     Delta = (do * o).sum(dim=-1).view(batch_size, N_CTX_Q, H).permute(0, 2, 1).contiguous()
@@ -1034,12 +1048,12 @@ def persistent_lean_attention_bwd(
     )
 
     # Optionally run Q-centric pass for dQ later; for now we leave dq as zeros or compute separately
-    # --- Q-centric pass for dQ: Stream-K equalized LeanTiles per CTA with host-CTA reduction ---
-    # Reuse scheduling params from safe scheduler
-    total_q_tiles = tiles_per_head * H
-    grid_q = (total_programs,)
+    # --- Q-centric pass for dQ: use KV-style correctness (one Q tile per CTA, full K/V sweep) ---
+    num_m_blocks_total = (N_CTX_Q + BLOCK_M - 1) // BLOCK_M
+    total_q_tiles = batch_size * H * num_m_blocks_total
+    grid_q = (total_q_tiles,)
 
-    la_bwd_q_streamk[grid_q](
+    la_bwd_q_persistent[grid_q](
         q,
         k,
         v,
@@ -1047,8 +1061,6 @@ def persistent_lean_attention_bwd(
         softmax_lse,
         Delta,
         dq,
-        DqOp,
-        locks,
         q.stride(0), q.stride(1), q.stride(2),
         k.stride(0), k.stride(1), k.stride(2),
         v.stride(0), v.stride(1), v.stride(2),
@@ -1056,22 +1068,16 @@ def persistent_lean_attention_bwd(
         softmax_lse.stride(0), softmax_lse.stride(1), softmax_lse.stride(2),
         Delta.stride(0), Delta.stride(1), Delta.stride(2),
         dq.stride(0), dq.stride(1), dq.stride(2),
-        DqOp.stride(0), DqOp.stride(1), DqOp.stride(2),
         sm_scale,
-        total_q_tiles,
-        high_load_wgs,
-        max_tiles_per_wg,
-        tiles_per_head,
-        num_splits=num_splits,
-        batch_size=batch_size,
+        batch_num_block_n,
+        N_CTX_Q,
+        total_n_blocks_all_batches,
         H=H,
+        B=batch_size,
         HEAD_DIM=HEAD_DIM,
         BLOCK_M=BLOCK_M,
         BLOCK_N=BLOCK_N,
-        MASKED_BLOCKS=(BLOCK_M // BLOCK_N),
         CAUSAL=causal,
-        num_m_blocks=num_m_blocks,
-        num_n_blocks=num_n_blocks,
         num_warps=config["num_warps"],
         waves_per_eu=config["waves_per_eu"],
         num_stages=1,
