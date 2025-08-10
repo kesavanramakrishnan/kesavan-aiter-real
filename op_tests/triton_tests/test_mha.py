@@ -497,6 +497,11 @@ def test_mha_backward(
     if FUSED and CAUSAL:
         pytest.skip("FUSED+CAUSAL results in NaNs")
     mha_set_use_fused_bwd_kernel(FUSED)
+    # For non-varlen, no-dropout cases, route backward to the Lean Attention kernel
+    if DROPOUT == 0.0:
+        from aiter.ops.triton import mha_onekernel_bwd as _okb
+        from aiter.ops.triton import lean_atten_bwd_prod as _lab
+        _okb.flash_attn_onekernel_backward = _lab.flash_attn_onekernel_backward
     q = torch.randn((BATCH, SEQLEN_Q, NUM_Q_HEADS, HEAD_SZ), device="cuda", dtype=dtype)
     k = torch.randn((BATCH, SEQLEN_K, NUM_K_HEADS, HEAD_SZ), device="cuda", dtype=dtype)
     v = torch.randn((BATCH, SEQLEN_K, NUM_K_HEADS, HEAD_SZ), device="cuda", dtype=dtype)

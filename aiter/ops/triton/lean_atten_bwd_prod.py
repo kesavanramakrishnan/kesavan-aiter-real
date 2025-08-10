@@ -681,7 +681,7 @@ def persistent_lean_attention_bwd(
     assert q.shape[-1] == k.shape[-1] == v.shape[-1]
 
     HEAD_DIM = q.shape[-1]
-    assert HEAD_DIM in {8, 16, 32, 64, 128, 256}
+    assert HEAD_DIM in {16, 32, 64, 128, 256}
 
     # Layout and dimensions
     N_CTX_Q = q.shape[0] // batch_size
@@ -812,3 +812,92 @@ def persistent_lean_attention_bwd(
     )
 
     return
+
+
+def flash_attn_onekernel_backward(
+    do: torch.Tensor,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    o: torch.Tensor,
+    softmax_lse: torch.Tensor,
+    dq: torch.Tensor,
+    dk: torch.Tensor,
+    dv: torch.Tensor,
+    dbias: Optional[torch.Tensor],
+    sm_scale: float,
+    alibi_slopes: Optional[torch.Tensor],
+    causal: bool,
+    cu_seqlens_q: Optional[torch.Tensor],
+    cu_seqlens_k: Optional[torch.Tensor],
+    max_seqlen_q: Optional[int],
+    max_seqlen_k: Optional[int],
+    dropout_p: float,
+    philox_seed: Optional[int] = 0,
+    philox_offset: Optional[int] = 0,
+    descale_q: Optional[torch.Tensor] = None,
+    descale_k: Optional[torch.Tensor] = None,
+    descale_v: Optional[torch.Tensor] = None,
+    descale_do: Optional[torch.Tensor] = None,
+    USE_INT64_STRIDES: Optional[bool] = False,
+    config: Optional[dict] = None,
+):
+    """
+    One-kernel compatible wrapper that calls the Lean Attention backward launcher.
+    - Supports the standard (non-varlen) path with no dropout/alibi.
+    - Does not change internal Lean bwd logic.
+    - Returns delta in the same shape as the one-kernel API (B, H, S_Q).
+    """
+    # Match behavior of the original API
+    if dbias is not None:
+        raise ValueError("Bias is not supported yet in the Triton Backend")
+
+    # Only support the already-implemented core functionality
+    assert cu_seqlens_q is None and cu_seqlens_k is None, "Varlen path not supported in Lean bwd wrapper"
+    assert dropout_p == 0.0, "Dropout is not supported in Lean bwd wrapper"
+    assert alibi_slopes is None, "Alibi is not supported in Lean bwd wrapper"
+    assert descale_q is None and descale_k is None and descale_v is None and descale_do is None, (
+        "FP8 descale factors are not supported in Lean bwd wrapper"
+    )
+
+    # Shapes: q,k,v,do,o are [B, S, H, D] in test_mha non-varlen path
+    assert q.dim() == 4 and k.dim() == 4 and v.dim() == 4 and do.dim() == 4 and o.dim() == 4
+    B, S_Q, H, D = q.shape
+    _, S_K, Hk, Dk = k.shape
+    assert H == Hk and D == Dk and v.shape[2] == H and v.shape[3] == D
+
+    # Compute delta (B, H, S_Q) to match the onekernel API return
+    delta = (do * o).sum(dim=-1).permute(0, 2, 1).contiguous()
+
+    # Adapt layout to Lean bwd: [B*Seqlen, H, D] for q/do/o, [B*Seqlen_k, H, D] for k/v
+    q_lean = q.contiguous().view(B * S_Q, H, D)
+    do_lean = do.contiguous().view(B * S_Q, H, D)
+    o_lean = o.contiguous().view(B * S_Q, H, D)
+
+    k_lean = k.contiguous().view(B * S_K, H, D)
+    v_lean = v.contiguous().view(B * S_K, H, D)
+
+    # Grad outputs in Lean layout (views into provided tensors)
+    dq_lean = dq.view(B * S_Q, H, D)
+    dk_lean = dk.view(B * S_K, H, D)
+    dv_lean = dv.view(B * S_K, H, D)
+
+    # batch_num_block_n: None for uniform/non-ragged path.
+    persistent_lean_attention_bwd(
+        q=q_lean,
+        k=k_lean,
+        v=v_lean,
+        do=do_lean,
+        o=o_lean,
+        softmax_lse=softmax_lse.contiguous(),  # (B, H, S_Q)
+        dq=dq_lean,
+        dk=dk_lean,
+        dv=dv_lean,
+        batch_num_block_n=None,
+        batch_size=B,
+        sm_scale=sm_scale,
+        causal=causal,
+        config=config,
+    )
+
+    return delta
