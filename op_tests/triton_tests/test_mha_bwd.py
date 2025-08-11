@@ -18,7 +18,7 @@ from aiter.test_mha_common import (
     generate_random_padding_mask,
     generate_qkv,
 )
-from aiter.ops.triton.lean_atten_bwd_prod import *
+from aiter.ops.triton.lean_atten_bwd_acc import *
 
 logging.basicConfig(level=logging.DEBUG)
 logger = logging.getLogger(__name__)
@@ -467,7 +467,7 @@ def fp8_assert_close(
 @pytest.mark.parametrize("BATCH", [1, 4, 57, 128])
 @pytest.mark.parametrize(
     "SEQLEN_Q, SEQLEN_K",
-    [(128, 128)(64, 128)],
+    [(128, 128),(64, 64)],
 )
 @pytest.mark.parametrize("DROPOUT, CAUSAL", [(0.0, False), (0.0, True)])
 # @pytest.mark.parametrize('DROPOUT, CAUSAL',[(0.0, False),(0.0, True),(0.2, False),(0.2, True)]) #Debug Causal + Dropout. fails for seq >= 64
