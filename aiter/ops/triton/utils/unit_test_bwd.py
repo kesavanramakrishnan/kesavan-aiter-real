@@ -5,7 +5,7 @@ import sys, os
 
 # Assume the la_backward_persistent launcher is in this path
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../../../..")))
-from aiter.ops.triton.lean_atten_bwd_nonatom_fused import persistent_lean_attention_bwd as la_backward_persistent
+from aiter.ops.triton.lean_atten_bwd_acc import persistent_lean_attention_bwd as la_backward_persistent
 
 # --- 1. Define Test Configurations ---
 # Add or modify dictionaries in this list to test different scenarios.

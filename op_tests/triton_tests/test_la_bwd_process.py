@@ -2,7 +2,7 @@ import pytest
 import torch
 import triton
 
-from aiter.ops.triton.lean_atten_bwd_acc import persistent_lean_attention_bwd
+from aiter.ops.triton.lean_atten_bwd_clean import persistent_lean_attention_bwd
 from aiter.ops.triton.mha_onekernel_bwd import flash_attn_onekernel_backward
 
 # Define data types for testing, including float32 on capable hardware
@@ -14,19 +14,19 @@ if torch.cuda.is_available() and torch.cuda.get_device_capability() >= (8, 0):
 ATOL = {torch.float16: 1e-2, torch.bfloat16: 2e-2, torch.float32: 1e-4}
 RTOL = {torch.float16: 1e-2, torch.bfloat16: 2e-2, torch.float32: 1e-4}
 
-@pytest.mark.parametrize("BATCH", [1,])
-@pytest.mark.parametrize("NUM_Q_HEADS, NUM_K_HEADS", [(4, 4)])
-@pytest.mark.parametrize("HEAD_SZ", [16])
-@pytest.mark.parametrize("SEQLEN_Q, SEQLEN_K", [(16, 16), (64, 128)])
-@pytest.mark.parametrize("causal", [False, True])
-@pytest.mark.parametrize("dtype", [torch.float16])
-
-# @pytest.mark.parametrize("BATCH", [1, 2, 4])
-# @pytest.mark.parametrize("NUM_Q_HEADS, NUM_K_HEADS", [(4, 4), (8, 8)])
-# @pytest.mark.parametrize("HEAD_SZ", [16, 64])
-# @pytest.mark.parametrize("SEQLEN_Q, SEQLEN_K", [(16, 16), (64, 64),(128, 128), (256, 256)])
+# @pytest.mark.parametrize("BATCH", [1,])
+# @pytest.mark.parametrize("NUM_Q_HEADS, NUM_K_HEADS", [(4, 4)])
+# @pytest.mark.parametrize("HEAD_SZ", [16])
+# @pytest.mark.parametrize("SEQLEN_Q, SEQLEN_K", [(16, 16), (64, 128)])
 # @pytest.mark.parametrize("causal", [False, True])
 # @pytest.mark.parametrize("dtype", [torch.float16])
+
+@pytest.mark.parametrize("BATCH", [1, 2, 4])
+@pytest.mark.parametrize("NUM_Q_HEADS, NUM_K_HEADS", [(4, 4), (8, 8)])
+@pytest.mark.parametrize("HEAD_SZ", [16, 64])
+@pytest.mark.parametrize("SEQLEN_Q, SEQLEN_K", ([(64, 64),(128, 128), (256, 256)]))
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("dtype", [torch.float16])
 def test_la_bwd_vs_flash_bwd(
     BATCH: int,
     NUM_Q_HEADS: int,
@@ -122,6 +122,7 @@ def test_la_bwd_vs_flash_bwd(
         dq=dq_flat, dk=dk_flat, dv=dv_flat,
         batch_num_block_n=batch_num_block_n,
         batch_size=BATCH, sm_scale=sm_scale, causal=causal,
+        num_programs=304,
     )
 
     dq_la_bsnh = dq_flat.view(BATCH, SEQLEN_Q, NUM_Q_HEADS, HEAD_SZ).contiguous()
