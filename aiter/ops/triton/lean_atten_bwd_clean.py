@@ -189,17 +189,17 @@ def la_bwd_kv_persistent(
         n_block_in_batch = n_linear % num_n_blocks_per_batch
         b_seq_size = batch_idx * num_n_blocks_per_batch
     else:
-        prev_cum_running = 0
-        match_prev_cum = 0
+        prev_running_blocks = 0
+        match_prev_blocks = 0
         found = 0
         for b in range(0, B):
-            cum = tl.load(batch_num_block_n + b) if b > 0 else tl.load(batch_num_block_n)
-            is_match = (found == 0) & (n_linear < cum)
+            blocks_total = tl.load(batch_num_block_n + b) if b > 0 else tl.load(batch_num_block_n)
+            is_match = (found == 0) & (n_linear < blocks_total)
             batch_idx = tl.where(is_match, b, batch_idx)
-            match_prev_cum = tl.where(is_match, prev_cum_running, match_prev_cum)
+            match_prev_blocks = tl.where(is_match, prev_running_blocks, match_prev_blocks)
             found = tl.where(is_match, 1, found)
-            prev_cum_running = cum
-        n_block_in_batch = n_linear - match_prev_cum
+            prev_running_blocks = blocks_total
+        n_block_in_batch = n_linear - match_prev_blocks
         b_seq_size = 0 if batch_idx == 0 else tl.load(batch_num_block_n + batch_idx - 1)
 
     # Load K/V tile for this kv
@@ -349,13 +349,13 @@ def la_bwd_q_persistent(
         num_n_blocks_per_batch = total_n_blocks_all_batches // B
         b_seq_size_blocks = batch_idx * num_n_blocks_per_batch
     else:
-        prev_cum = 0
+        blocks_prev = 0
         for b in range(0, B):
-            cum = tl.load(batch_num_block_n + b) if b > 0 else tl.load(batch_num_block_n)
+            blocks_total = tl.load(batch_num_block_n + b) if b > 0 else tl.load(batch_num_block_n)
             if b == batch_idx:
-                num_n_blocks_per_batch = cum - prev_cum
-                b_seq_size_blocks = prev_cum
-            prev_cum = cum
+                num_n_blocks_per_batch = blocks_total - blocks_prev
+                b_seq_size_blocks = blocks_prev
+            blocks_prev = blocks_total
 
     dq_acc = tl.zeros([BLOCK_M, HEAD_DIM], dtype=tl.float32)
 
@@ -508,12 +508,12 @@ def la_bwd_q_streamk(
             local_head_iter = iter % tiles_per_head
             tile_batch_idx = 0
             for b in range(0, batch_size):
-                cum = tl.load(batch_num_block_n + b) if b > 0 else tl.load(batch_num_block_n)
-                if (local_head_iter < cum) & (local_head_iter >= prev_size):
+                blocks_total = tl.load(batch_num_block_n + b) if b > 0 else tl.load(batch_num_block_n)
+                if (local_head_iter < blocks_total) & (local_head_iter >= prev_size):
                     tile_batch_idx = b
                     tile_iter = tile_head_idx * tiles_per_head + prev_size
-                    tile_iter_end = tile_iter + (cum - prev_size)
-                prev_size = cum
+                    tile_iter_end = tile_iter + (blocks_total - prev_size)
+                prev_size = blocks_total
             tile_idx = tile_head_idx * batch_size + tile_batch_idx
         # Compute local iter bounds for this CTA
         local_iter = tl.where(valid, iter - tile_iter, 0)
@@ -736,17 +736,17 @@ def la_bwd_kv_streamk(
             n_block_in_batch = n_linear % num_n_blocks_per_batch
             b_seq_size = batch_idx * num_n_blocks_per_batch
         else:
-            prev_cum_running = 0
-            match_prev_cumu = 0
+            prev_running_blocks = 0
+            match_prev_blocks = 0
             found = 0
             for b in range(0, B):
-                cum = tl.load(batch_num_block_n + b, mask=valid, other=0) if b > 0 else tl.load(batch_num_block_n, mask=valid, other=0)
-                is_match = (found == 0) & (n_linear < cum)
+                blocks_total = tl.load(batch_num_block_n + b, mask=valid, other=0) if b > 0 else tl.load(batch_num_block_n, mask=valid, other=0)
+                is_match = (found == 0) & (n_linear < blocks_total)
                 batch_idx = tl.where(is_match, b, batch_idx)
-                match_prev_cumu = tl.where(is_match, prev_cum_running, match_prev_cumu)
+                match_prev_blocks = tl.where(is_match, prev_running_blocks, match_prev_blocks)
                 found = tl.where(is_match, 1, found)
-                prev_cum_running = cum
-            n_block_in_batch = n_linear - match_prev_cumu
+                prev_running_blocks = blocks_total
+            n_block_in_batch = n_linear - match_prev_blocks
             b_seq_size = 0 if batch_idx == 0 else tl.load(batch_num_block_n + batch_idx - 1, mask=valid, other=0)
 
         # Load K/V tile for this kv
@@ -901,13 +901,13 @@ def la_bwd_q_streamk_tiles(
             num_n_blocks_per_batch = total_n_blocks_all_batches // B
             b_seq_size_blocks = batch_idx * num_n_blocks_per_batch
         else:
-            prev_cumu = 0
+            blocks_prev = 0
             for b in range(0, B):
-                cumu = tl.load(batch_num_block_n + b) if b > 0 else tl.load(batch_num_block_n)
+                blocks_total = tl.load(batch_num_block_n + b) if b > 0 else tl.load(batch_num_block_n)
                 if b == batch_idx:
-                    num_n_blocks_per_batch = cumu - prev_cumu
-                    b_seq_size_blocks = prev_cumu
-                prev_cumu = cumu
+                    num_n_blocks_per_batch = blocks_total - blocks_prev
+                    b_seq_size_blocks = blocks_prev
+                blocks_prev = blocks_total
 
         dq_acc = tl.zeros([BLOCK_M, HEAD_DIM], dtype=tl.float32)
 
