@@ -2,7 +2,7 @@ import pytest
 import torch
 import triton
 
-from aiter.ops.triton.lean_atten_bwd_acc import persistent_lean_attention_bwd
+from aiter.ops.triton.lean_atten_bwd_clean import persistent_lean_attention_bwd
 from aiter.ops.triton.mha_onekernel_bwd import flash_attn_onekernel_backward
 
 # Define data types for testing, including float32 on capable hardware
