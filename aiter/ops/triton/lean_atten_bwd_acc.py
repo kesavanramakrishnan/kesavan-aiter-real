@@ -127,6 +127,59 @@ def get_num_splits_and_buffer_sizes_bwd(
 
 
 @triton.jit
+def la_bwd_preprocess(
+    o_ptr,
+    do_ptr,
+    delta_ptr,
+    stride_om,
+    stride_oh,
+    stride_ok,
+    stride_deltab,
+    stride_deltah,
+    stride_deltam,
+    N_CTX_Q,
+    BLOCK_M: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+):
+    """
+    Compute Delta = rowsum(dO * O) per row in [B, H, N_CTX_Q], mirroring flash-attn preprocess.
+    Inputs O/DO are laid out as [B*N_CTX_Q, H, HEAD_DIM]; Delta is [B, H, N_CTX_Q].
+    Grid: (tl.cdiv(N_CTX_Q, BLOCK_M), B, H)
+    """
+    pid_m = tl.program_id(0)
+    bid = tl.program_id(1)
+    hid = tl.program_id(2)
+
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_k = tl.arange(0, HEAD_DIM)
+
+    # Compute flattened row index into O/DO: (bid * N_CTX_Q + m)
+    row_idx = bid * N_CTX_Q + offs_m
+
+    # Offsets into O/DO: [B*N_CTX_Q, H, K]
+    offs_ok = (
+        row_idx[:, None] * stride_om
+        + hid * stride_oh
+        + offs_k[None, :] * stride_ok
+    )
+
+    mask_m = offs_m < N_CTX_Q
+    mask = mask_m[:, None]
+
+    o = tl.load(o_ptr + offs_ok, mask=mask, other=0.0)
+    do = tl.load(do_ptr + offs_ok, mask=mask, other=0.0)
+
+    delta = tl.sum(o.to(tl.float32) * do.to(tl.float32), axis=1)
+
+    offs_delta = (
+        bid * stride_deltab
+        + hid * stride_deltah
+        + offs_m * stride_deltam
+    )
+    tl.store(delta_ptr + offs_delta, delta, mask=mask_m)
+
+
+@triton.jit
 def la_bwd_dkdv_inner(
     Q,
     K,
@@ -328,11 +381,12 @@ def la_bwd_dkdv_inner(
                 mask_T = (q_start_abs + offs_m[None, :]) >= (k_start_abs + offs_n[:, None])
                 p_T = tl.where(mask_T & valid_kv, p_T, 0.0)
 
-            dp_T = tl.dot(v_tile, do_tile_T)
-            ds_T = p_T * (dp_T - delta_rows[None, :])
-
-            # Accumulate in (BLOCK_N, HEAD_DIM)
+            # dV first (streaming-friendly order)
             dv_acc += tl.dot(p_T.to(do_tile_T.type.element_ty), tl.trans(do_tile_T))
+
+            # Then dP and dK
+            dp_T = tl.dot(v_tile, do_tile_T)  # shape (BLOCK_N, BLOCK_M)
+            ds_T = p_T * (dp_T - delta_rows[None, :])
             dk_acc += tl.dot(ds_T.to(q_tile_T.type.element_ty), tl.trans(q_tile_T))
 
             # Advance pointers and absolute row start
@@ -815,8 +869,27 @@ def persistent_lean_attention_bwd(
             # not used in causal paths; provide a sane placeholder
             batch_num_block_n = torch.tensor([num_n_blocks_total // max(1, batch_size)], device=q.device, dtype=torch.int32)
 
-    # Compute Delta on host: sum(dO * O) per row, arranged as [B, H, Nq]
-    Delta = (do * o).sum(dim=-1).view(batch_size, N_CTX_Q, H).permute(0, 2, 1).contiguous()
+    # Compute Delta on device: [B, H, Nq]
+    Delta = torch.empty((batch_size, H, N_CTX_Q), device=q.device, dtype=torch.float32)
+    pre_grid = (
+        triton.cdiv(N_CTX_Q, BLOCK_M),
+        batch_size,
+        H,
+    )
+    la_bwd_preprocess[pre_grid](
+        o,
+        do,
+        Delta,
+        o.stride(0),  # stride_om (B*N_CTX_Q)
+        o.stride(1),  # stride_oh (H)
+        o.stride(2),  # stride_ok (K)
+        Delta.stride(0),  # stride_deltab (B)
+        Delta.stride(1),  # stride_deltah (H)
+        Delta.stride(2),  # stride_deltam (M)
+        N_CTX_Q,
+        BLOCK_M=BLOCK_M,
+        HEAD_DIM=HEAD_DIM,
+    )
     # Ensure dk/dv/dq are zero-initialized
     dk.zero_(); dv.zero_(); dq.zero_()
 

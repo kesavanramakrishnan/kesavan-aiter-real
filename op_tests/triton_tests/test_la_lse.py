@@ -6,7 +6,7 @@ import pytest
 import torch
 from bisect import bisect_right
 from typing import Union, List
-from aiter.ops.triton.lean_atten import (
+from aiter.ops.triton.lean_atten_lse import (
     _persistent_lean_attention,
     persistent_lean_attention,
     _get_config,
@@ -67,31 +67,40 @@ def get_lean_attn_inputs(
 
 
 def reference_attention(q, k, v, n_ctx, n_ctx_q, sm_scale, causal):
+    # LSE: NEW — allocate reference LSE buffer [B*Seqlen_q, H]
+    ref_lse = torch.empty((q.shape[0], q.shape[1]), dtype=torch.float32, device=q.device)
 
-    # Calculate Pytorch refence output
     ref_out = torch.empty_like(q, dtype=q.dtype)
     start = 0
     start_q = 0
 
     for b in n_ctx:
         qb = q[start_q : (start_q + int(n_ctx_q)), :, :]
-        qb_reshaped = qb.transpose(0, 1)
+        qb_reshaped = qb.transpose(0, 1)            # [H, n_ctx_q, d]
         kb = k[start : (start + int(b)), :, :]
-        kb_reshaped = kb.transpose(0, 1)
+        kb_reshaped = kb.transpose(0, 1)            # [H, b, d]
         vb = v[start : (start + int(b)), :, :]
-        vb_reshaped = vb.transpose(0, 1)
-        p = torch.matmul(qb_reshaped, kb_reshaped.transpose(-2, -1)) * sm_scale
+        vb_reshaped = vb.transpose(0, 1)            # [H, b, d]
+
+        logits = torch.matmul(qb_reshaped, kb_reshaped.transpose(-2, -1)) * sm_scale   # [H, n_ctx_q, b]
         if causal:
-            M = torch.tril(torch.ones((n_ctx_q, b), device="cuda"))
+            M = torch.tril(torch.ones((n_ctx_q, b), device=q.device))
             mask = M == 0
-            p[:, mask] = float("-inf")
-        # print(f"p shape: {p.shape}")
-        p = torch.softmax(p.float(), dim=-1).to(q.dtype)
-        refb = torch.matmul(p, vb_reshaped)
+            logits[:, mask] = float("-inf")
+
+        # LSE: NEW — natural-log logsumexp over K-dim
+        lse = torch.logsumexp(logits.float(), dim=-1)      # [H, n_ctx_q]
+        ref_lse[start_q : (start_q + int(n_ctx_q)), :] = lse.transpose(0, 1)  # -> [n_ctx_q, H]
+
+        p = torch.softmax(logits.float(), dim=-1).to(q.dtype)
+        refb = torch.matmul(p, vb_reshaped)                # [H, n_ctx_q, d]
         ref_out[start_q : (start_q + int(n_ctx_q)), :, :] = refb.transpose(0, 1)
+
         start += b
         start_q += n_ctx_q
-    return ref_out
+
+    return ref_out, ref_lse
+
 
 
 @pytest.mark.parametrize(
@@ -221,26 +230,58 @@ def test_persistent_lean_attention(
         init_dtype,
     )
 
-    # Triton LeanAttention output
-    la_out, ms = _persistent_lean_attention(
-        q,
-        k,
-        v,
-        Mp,
-        Lp,
-        Op,
-        locks,
-        batch_num_block_n,
-        total_programs,
-        BLOCK_M,
-        BLOCK_N,
-        causal,
-        batch,
-        sm_scale,
-        num_warps,
-        waves_per_eu,
-    )
+    # # Triton LeanAttention output
+    # la_out, ms = _persistent_lean_attention(
+    #     q,
+    #     k,
+    #     v,
+    #     Mp,
+    #     Lp,
+    #     Op,
+    #     locks,
+    #     batch_num_block_n,
+    #     total_programs,
+    #     BLOCK_M,
+    #     BLOCK_N,
+    #     causal,
+    #     batch,
+    #     sm_scale,
+    #     num_warps,
+    #     waves_per_eu,
+    # )
 
+    lse_out = torch.empty((q.shape[0], q.shape[1]), dtype=torch.float32, device=q.device)
+
+    # Triton LeanAttention output
+    try:
+        # LSE: NEW — prefer passing lse_out if your kernel supports it
+        la_out, ms = _persistent_lean_attention(
+            q, k, v, Mp, Lp, Op, locks, batch_num_block_n,
+            total_programs, BLOCK_M, BLOCK_N, causal, batch,
+            sm_scale, num_warps, waves_per_eu,
+            lse_out=lse_out,   # <-- LSE: NEW
+        )
+    except TypeError:
+        # Fallback if LSE plumbing isn't merged yet
+        la_out, ms = _persistent_lean_attention(
+            q, k, v, Mp, Lp, Op, locks, batch_num_block_n,
+            total_programs, BLOCK_M, BLOCK_N, causal, batch,
+            sm_scale, num_warps, waves_per_eu,
+        )
+
+    # PyTorch reference (now returns LSE too)
+    ref_out, ref_lse = reference_attention(q, k, v, n_ctx, n_ctx_q, sm_scale, causal)
+
+    # Compare result
+    atol = 1.4e-1 if init_dtype == "fp8" else 1e-2
+    rtol = 1e-2 if init_dtype == "fp8" else 3e-3
+    torch.testing.assert_close(ref_out, la_out, atol=atol, rtol=rtol)
+
+    # LSE: NEW — validate natural-log normalizers
+    lse_atol = 3e-2 if init_dtype == "fp8" else 1e-2
+    lse_rtol = 3e-3
+    if 'lse_out' in locals():
+        torch.testing.assert_close(ref_lse, lse_out, atol=lse_atol, rtol=lse_rtol)
     # Calculate Pytorch refence output
     ref_out = reference_attention(q, k, v, n_ctx, n_ctx_q, sm_scale, causal)
     # Compare result
@@ -400,30 +441,24 @@ def main():
         init_dtype,
     )
 
-    # Triton LeanAttention output
-    la_out, ms = _persistent_lean_attention(
-        q,
-        k,
-        v,
-        Mp,
-        Lp,
-        Op,
-        locks,
-        batch_num_block_n,
-        total_programs,
-        BLOCK_M,
-        BLOCK_N,
-        causal,
-        batch,
-        sm_scale,
-        num_warps,
-        waves_per_eu,
-    )
-    # print(f"ms={ms}")
+    lse_out = torch.empty((q.shape[0], q.shape[1]), dtype=torch.float32, device=q.device)
 
-    ref_out = reference_attention(q, k, v, n_ctx, n_ctx_q, sm_scale, causal)
+    try:
+        la_out, ms = _persistent_lean_attention(
+            q, k, v, Mp, Lp, Op, locks, batch_num_block_n,
+            total_programs, BLOCK_M, BLOCK_N, causal, batch,
+            sm_scale, num_warps, waves_per_eu,
+            lse_out=lse_out,   # LSE: NEW
+        )
+    except TypeError:
+        la_out, ms = _persistent_lean_attention(
+            q, k, v, Mp, Lp, Op, locks, batch_num_block_n,
+            total_programs, BLOCK_M, BLOCK_N, causal, batch,
+            sm_scale, num_warps, waves_per_eu,
+        )
 
-    # Compare result
+    ref_out, ref_lse = reference_attention(q, k, v, n_ctx, n_ctx_q, sm_scale, causal)
+
     atol = 1.4e-1 if init_dtype == "fp8" else 1e-2
     rtol = 1e-2 if init_dtype == "fp8" else 3e-3
     try:
@@ -431,7 +466,18 @@ def main():
     except AssertionError:
         print("Assertion failed! Showing mismatches:")
         print_mismatches(ref_out, la_out, atol, rtol)
-        raise  # Re-raise the exception after printing mismatches
+        raise
+
+    # LSE: NEW — check LSE
+    if 'lse_out' in locals():
+        lse_atol = 3e-2 if init_dtype == "fp8" else 1e-2
+        lse_rtol = 3e-3
+        try:
+            torch.testing.assert_close(ref_lse, lse_out, atol=lse_atol, rtol=lse_rtol)
+        except AssertionError:
+            print("LSE assertion failed! Showing mismatches:")
+            print_mismatches(ref_lse, lse_out, atol=lse_atol, rtol=lse_rtol)
+            raise
 
     # torch.testing.assert_close(ref_out, la_out, atol=atol, rtol=rtol)
 

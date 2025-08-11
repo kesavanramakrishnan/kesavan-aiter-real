@@ -4,7 +4,9 @@ from typing import Optional
 import triton
 import triton.language as tl
 import aiter.ops.triton.utils.arch_info as arch_info
-from aiter.ops.triton.lean_atten_bwd_acc import persistent_lean_attention_bwd
+from aiter.ops.triton.lean_atten_bwd_clean import persistent_lean_attention_bwd
+
+
 
 
 def flash_attn_onekernel_backward(
