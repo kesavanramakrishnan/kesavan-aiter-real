@@ -3,207 +3,786 @@
 
 import torch
 import pytest
-import triton
-import triton.language as tl
-from aiter.ops.triton.mha import flash_attn_func
-from aiter.test_mha_common import attention_ref
-
-# Assuming the new dkdv kernel and its helpers are in this file
-from aiter.ops.triton.lean_atten_bwd_updated_proto import (
-    _bwd_preprocess,
-    la_bwd_dkdv_persistent,
-    get_num_splits_and_buffer_sizes,
+import logging
+import numpy as np
+from aiter.ops.triton.mha import (
+    flash_attn_func,
+    flash_attn_fp8_func,
+    flash_attn_varlen_func,
+    flash_attn_varlen_fp8_func,
+    mha_set_use_fused_bwd_kernel,
+    mha_set_use_int64_strides,
 )
+from aiter.test_mha_common import (
+    attention_ref,
+    generate_random_padding_mask,
+    generate_qkv,
+)
+from aiter.ops.triton.lean_atten_bwd_prod import *
 
-def lean_flash_attn_onekernel_backward(
-    do: torch.Tensor,
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    o: torch.Tensor,
-    softmax_lse: torch.Tensor,
-    dq: torch.Tensor,
-    dk: torch.Tensor,
-    dv: torch.Tensor,
-    sm_scale: float,
-    causal: bool,
-    max_seqlen_q: int,
-    max_seqlen_k: int,
-    total_programs: int,
-    BLOCK_M: int,
-    BLOCK_N: int,
+logging.basicConfig(level=logging.DEBUG)
+logger = logging.getLogger(__name__)
+DEBUG_MODE = False
+ATOL_fp8 = 2.5e-1
+RTOL_fp8 = 2.5e-1
+
+
+def pad_rearrange_dropout_mask(
+    S_dmask,
+    cu_seqlens_q,
+    cu_seqlens_k,
+    max_seqlen_q,
+    max_seqlen_k,
+    seqlen_q,
+    seqlen_k,
+    num_q_heads,
 ):
-    """
-    Wrapper for the Lean Attention backward pass dk/dv kernel.
-    """
-    batch_size, _, num_q_heads, head_dim = q.shape
-    _, _, num_k_heads, _ = k.shape
+    batch_size = cu_seqlens_q.numel() - 1
 
-    # Reshape tensors for the kernel: (B, S, H, D) -> (B*H, S, D)
-    q_reshaped = q.transpose(1, 2).contiguous().view(batch_size * num_q_heads, max_seqlen_q, head_dim)
-    k_reshaped = k.transpose(1, 2).contiguous().view(batch_size * num_k_heads, max_seqlen_k, head_dim)
-    v_reshaped = v.transpose(1, 2).contiguous().view(batch_size * num_k_heads, max_seqlen_k, head_dim)
-    do_reshaped = do.transpose(1, 2).contiguous().view(batch_size * num_q_heads, max_seqlen_q, head_dim)
-    o_reshaped = o.transpose(1, 2).contiguous().view(batch_size * num_q_heads, max_seqlen_q, head_dim)
-    
-    dk_reshaped = dk.transpose(1, 2).contiguous().view(batch_size * num_k_heads, max_seqlen_k, head_dim)
-    dv_reshaped = dv.transpose(1, 2).contiguous().view(batch_size * num_k_heads, max_seqlen_k, head_dim)
-    
-    lse_reshaped = softmax_lse.view(batch_size * num_q_heads, max_seqlen_q)
-    
-    # Pre-computation of D = rowsum(dO * O)
-    delta = torch.empty_like(lse_reshaped)
-    pre_block_m = 128 # A common block size for preprocessing
-    pre_grid = (triton.cdiv(max_seqlen_q, pre_block_m), batch_size * num_q_heads)
-    
-    _bwd_preprocess[pre_grid](
-        o_reshaped, do_reshaped, delta,
-        o_reshaped.stride(0), o_reshaped.stride(1), o_reshaped.stride(2),
-        delta.stride(0), delta.stride(1),
-        seqlen_q=max_seqlen_q,
-        BLOCK_M=pre_block_m,
-        BLOCK_DMODEL=head_dim,
+    padded_dropout_mask = torch.ones(
+        (batch_size, num_q_heads, seqlen_q, seqlen_k), device="cuda"
     )
-    
-    # Get Lean Attention schedule
-    (
-        num_m_blocks,
-        num_n_blocks,
-        high_load_wgs,
-        max_tiles_per_wg,
-        tiles_per_head,
-        grid_size,
-        num_splits,
-        even_split,
-    ) = get_num_splits_and_buffer_sizes(
-        causal, batch_size, max_seqlen_q, max_seqlen_k,
-        num_q_heads, num_k_heads, BLOCK_M, BLOCK_N, total_programs,
-    )
-    
-    # Allocate tensors for partial results and synchronization
-    dKp = torch.empty((grid_size, max_seqlen_k, head_dim), device='cuda', dtype=torch.float32)
-    dVp = torch.empty((grid_size, max_seqlen_k, head_dim), device='cuda', dtype=torch.float32)
-    locks = torch.zeros(grid_size, dtype=torch.int32, device='cuda')
-    
-    max_output_tile_cnt = max_tiles_per_wg
+    for b in range(batch_size):
+        start_q = cu_seqlens_q[b].item()
+        end_q = cu_seqlens_q[b + 1].item()
+        start_k = cu_seqlens_k[b].item()
+        end_k = cu_seqlens_k[b + 1].item()
 
-    # Launch the dk/dv kernel
-    la_bwd_dkdv_persistent[(grid_size,)](
-        dk_reshaped, dv_reshaped, q_reshaped, k_reshaped, v_reshaped, do_reshaped, lse_reshaped, delta,
-        dKp, dVp, locks,
-        dk_reshaped.stride(0), dk_reshaped.stride(1), dk_reshaped.stride(2),
-        dv_reshaped.stride(0), dv_reshaped.stride(1), dv_reshaped.stride(2),
-        q_reshaped.stride(0), q_reshaped.stride(1), q_reshaped.stride(2),
-        k_reshaped.stride(0), k_reshaped.stride(1), k_reshaped.stride(2),
-        v_reshaped.stride(0), v_reshaped.stride(1), v_reshaped.stride(2),
-        do_reshaped.stride(0), do_reshaped.stride(1), do_reshaped.stride(2),
-        lse_reshaped.stride(0), lse_reshaped.stride(1),
-        delta.stride(0), delta.stride(1),
-        dKp.stride(0), dKp.stride(1), dKp.stride(2),
-        dVp.stride(0), dVp.stride(1), dVp.stride(2),
-        sm_scale,
-        max_seqlen_q, max_seqlen_k,
-        high_load_wgs, max_tiles_per_wg, tiles_per_head, num_m_blocks, num_splits, max_output_tile_cnt,
-        NUM_Q_HEADS=num_q_heads,
-        NUM_K_HEADS=num_k_heads,
-        HEAD_DIM=head_dim,
-        BLOCK_M=BLOCK_M,
-        BLOCK_N=BLOCK_N,
-    )
-    
-    # Reshape back to original (B, S, H, D)
-    dk_reshaped = dk_reshaped.view(batch_size, num_k_heads, max_seqlen_k, head_dim).transpose(1, 2).contiguous()
-    dv_reshaped = dv_reshaped.view(batch_size, num_k_heads, max_seqlen_k, head_dim).transpose(1, 2).contiguous()
-    dk.copy_(dk_reshaped)
-    dv.copy_(dv_reshaped)
+        seqlen_q = end_q - start_q
+        seqlen_k = end_k - start_k
+        for h in range(S_dmask.shape[1]):
+            padded_dropout_mask[b, h, :max_seqlen_q, :max_seqlen_k] = S_dmask[
+                b, h, :, :
+            ]
 
+    return padded_dropout_mask
+
+
+def fp8_assert_close(
+    tensor_a, tensor_b, atol=ATOL_fp8, rtol=RTOL_fp8, max_diff_percentage=0.5
+):
+    """Assert tensors are close with tolerance for small percentage of elements"""
+    # standard comparison
+    abs_diff = torch.abs(tensor_a - tensor_b)
+    rel_diff = abs_diff / torch.abs(tensor_b.clamp(min=1e-6))
+
+    # calculate elements that exceed tolerance
+    abs_check = abs_diff > atol
+    rel_check = rel_diff > rtol
+    failed_check = torch.logical_and(abs_check, rel_check)
+
+    # calculate percentage of failed elements
+    failed_percentage = failed_check.sum().item() / failed_check.numel() * 100
+
+    # if percentage is small enough, test passes
+    if failed_percentage <= max_diff_percentage:
+        return True
+
+    # Otherwise, provide diagnostic information
+    max_abs_idx = torch.argmax(abs_diff).item()
+    max_rel_idx = torch.argmax(rel_diff).item()
+
+    flat_to_idx = lambda flat_idx, shape: np.unravel_index(flat_idx, shape)
+
+    max_abs_pos = flat_to_idx(max_abs_idx, tensor_a.shape)
+    max_rel_pos = flat_to_idx(max_rel_idx, tensor_a.shape)
+
+    max_abs_diff = abs_diff.flatten()[max_abs_idx].item()
+    max_rel_diff = rel_diff.flatten()[max_rel_idx].item()
+
+    raise AssertionError(
+        f"Tensors not close enough! {failed_percentage:.6f}% elements exceed tolerance.\n"
+        f"Greatest absolute difference: {max_abs_diff} at index {max_abs_pos} (up to {atol} allowed)\n"
+        f"Greatest relative difference: {max_rel_diff} at index {max_rel_pos} (up to {rtol} allowed)"
+    )
+
+
+# @pytest.mark.parametrize("BATCH", [1, 4, 57, 128])
+# @pytest.mark.parametrize(
+#     "SEQLEN_Q, SEQLEN_K",
+#     [(1, 1), (4, 4), (128, 128), (2, 1), (1, 2), (32, 16), (64, 128)],
+# )
+# @pytest.mark.parametrize(
+#     "NUM_Q_HEADS, NUM_K_HEADS", [ (16, 16), (48, 8)]
+# )
+# @pytest.mark.parametrize("HEAD_SZ", [8, 32, 128])
+# @pytest.mark.parametrize(
+#     "DROPOUT, RETURN_LSE, RETURN_SOFTMAX, ", [(0.2, True, True), (0.0, False, False)]
+# )
+# @pytest.mark.parametrize("CAUSAL", [(True), (False)])
+# @pytest.mark.parametrize("FP8", [(True), (False)])
+# def test_mha(
+#     BATCH: int,
+#     SEQLEN_Q: int,
+#     SEQLEN_K: int,
+#     NUM_Q_HEADS: int,
+#     NUM_K_HEADS: int,
+#     HEAD_SZ: int,
+#     DROPOUT: float,
+#     RETURN_LSE: bool,
+#     RETURN_SOFTMAX: bool,
+#     CAUSAL: bool,
+#     FP8: bool,
+#     dtype=torch.float16,
+# ):
+#     torch.cuda.empty_cache()
+#     q = torch.randn((BATCH, SEQLEN_Q, NUM_Q_HEADS, HEAD_SZ), device="cuda", dtype=dtype)
+#     k = torch.randn((BATCH, SEQLEN_K, NUM_K_HEADS, HEAD_SZ), device="cuda", dtype=dtype)
+#     v = torch.randn((BATCH, SEQLEN_K, NUM_K_HEADS, HEAD_SZ), device="cuda", dtype=dtype)
+
+#     dropout_mask = None
+#     if FP8:
+#         triton_out = flash_attn_fp8_func(
+#             q,
+#             k,
+#             v,
+#             dropout_p=DROPOUT,
+#             causal=CAUSAL,
+#             return_lse=RETURN_LSE,
+#             return_attn_probs=RETURN_SOFTMAX,
+#         )
+#     else:
+#         triton_out = flash_attn_func(
+#             q,
+#             k,
+#             v,
+#             dropout_p=DROPOUT,
+#             causal=CAUSAL,
+#             return_lse=RETURN_LSE,
+#             return_attn_probs=RETURN_SOFTMAX,
+#         )
+
+#     if RETURN_LSE:
+#         assert len(triton_out) > 1
+#         lse = triton_out[1]
+#         if DEBUG_MODE:
+#             print(f"lse.shape={lse.shape}, lse={lse}")
+
+#     if DROPOUT > 0.0 and RETURN_SOFTMAX:
+#         if RETURN_LSE:
+#             assert len(triton_out) == 3
+#             sd_mask = triton_out[2]
+#         else:
+#             assert len(triton_out) == 2
+#             sd_mask = triton_out[1]
+#         dropout_mask = sd_mask >= 0
+#         if DEBUG_MODE:
+#             print(f"sd_mask.shape={sd_mask.shape}, sd_mask={sd_mask}")
+#             print(
+#                 f"dropout_mask.shape={dropout_mask.shape}, dropout_mask={dropout_mask}"
+#             )
+
+#     if RETURN_SOFTMAX or RETURN_LSE:
+#         triton_out = triton_out[0]
+#     if DEBUG_MODE:
+#         print(f"triton_out.shape={triton_out.shape}, triton_out={triton_out}")
+
+#     torch_out = attention_ref(
+#         q, k, v, dropout_p=DROPOUT, dropout_mask=dropout_mask, causal=CAUSAL
+#     )
+#     torch_out, attention_scores = torch_out
+#     if DEBUG_MODE:
+#         print(f"torch_out.shape={torch_out.shape}, torch_out={torch_out}")
+#         print(
+#             f"attention_scores.shape={attention_scores.shape}, attention_scores={attention_scores}"
+#         )
+
+#     if FP8:
+#         fp8_assert_close(
+#             triton_out, torch_out.to(triton_out.dtype), atol=ATOL_fp8, rtol=RTOL_fp8
+#         )
+#     else:
+#         torch.testing.assert_close(triton_out, torch_out, atol=1e-2, rtol=1e-2)
+
+
+# # LLaMA 3 405B config
+# @pytest.mark.parametrize("BATCH", [1])
+# @pytest.mark.parametrize(
+#     "SEQLEN_Q, SEQLEN_K",
+#     [(1, 1)],
+# )
+# @pytest.mark.parametrize("NUM_Q_HEADS, NUM_K_HEADS", [(128, 8)])
+# @pytest.mark.parametrize("HEAD_SZ", [128])
+# @pytest.mark.parametrize("CAUSAL", [True])
+# @pytest.mark.parametrize("DROPOUT", [0.0])
+# def test_mha_int64_strides(
+#     BATCH: int,
+#     SEQLEN_Q: int,
+#     SEQLEN_K: int,
+#     NUM_Q_HEADS: int,
+#     NUM_K_HEADS: int,
+#     HEAD_SZ: int,
+#     CAUSAL: bool,
+#     DROPOUT: float,
+#     dtype=torch.float16,
+#     device="cuda",
+#     test_backward=True,
+# ):
+#     """
+#     In the absence of strides being int64, parts of the offset computation is done in 32 bit and overflows resulting in segfaults.
+#     """
+#     torch.cuda.empty_cache()
+#     torch.manual_seed(20)
+#     # use int64 strides.
+#     mha_set_use_int64_strides(
+#         True
+#     )  # NOTE: if you set this to false this test case will segfault
+
+#     # generate inputs with large strides
+#     def _generate_input(
+#         batch: int, seqlen: int, nheads: int, dim_size: int, large_stride: bool = False
+#     ) -> torch.Tensor:
+#         seqlens = torch.full((batch,), seqlen)
+#         cu_seqlens = torch.cat(
+#             [
+#                 torch.tensor([0], dtype=torch.int32),
+#                 seqlens.cumsum(dim=0, dtype=torch.int32),
+#             ]
+#         ).to(device="cuda")
+#         total_seqlen = cu_seqlens[-1].item()
+
+#         if large_stride:
+#             x_dummy = torch.randn(
+#                 (total_seqlen, nheads, 1024 * 1024 * 64), dtype=dtype, device="cuda"
+#             ).requires_grad_(True)
+#             x = x_dummy[:seqlen, :nheads, :dim_size]
+#         else:
+#             x = torch.randn(
+#                 (total_seqlen, nheads, dim_size), dtype=dtype, device="cuda"
+#             ).requires_grad_(True)
+#         return x, cu_seqlens, seqlen
+
+#     # inputs
+#     q, cu_seqlens_q, max_seqlens_q = _generate_input(
+#         BATCH, SEQLEN_Q, NUM_Q_HEADS, HEAD_SZ, large_stride=True
+#     )
+#     k, cu_seqlens_k, max_seqlens_k = _generate_input(
+#         BATCH, SEQLEN_K, NUM_K_HEADS, HEAD_SZ
+#     )
+#     v, _, _ = _generate_input(BATCH, SEQLEN_K, NUM_K_HEADS, HEAD_SZ)
+#     do = torch.randn_like(q)
+
+#     if DEBUG_MODE:
+#         print()
+#         print("q:", q.shape, q.stride())
+#         print("k:", k.shape, k.stride())
+#         print("v:", v.shape, v.stride())
+#         print("cu_seqlens_q:", cu_seqlens_q.shape, cu_seqlens_q.stride())
+#         print("cu_seqlens_k:", cu_seqlens_k.shape, cu_seqlens_k.stride())
+
+#     triton_out, _ = flash_attn_varlen_func(
+#         q,
+#         k,
+#         v,
+#         cu_seqlens_q,
+#         cu_seqlens_k,
+#         max_seqlens_q,
+#         max_seqlens_k,
+#         dropout_p=DROPOUT,
+#         causal=CAUSAL,
+#         return_lse=True,
+#     )
+#     if test_backward:
+#         triton_dq, triton_dk, triton_dv = torch.autograd.grad(
+#             triton_out, (q, k, v), do.clone()
+#         )
+
+#     # NOTE: use fwd output to wait not exit program before kernel finishes
+#     print("triton_out:", triton_out)
+#     if test_backward:
+#         print("triton_dq:", triton_dq.shape, triton_dq.stride())
+#         print("triton_dk:", triton_dk.shape, triton_dk.stride())
+#         print("triton_dv:", triton_dv.shape, triton_dv.stride())
+
+
+# @pytest.mark.parametrize("BATCH", [1, 4, 57, 128])
+# @pytest.mark.parametrize(
+#     "SEQLEN_Q, SEQLEN_K",
+#     [(1, 1), (4, 4), (128, 128), (2, 1), (1, 2), (32, 16), (64, 128)],
+# )
+# @pytest.mark.parametrize(
+#     "DROPOUT, RETURN_LSE, RETURN_SOFTMAX, ", [(0.0, False, False), (0.2, True, True)]
+# )
+# @pytest.mark.parametrize(
+#     "NUM_Q_HEADS, NUM_K_HEADS", [(1, 1), (16, 16), (2, 1), (48, 8)]
+# )
+# @pytest.mark.parametrize("HEAD_SZ", [8, 32, 128])
+# @pytest.mark.parametrize("CAUSAL", [(True), (False)])
+# @pytest.mark.parametrize("FP8", [(False), (True)])
+# def test_mha_varlen(
+#     BATCH: int,
+#     SEQLEN_Q: int,
+#     SEQLEN_K: int,
+#     NUM_Q_HEADS: int,
+#     NUM_K_HEADS: int,
+#     HEAD_SZ: int,
+#     DROPOUT: float,
+#     RETURN_LSE: bool,
+#     RETURN_SOFTMAX: bool,
+#     CAUSAL: bool,
+#     FP8: bool,
+#     dtype=torch.float16,
+# ):
+#     torch.set_printoptions(threshold=10000)
+#     torch.cuda.empty_cache()
+#     torch.manual_seed(20)
+#     q = torch.randn((BATCH, SEQLEN_Q, NUM_Q_HEADS, HEAD_SZ), device="cuda", dtype=dtype)
+#     k = torch.randn((BATCH, SEQLEN_K, NUM_K_HEADS, HEAD_SZ), device="cuda", dtype=dtype)
+#     v = torch.randn((BATCH, SEQLEN_K, NUM_K_HEADS, HEAD_SZ), device="cuda", dtype=dtype)
+#     query_padding_mask = generate_random_padding_mask(
+#         SEQLEN_Q, BATCH, "cuda", mode="random"
+#     )
+#     key_padding_mask = generate_random_padding_mask(
+#         SEQLEN_K, BATCH, "cuda", mode="random"
+#     )
+#     (
+#         q_unpad,
+#         k_unpad,
+#         v_unpad,
+#         cu_seqlens_q,
+#         cu_seqlens_k,
+#         max_seqlen_q,
+#         max_seqlen_k,
+#         q,
+#         k,
+#         v,
+#         output_pad_fn,
+#         dq_pad_fn,
+#         dk_pad_fn,
+#     ) = generate_qkv(q, k, v, query_padding_mask, key_padding_mask, kvpacked=False)
+
+#     if DEBUG_MODE:
+#         print(
+#             f"query_padding_mask.shape={query_padding_mask.shape} query_padding_mask={query_padding_mask}"
+#         )
+#         print(
+#             f"key_padding_mask.shape={key_padding_mask.shape} key_padding_mask={key_padding_mask}"
+#         )
+
+#         print(f"q.shape={q.shape} q={q}")
+#         print(f"k.shape={k.shape} k={k}")
+#         print(f"v.shape={v.shape} v={v}")
+#         print(f"q_unpad.shape={q_unpad.shape} q_unpad={q_unpad}")
+#         print(f"k_unpad.shape={k_unpad.shape} k_unpad={k_unpad}")
+#         print(f"v_unpad.shape={v_unpad.shape} v_unpad={v_unpad}")
+#         print(f"max_seqlens_q={max_seqlen_q }")
+#         print(f"max_seqlens_k={max_seqlen_k }")
+#         print(f"cu_seqlens_q={cu_seqlens_q }")
+#         print(f"cu_seqlens_k={cu_seqlens_k }")
+#     if FP8:
+#         triton_out = flash_attn_varlen_fp8_func(
+#             q_unpad,
+#             k_unpad,
+#             v_unpad,
+#             cu_seqlens_q,
+#             cu_seqlens_k,
+#             max_seqlen_q,
+#             max_seqlen_k,
+#             dropout_p=DROPOUT,
+#             causal=CAUSAL,
+#             return_lse=RETURN_LSE,
+#             return_attn_probs=RETURN_SOFTMAX,
+#         )
+#     else:
+#         triton_out = flash_attn_varlen_func(
+#             q_unpad,
+#             k_unpad,
+#             v_unpad,
+#             cu_seqlens_q,
+#             cu_seqlens_k,
+#             max_seqlen_q,
+#             max_seqlen_k,
+#             dropout_p=DROPOUT,
+#             causal=CAUSAL,
+#             return_lse=RETURN_LSE,
+#             return_attn_probs=RETURN_SOFTMAX,
+#         )
+
+#     if RETURN_LSE:
+#         assert len(triton_out) > 1
+#         lse = triton_out[1]
+#         if DEBUG_MODE:
+#             print(f"lse.shape={lse.shape}, lse={lse}")
+
+#     dropout_mask = None
+#     if DROPOUT > 0.0 and RETURN_SOFTMAX:
+#         if RETURN_LSE:
+#             assert len(triton_out) == 3
+#             sd_mask = triton_out[2]
+#         else:
+#             assert len(triton_out) == 2
+#             sd_mask = triton_out[1]
+#         dropout_mask = sd_mask >= 0
+#         dropout_mask = pad_rearrange_dropout_mask(
+#             dropout_mask,
+#             cu_seqlens_q,
+#             cu_seqlens_k,
+#             max_seqlen_q,
+#             max_seqlen_k,
+#             SEQLEN_Q,
+#             SEQLEN_K,
+#             NUM_Q_HEADS,
+#         )
+#         dropout_mask = dropout_mask > 0
+#         if DEBUG_MODE:
+#             # print(f"sd_mask.shape={sd_mask.shape}, sd_mask={sd_mask}")
+#             print(
+#                 f"dropout_mask.shape={dropout_mask.shape}, dropout_mask={dropout_mask}"
+#             )
+#     if RETURN_SOFTMAX or RETURN_LSE:
+#         triton_out = output_pad_fn(triton_out[0])
+#     else:
+#         triton_out = output_pad_fn(triton_out)
+#     if DEBUG_MODE:
+#         print(f"triton_out.shape={triton_out.shape}, triton_out={triton_out}")
+
+#     torch_out = attention_ref(
+#         q,
+#         k,
+#         v,
+#         query_padding_mask=query_padding_mask,
+#         key_padding_mask=key_padding_mask,
+#         dropout_p=DROPOUT,
+#         dropout_mask=dropout_mask,
+#         causal=CAUSAL,
+#     )
+#     torch_out, attention_scores = torch_out
+
+#     if DEBUG_MODE:
+#         print(f"torch_out.shape={torch_out.shape}, torch_out={torch_out}")
+#         print(
+#             f"attention_scores.shape={attention_scores.shape}, attention_scores={attention_scores}"
+#         )
+
+#     if FP8:
+#         torch.testing.assert_close(
+#             triton_out, torch_out.to(triton_out.dtype), atol=0.25, rtol=10
+#         )  # Lower tolerance for FP8
+#     else:
+#         torch.testing.assert_close(
+#             triton_out, torch_out.to(triton_out.dtype), atol=1e-1, rtol=1e-1
+#         )
+
+
+@pytest.mark.parametrize("BATCH", [1, 4, 57, 128])
 @pytest.mark.parametrize(
-    "causal, batch, h, n_ctx_q, n_ctx, d, total_programs, init_dtype, BLOCK_M, BLOCK_N, waves_per_eu, num_warps ",
-    [
-        (False, 2, 64, 16, [65536, 65536], 128, 912, torch.float16, 16, 128, 3, 4),
-        (False, 1, 64, 16, [131072], 128, 912, torch.float16, 16, 128, 2, 4),
-        (False, 1, 64, 16, [262144], 64, 912, torch.float16, 16, 64, 2, 4),
-        (False, 1, 64, 16, [524288], 64, 912, torch.float16, 16, 64, 2, 4),
-        (False, 2, 96, 16, [32768, 32768], 128, 912, torch.float16, 16, 128, 2, 4),
-        (False, 1, 96, 16, [65536], 128, 912, torch.float16, 16, 128, 2, 4),
-        (False, 1, 96, 16, [131072], 128, 912, torch.float16, 16, 128, 2, 4),
-        (False, 1, 96, 16, [262144], 64, 912, torch.float16, 16, 64, 2, 4),
-        (False, 1, 96, 16, [524288], 16, 912, torch.float16, 16, 256, 1, 4),
-        (False, 1, 96, 16, [1048576], 16, 912, torch.float16, 16, 256, 1, 4),
-        (False, 1, 128, 16, [32768], 128, 912, torch.float16, 16, 128, 2, 4),
-        (False, 1, 128, 16, [65536], 128, 912, torch.float16, 16, 128, 2, 4),
-        (False, 1, 128, 16, [131072], 128, 912, torch.float16, 16, 128, 2, 4),
-        (False, 1, 128, 16, [262144], 64, 912, torch.float16, 16, 64, 2, 4),
-        (False, 1, 128, 16, [524288], 16, 912, torch.float16, 16, 256, 1, 4),
-        (
-            False, 3, 64, 16, [4096, 32768, 65536], 128, 912,
-            torch.float16, 16, 128, 2, 4,
-        ),
-        (
-            False, 8, 64, 16, [1024, 1024, 2048, 2048, 4096, 4096, 32768, 65536], 128, 912,
-            torch.float16, 16, 128, 2, 4,
-        ),
-        (
-            True, 1, 64, 8192, [8192], 128, 304,
-            torch.float16, 128, 64, 1, 4,
-        ),
-        (True, 2, 64, 2048, [2048, 2048], 128, 304, torch.float16, 128, 64, 1, 4),
-        (True, 2, 64, 2048, [2048, 2048], 128, 304, torch.float16, 16, 16, 1, 4),
-        (True, 2, 64, 2048, [2048, 2048], 128, 304, torch.float16, 32, 16, 1, 4),
-        (True, 2, 64, 2048, [2048, 2048], 128, 304, torch.float16, 32, 32, 1, 4),
-        (True, 2, 64, 2048, [2048, 2048], 128, 304, torch.float16, 64, 16, 1, 4),
-        (True, 2, 64, 2048, [2048, 2048], 128, 304, torch.float16, 64, 32, 1, 4),
-        (True, 2, 64, 2048, [2048, 2048], 128, 304, torch.float16, 64, 64, 1, 4),
-        (True, 2, 64, 2048, [2048, 2048], 128, 304, torch.float16, 128, 16, 1, 4),
-        (True, 2, 64, 2048, [2048, 2048], 128, 304, torch.float16, 128, 32, 1, 4),
-        (True, 2, 64, 2048, [2048, 2048], 128, 304, torch.float16, 128, 64, 1, 4),
-        (True, 2, 64, 2048, [2048, 2048], 128, 304, torch.float16, 128, 128, 1, 4),
-    ],
+    "SEQLEN_Q, SEQLEN_K",
+    [(128, 128)(64, 128)],
 )
-def test_lean_bwd_dkdv_persistent(
-    causal, batch, h, n_ctx_q, n_ctx, d, total_programs, init_dtype, BLOCK_M, BLOCK_N, waves_per_eu, num_warps
+@pytest.mark.parametrize("DROPOUT, CAUSAL", [(0.0, False), (0.0, True)])
+# @pytest.mark.parametrize('DROPOUT, CAUSAL',[(0.0, False),(0.0, True),(0.2, False),(0.2, True)]) #Debug Causal + Dropout. fails for seq >= 64
+@pytest.mark.parametrize(
+    "NUM_Q_HEADS, NUM_K_HEADS", [(4, 4),(16, 16)]
+)
+@pytest.mark.parametrize("HEAD_SZ", [32, 128])
+@pytest.mark.parametrize("FP8", [False])
+@pytest.mark.parametrize("FUSED", [False])
+# @pytest.mark.parametrize('FP8',[(False), (True)]) #TODO Debug FP8
+def test_mha_backward(
+    BATCH: int,
+    SEQLEN_Q: int,
+    SEQLEN_K: int,
+    NUM_Q_HEADS: int,
+    NUM_K_HEADS: int,
+    HEAD_SZ: int,
+    DROPOUT: float,
+    CAUSAL: bool,
+    FP8: bool,
+    FUSED: bool,
+    dtype=torch.float16,
 ):
-    torch.manual_seed(20)
     torch.cuda.empty_cache()
+    torch.manual_seed(20)
 
-    sum_n_ctx = sum(n_ctx)
-    
-    # For simplicity, this test uses MHA (num_q_heads == num_k_heads)
-    num_q_heads = h
-    num_k_heads = h
+    if FUSED and CAUSAL:
+        pytest.skip("FUSED+CAUSAL results in NaNs")
+    mha_set_use_fused_bwd_kernel(FUSED)
+    # For non-varlen, no-dropout cases, route backward to the Lean production bwd
+    if DROPOUT == 0.0:
+        from aiter.ops.triton import mha as _mha
+        from aiter.ops.triton import lean_atten_bwd_prod as _lab
+        _mha.flash_attn_onekernel_backward = _lab.flash_attn_onekernel_backward
+    q = torch.randn((BATCH, SEQLEN_Q, NUM_Q_HEADS, HEAD_SZ), device="cuda", dtype=dtype)
+    k = torch.randn((BATCH, SEQLEN_K, NUM_K_HEADS, HEAD_SZ), device="cuda", dtype=dtype)
+    v = torch.randn((BATCH, SEQLEN_K, NUM_K_HEADS, HEAD_SZ), device="cuda", dtype=dtype)
+    q.requires_grad = True
+    k.requires_grad = True
+    v.requires_grad = True
 
-    q = torch.randn((batch, n_ctx_q, num_q_heads, d), device="cuda", dtype=init_dtype, requires_grad=True)
-    k = torch.randn((batch, sum_n_ctx, num_k_heads, d), device="cuda", dtype=init_dtype, requires_grad=True)
-    v = torch.randn((batch, sum_n_ctx, num_k_heads, d), device="cuda", dtype=init_dtype, requires_grad=True)
     do = torch.randn_like(q)
-    
-    sm_scale = 1.0 / (d**0.5)
 
-    # --- Forward Pass ---
+    if DEBUG_MODE:
+        print("--------------Triton----------------")
+        print(f"q.shape={q.shape} q={q}")
+        print(f"k.shape={k.shape} k={k}")
+        print(f"v.shape={v.shape} v={v}")
+        print(f"do.shape={do.shape} do={do}")
+
     with torch.enable_grad():
-        triton_out, lse, _ = flash_attn_func(
-            q, k, v, dropout_p=0.0, causal=causal, return_lse=True, return_attn_probs=True
-        )
+        if FP8:
+            triton_out = flash_attn_fp8_func(
+                q,
+                k,
+                v,
+                dropout_p=DROPOUT,
+                causal=CAUSAL,
+                return_lse=True,
+                return_attn_probs=True,
+            )
+        else:
+            triton_out = flash_attn_func(
+                q,
+                k,
+                v,
+                dropout_p=DROPOUT,
+                causal=CAUSAL,
+                return_lse=True,
+                return_attn_probs=True,
+            )
 
-    # --- Triton Lean BWD Pass ---
-    triton_dq_lean = torch.empty_like(q)
-    triton_dk_lean = torch.empty_like(k)
-    triton_dv_lean = torch.empty_like(v)
-    
-    lean_flash_attn_onekernel_backward(
-        do, q, k, v, triton_out, lse, 
-        triton_dq_lean, triton_dk_lean, triton_dv_lean,
-        sm_scale, causal, n_ctx_q, sum_n_ctx, 
-        total_programs, BLOCK_M, BLOCK_N
+    assert len(triton_out) == 3
+    triton_out, lse, sd_mask = triton_out[0], triton_out[1], triton_out[2]
+
+    if DROPOUT > 0.0:
+        dropout_mask = sd_mask >= 0
+    else:
+        dropout_mask = None
+
+    triton_dq, triton_dk, triton_dv = torch.autograd.grad(
+        triton_out, (q, k, v), do.clone()
+    )
+    # print(triton_dq)
+
+    if DEBUG_MODE:
+        print(f"triton_out={triton_out}")
+        print(f"triton_lse={lse}")
+        print(f"sd_mask={sd_mask}")
+        print(f"triton_dq.shape={triton_dq.shape} triton_dq={triton_dq}")
+        print(f"triton_dk.shape={triton_dk.shape} triton_dk={triton_dk}")
+        print(f"triton_dv.shape={triton_dv.shape} triton_dv={triton_dv}")
+        print(f"dropout_mask={dropout_mask}")
+
+    if DEBUG_MODE:
+        print("--------------Torch----------------")
+        print(f"q.shape={q.shape} q={q}")
+        print(f"k.shape={k.shape} k={k}")
+        print(f"v.shape={v.shape} v={v}")
+        print(f"do.shape={do.shape} do={do}")
+    with torch.enable_grad():
+        torch_out = attention_ref(
+            q, k, v, dropout_p=DROPOUT, dropout_mask=dropout_mask, causal=CAUSAL
+        )
+    torch_out, attention_scores = torch_out
+
+    torch.testing.assert_close(
+        triton_out, torch_out.to(triton_out.dtype), atol=1e-2, rtol=1e-2
     )
 
-    # --- PyTorch Reference BWD Pass ---
-    with torch.enable_grad():
-        torch_out, _ = attention_ref(q, k, v, causal=causal)
-    
     torch_dq, torch_dk, torch_dv = torch.autograd.grad(torch_out, (q, k, v), do)
 
-    # --- Comparison ---
-    torch.testing.assert_close(triton_out, torch_out.to(triton_out.dtype), atol=1e-2, rtol=1e-2)
-    torch.testing.assert_close(triton_dk_lean, torch_dk.to(triton_out.dtype), atol=1e-2, rtol=1e-2)
-    torch.testing.assert_close(triton_dv_lean, torch_dv.to(triton_out.dtype), atol=1e-2, rtol=1e-2)
+    if DEBUG_MODE:
+        print(f"torch_out={torch_out}")
+        print(f"torch_attn_scores={attention_scores}")
+        print(f"torch_dq.shape={torch_dq.shape} torch_dq={torch_dq}")
+        print(f"torch_dk.shape={torch_dk.shape} torch_dk={torch_dk}")
+        print(f"torch_dv.shape={torch_dv.shape} torch_dv={torch_dv}")
+
+    if FP8:
+        fp8_assert_close(
+            triton_dq, torch_dq.to(triton_dq.dtype), atol=ATOL_fp8, rtol=RTOL_fp8
+        )
+        fp8_assert_close(
+            triton_dk, torch_dk.to(triton_dk.dtype), atol=ATOL_fp8, rtol=RTOL_fp8
+        )
+        fp8_assert_close(
+            triton_dv, torch_dv.to(triton_dv.dtype), atol=ATOL_fp8, rtol=RTOL_fp8
+        )
+    else:
+        torch.testing.assert_close(
+            triton_dq, torch_dq.to(triton_out.dtype), atol=1e-2, rtol=1e-2
+        )
+        torch.testing.assert_close(
+            triton_dk, torch_dk.to(triton_out.dtype), atol=1e-2, rtol=1e-2
+        )
+        torch.testing.assert_close(
+            triton_dv, torch_dv.to(triton_out.dtype), atol=1e-2, rtol=1e-2
+        )
+
+
+# @pytest.mark.parametrize("BATCH", [1, 4, 57, 128])
+# @pytest.mark.parametrize(
+#     "SEQLEN_Q, SEQLEN_K",
+#     [(1, 1), (4, 4), (128, 128), (2, 1), (1, 2), (32, 16), (64, 128)],
+# )
+# @pytest.mark.parametrize("DROPOUT, CAUSAL", [(0.0, False), (0.0, True)])
+# # @pytest.mark.parametrize('DROPOUT, CAUSAL',[(0.0, False),(0.0, True),(0.2, False),(0.2, True)]) #Debug Causal + Dropout. Fails for seq >=64
+# @pytest.mark.parametrize(
+#     "NUM_Q_HEADS, NUM_K_HEADS", [(1, 1), (16, 16)]
+# )
+# @pytest.mark.parametrize("HEAD_SZ", [8, 32, 128])
+# @pytest.mark.parametrize("FP8", [False])
+# @pytest.mark.parametrize("FUSED", [False])
+# # @pytest.mark.parametrize('FP8',[(False), (True)]) #TODO Debug FP8
+# def test_mha_backward_varlen(
+#     BATCH: int,
+#     SEQLEN_Q: int,
+#     SEQLEN_K: int,
+#     NUM_Q_HEADS: int,
+#     NUM_K_HEADS: int,
+#     HEAD_SZ: int,
+#     DROPOUT: float,
+#     CAUSAL: bool,
+#     FP8: bool,
+#     FUSED: bool,
+#     dtype=torch.float16,
+# ):
+#     torch.cuda.empty_cache()
+#     torch.manual_seed(20)
+#     if FUSED and CAUSAL:
+#         pytest.skip("FUSED+CAUSAL results in NaNs")
+
+#     mha_set_use_fused_bwd_kernel(FUSED)
+#     q = torch.randn((BATCH, SEQLEN_Q, NUM_Q_HEADS, HEAD_SZ), device="cuda", dtype=dtype)
+#     k = torch.randn((BATCH, SEQLEN_K, NUM_K_HEADS, HEAD_SZ), device="cuda", dtype=dtype)
+#     v = torch.randn((BATCH, SEQLEN_K, NUM_K_HEADS, HEAD_SZ), device="cuda", dtype=dtype)
+#     q.requires_grad = True
+#     k.requires_grad = True
+#     v.requires_grad = True
+
+#     query_padding_mask = generate_random_padding_mask(
+#         SEQLEN_Q, BATCH, "cuda", mode="random"
+#     )
+#     key_padding_mask = generate_random_padding_mask(
+#         SEQLEN_K, BATCH, "cuda", mode="random"
+#     )
+#     (
+#         q_unpad,
+#         k_unpad,
+#         v_unpad,
+#         cu_seqlens_q,
+#         cu_seqlens_k,
+#         max_seqlen_q,
+#         max_seqlen_k,
+#         q,
+#         k,
+#         v,
+#         output_pad_fn,
+#         dq_pad_fn,
+#         dk_pad_fn,
+#     ) = generate_qkv(q, k, v, query_padding_mask, key_padding_mask, kvpacked=False)
+
+#     q_unpad.requires_grad = True
+#     k_unpad.requires_grad = True
+#     v_unpad.requires_grad = True
+#     if DEBUG_MODE:
+#         print(
+#             f"query_padding_mask.shape={query_padding_mask.shape} query_padding_mask={query_padding_mask}"
+#         )
+#         print(
+#             f"key_padding_mask.shape={key_padding_mask.shape} key_padding_mask={key_padding_mask}"
+#         )
+
+#         print(f"q.shape={q.shape} q={q}")
+#         print(f"k.shape={k.shape} k={k}")
+#         print(f"v.shape={v.shape} v={v}")
+#         print(f"q_unpad.shape={q_unpad.shape} q_unpad={q_unpad}")
+#         print(f"k_unpad.shape={k_unpad.shape} k_unpad={k_unpad}")
+#         print(f"v_unpad.shape={v_unpad.shape} v_unpad={v_unpad}")
+#         print(f"max_seqlens_q={max_seqlen_q }")
+#         print(f"max_seqlens_k={max_seqlen_k }")
+#         print(f"cu_seqlens_q={cu_seqlens_q }")
+#         print(f"cu_seqlens_k={cu_seqlens_k }")
+#     do = torch.randn_like(q)
+
+#     if DEBUG_MODE:
+#         print("--------------Triton----------------")
+#         print(f"do.shape={do.shape} do={do}")
+
+#     with torch.enable_grad():
+#         triton_out = flash_attn_varlen_func(
+#             q_unpad,
+#             k_unpad,
+#             v_unpad,
+#             cu_seqlens_q,
+#             cu_seqlens_k,
+#             max_seqlen_q,
+#             max_seqlen_k,
+#             dropout_p=DROPOUT,
+#             causal=CAUSAL,
+#             return_lse=True,
+#             return_attn_probs=True,
+#         )
+
+#     assert len(triton_out) == 3
+#     triton_out, lse, sd_mask = triton_out[0], triton_out[1], triton_out[2]
+
+#     if DROPOUT > 0.0:
+#         dropout_mask = sd_mask >= 0
+#         dropout_mask = pad_rearrange_dropout_mask(
+#             dropout_mask,
+#             cu_seqlens_q,
+#             cu_seqlens_k,
+#             max_seqlen_q,
+#             max_seqlen_k,
+#             SEQLEN_Q,
+#             SEQLEN_K,
+#             NUM_Q_HEADS,
+#         )
+#         dropout_mask = dropout_mask > 0
+#     else:
+#         dropout_mask = None
+
+#     triton_out = output_pad_fn(triton_out)
+#     triton_dq, triton_dk, triton_dv = torch.autograd.grad(
+#         triton_out, (q_unpad, k_unpad, v_unpad), do.clone()
+#     )
+
+#     triton_dq = dq_pad_fn(triton_dq)
+#     triton_dk = dk_pad_fn(triton_dk)
+#     triton_dv = dk_pad_fn(triton_dv)
+#     if DEBUG_MODE:
+#         print(f"triton_out={triton_out}")
+#         print(f"triton_lse.shape={lse.shape} triton_lse={lse}")
+#         print(f"triton_dq.shape={triton_dq.shape} triton_dq={triton_dq}")
+#         print(f"triton_dk.shape={triton_dk.shape} triton_dk={triton_dk}")
+#         print(f"triton_dv.shape={triton_dv.shape} triton_dv={triton_dv}")
+#         print(f"dropout_mask={dropout_mask}")
+
+#     if DEBUG_MODE:
+#         print("--------------Torch----------------")
+#         print(f"do.shape={do.shape} do={do}")
+#     with torch.enable_grad():
+#         torch_out = attention_ref(
+#             q,
+#             k,
+#             v,
+#             query_padding_mask=query_padding_mask,
+#             key_padding_mask=key_padding_mask,
+#             dropout_p=DROPOUT,
+#             dropout_mask=dropout_mask,
+#             causal=CAUSAL,
+#         )
+#     torch_out, attention_scores = torch_out
+
+#     torch.testing.assert_close(
+#         triton_out, torch_out.to(triton_out.dtype), atol=1e-2, rtol=1e-2
+#     )
+
+#     torch_dq, torch_dk, torch_dv = torch.autograd.grad(torch_out, (q, k, v), do)
+
+#     if DEBUG_MODE:
+#         print(f"torch_out={torch_out}")
+#         print(f"torch_attn_scores={attention_scores}")
+#         print(f"torch_dq.shape={torch_dq.shape} torch_dq={torch_dq}")
+#         print(f"torch_dk.shape={torch_dk.shape} torch_dk={torch_dk}")
+#         print(f"torch_dv.shape={torch_dv.shape} torch_dv={torch_dv}")
+
+#     torch.testing.assert_close(
+#         triton_dq, torch_dq.to(triton_out.dtype), atol=1e-2, rtol=1e-2
+#     )
+#     torch.testing.assert_close(
+#         triton_dk, torch_dk.to(triton_out.dtype), atol=1e-2, rtol=1e-2
+#     )
+#     torch.testing.assert_close(
+#         triton_dv, torch_dv.to(triton_out.dtype), atol=1e-2, rtol=1e-2
+#     )
