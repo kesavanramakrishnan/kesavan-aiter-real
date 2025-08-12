@@ -526,8 +526,9 @@ def _attn_fwd(
         start_m = (wid_per_batch % chunk_size) // NUM_XCD
         off_z = (wid // (NUM_BLOCKS * NUM_Q_HEADS)) % BATCH
     else: # MAPPING_MODE == 2, triton_fa case
-        off_q_head = (wid_per_batch % NUM_XCD) * (NUM_Q_HEADS // NUM_XCD) + (wid_per_batch // chunk_size)
-        start_m = (wid_per_batch % chunk_size) // NUM_XCD
+        # off_q_head = (wid_per_batch % NUM_XCD) * (NUM_Q_HEADS // NUM_XCD) + (wid_per_batch // chunk_size)
+        start_m = wid % NUM_BLOCKS
+        off_q_head = (wid // NUM_BLOCKS) % NUM_Q_HEADS
         off_z = (wid // (NUM_BLOCKS * NUM_Q_HEADS)) % BATCH
 
     # swizzled_wid = wid
