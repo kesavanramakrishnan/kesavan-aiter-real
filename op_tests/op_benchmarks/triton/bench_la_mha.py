@@ -9,8 +9,9 @@ import triton
 from bisect import bisect_right
 
 # Import both attention functions
-from aiter.ops.triton.lean_atten_val import _persistent_lean_attention
+from aiter.ops.triton.lean_atten import persistent_lean_attention
 from aiter.ops.triton.mha import flash_attn_func
+from aiter.ops.triton.utils import arch_info
 
 # --- Helper functions copied from bench_la.py ---
 
@@ -121,7 +122,9 @@ configs.append(
         x_vals=[
             (True, 1, 64, 8192, 8192, 128),
             (True, 2, 64, 8192, 8192, 128),
-            (True, 2, 64, 16384, 16384, 128)
+            (True, 2, 64, 16384, 16384, 128),
+            (False, 2, 64, 8192, 8192, 128),
+            (False, 2, 64, 16384, 16384, 128),
             # Add other configurations here for comparison
             # (True, 1, 64, 4096, 4096, 128),
             # (True, 4, 32, 2048, 2048, 64),
@@ -154,30 +157,15 @@ def bench_attention(
 
     if provider == 'lean':
         # --- LEAN ATTENTION SETUP ---
-        # Use reasonable defaults for LA-specific tuning parameters
-        total_programs = 304  # Typically num_SMs
-        BLOCK_M = 128
-        BLOCK_N = 64
-        waves_per_eu = 2
-        num_warps = 4
+        # Use device SM count for buffer allocation
+        sm_count = arch_info.get_num_sms()
 
         # LA uses ragged tensors, so we create a list of sequence lengths
         n_ctx = [SEQLEN_K] * BATCH
         sum_n_ctx = sum(n_ctx)
 
-        max_output_tile_cnt = calculate_max_output_tiles_analytically(
-            causal=CAUSAL,
-            batch_size=BATCH,
-            max_seqlen_q=SEQLEN_Q,
-            max_seqlen_k=sum_n_ctx,
-            num_heads=NUM_HEADS,
-            num_SMs=total_programs,
-            BLOCK_M=BLOCK_M,
-            BLOCK_N=BLOCK_N,
-        )
-        max_output_tile_cnt += 4
-
         # Create the cumulative sequence length tensor for LA
+        BLOCK_N = 64
         list_num_block_n = [(s + BLOCK_N - 1) // BLOCK_N for s in n_ctx]
         len_sum = 0
         list_sum_block_n = []
@@ -190,15 +178,23 @@ def bench_attention(
         q = torch.randn((SEQLEN_Q * BATCH, NUM_HEADS, HEAD_SZ), dtype=init_dtype, device=device)
         k = torch.randn((sum_n_ctx, NUM_HEADS, HEAD_SZ), dtype=init_dtype, device=device)
         v = torch.randn((sum_n_ctx, NUM_HEADS, HEAD_SZ), dtype=init_dtype, device=device)
-        Mp = torch.empty((total_programs, SEQLEN_Q), device=device, dtype=torch.float32)
-        Lp = torch.empty((total_programs, SEQLEN_Q), device=device, dtype=torch.float32)
-        Op = torch.empty((total_programs, SEQLEN_Q, HEAD_SZ), device=device, dtype=torch.float32)
-        locks = torch.zeros((total_programs,), device=device, dtype=torch.int32)
+        Mp = torch.empty((sm_count, SEQLEN_Q), device=device, dtype=torch.float32)
+        Lp = torch.empty((sm_count, SEQLEN_Q), device=device, dtype=torch.float32)
+        Op = torch.empty((sm_count, SEQLEN_Q, HEAD_SZ), device=device, dtype=torch.float32)
+        locks = torch.zeros((sm_count,), device=device, dtype=torch.int32)
 
-        fn = lambda: _persistent_lean_attention(
-            q, k, v, Mp, Lp, Op, locks, batch_num_block_n,
-            total_programs, BLOCK_M, BLOCK_N, CAUSAL, BATCH, sm_scale,
-            num_warps, waves_per_eu, max_output_tile_cnt
+        fn = lambda: persistent_lean_attention(
+            q=q,
+            k=k,
+            v=v,
+            Mp=Mp,
+            Lp=Lp,
+            Op=Op,
+            locks=locks,
+            batch_num_block_n=batch_num_block_n,
+            batch_size=BATCH,
+            sm_scale=sm_scale,
+            causal=CAUSAL,
         )
 
     elif provider == 'mha':

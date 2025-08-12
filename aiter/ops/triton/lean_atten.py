@@ -76,6 +76,13 @@ def persistent_lean_attention(
         config = _get_config(causal=causal, batch_size=batch_size)
     sm_count = arch_info.get_num_sms()
 
+    # Ensure we don't pass kernel launch keywords via both Triton kernel and config dict
+    # Remove any Triton launch keywords from config to avoid duplicates
+    safe_config = config.copy() if config is not None else {}
+    for kw in ("num_warps", "num_stages"):
+        if kw in safe_config:
+            del safe_config[kw]
+
     return _persistent_lean_attention(
         q=q,
         k=k,
@@ -93,7 +100,7 @@ def persistent_lean_attention(
         sm_scale=sm_scale,
         num_warps=config["num_warps"],
         waves_per_eu=config["waves_per_eu"],
-        config=config,
+        config=safe_config,
     )
 
 
@@ -240,11 +247,8 @@ def _persistent_lean_attention(
         tiles_per_head=tiles_per_head,
         num_splits=num_splits,
         max_output_tile_cnt=max_output_tile_cnt,
-        waves_per_eu=waves_per_eu,
         num_warps=num_warps,
-        num_stages=1,
-        num_ctas=1,
-        **config,
+        num_stages=config.get("num_stages", 1),
     )
     """
     kernel_timing["attn_fwd"]["end_event"].record()

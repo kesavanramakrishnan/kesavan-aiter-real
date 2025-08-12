@@ -798,7 +798,7 @@ def persistent_lean_attention_bwd(
     """
     if config is None:
         # Use a minimal default to avoid external JSON dependency during tests
-        config = {"BLOCK_SIZE_M": 64, "BLOCK_SIZE_N": 64, "num_warps": 4, "waves_per_eu": 1}
+        config = {"BLOCK_SIZE_M": 128, "BLOCK_SIZE_N": 64, "num_warps": 4, "waves_per_eu": 2}
     # Resolve total programs (CTAs) preference: explicit arg > config > device
     total_programs_pref = None
     if num_programs is not None:

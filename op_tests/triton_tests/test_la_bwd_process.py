@@ -14,20 +14,32 @@ if torch.cuda.is_available() and torch.cuda.get_device_capability() >= (8, 0):
 ATOL = {torch.float16: 1e-2, torch.bfloat16: 2e-2, torch.float32: 1e-4}
 RTOL = {torch.float16: 1e-2, torch.bfloat16: 2e-2, torch.float32: 1e-4}
 
-# @pytest.mark.parametrize("BATCH", [1,])
-# @pytest.mark.parametrize("NUM_Q_HEADS, NUM_K_HEADS", [(4, 4)])
-# @pytest.mark.parametrize("HEAD_SZ", [16])
-# @pytest.mark.parametrize("SEQLEN_Q, SEQLEN_K", [(16, 16), (64, 128)])
-# @pytest.mark.parametrize("causal", [False, True])
-# @pytest.mark.parametrize("dtype", [torch.float16])
+# Benchmark-derived non-varlen configs (BATCH, HQ, HK, N_CTX_Q, N_CTX_K)
+# Sourced from nonvarlen_benchmark_configs used in fused-attention bwd benchmarks
+BENCH_NONVARLEN_CONFIGS = [
+    (16, 16, 16, 1024, 1024),
+    (8, 16, 16, 2048, 2048),
+    (4, 16, 16, 4096, 4096),
+    (2, 16, 16, 8192, 8192),
+    (8, 16, 16, 1024, 4096),
+    (1, 16, 16, 4096, 16384),
+    (2, 48, 48, 1024, 1024),
+    (2, 48, 48, 2048, 1024),
+    (2, 48, 48, 4096, 8192),
+    (2, 48, 48, 8192, 4096),
+    (2, 48, 48, 16384, 8192),
+    (8, 16, 16, 1989, 15344),
+    (4, 16, 16, 4097, 163),
+    (2, 16, 16, 8122, 2159),
+    (1, 16, 16, 16281, 7),
+    (2, 48, 48, 1021, 1020),
+    (2, 48, 48, 2001, 2048),
+    (2, 48, 48, 3996, 9639),
+    (2, 48, 48, 8181, 1021),
+]
 
-@pytest.mark.parametrize("BATCH", [1, 2, 4])
-@pytest.mark.parametrize("NUM_Q_HEADS, NUM_K_HEADS", [(4, 4), (8, 8)])
-@pytest.mark.parametrize("HEAD_SZ", [16, 64])
-@pytest.mark.parametrize("SEQLEN_Q, SEQLEN_K", ([(64, 64),(128, 128), (256, 256)]))
-@pytest.mark.parametrize("causal", [False, True])
-@pytest.mark.parametrize("dtype", [torch.float16])
-def test_la_bwd_vs_flash_bwd(
+
+def _run_la_bwd_process_test(
     BATCH: int,
     NUM_Q_HEADS: int,
     NUM_K_HEADS: int,
@@ -38,10 +50,6 @@ def test_la_bwd_vs_flash_bwd(
     dtype: torch.dtype,
     device: str = "cuda",
 ):
-    """
-    Compares the backward pass of Lean Attention with a reference Flash Attention
-    implementation and PyTorch's native scaled_dot_product_attention.
-    """
     torch.manual_seed(2024)
 
     # Define tensor shapes
@@ -179,3 +187,63 @@ def test_la_bwd_vs_flash_bwd(
     torch.testing.assert_close(dq_la, dq_flash, atol=atol, rtol=rtol, msg="dQ (Lean Attn vs Flash Attn)")
     torch.testing.assert_close(dk_la, dk_flash, atol=atol, rtol=rtol, msg="dK (Lean Attn vs Flash Attn)")
     torch.testing.assert_close(dv_la, dv_flash, atol=atol, rtol=rtol, msg="dV (Lean Attn vs Flash Attn)")
+
+@pytest.mark.parametrize("BATCH", [1, 2, 4])
+@pytest.mark.parametrize("NUM_Q_HEADS, NUM_K_HEADS", [(4, 4), (8, 8)])
+@pytest.mark.parametrize("HEAD_SZ", [16, 64])
+@pytest.mark.parametrize("SEQLEN_Q, SEQLEN_K", ([(64, 64), (128, 128), (256, 256)]))
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("dtype", [torch.float16])
+def test_la_bwd_vs_flash_bwd(
+    BATCH: int,
+    NUM_Q_HEADS: int,
+    NUM_K_HEADS: int,
+    HEAD_SZ: int,
+    SEQLEN_Q: int,
+    SEQLEN_K: int,
+    causal: bool,
+    dtype: torch.dtype,
+    device: str = "cuda",
+):
+    _run_la_bwd_process_test(
+        BATCH,
+        NUM_Q_HEADS,
+        NUM_K_HEADS,
+        HEAD_SZ,
+        SEQLEN_Q,
+        SEQLEN_K,
+        causal,
+        dtype,
+        device,
+    )
+
+
+@pytest.mark.parametrize(
+    "BATCH, NUM_Q_HEADS, NUM_K_HEADS, SEQLEN_Q, SEQLEN_K",
+    BENCH_NONVARLEN_CONFIGS,
+)
+@pytest.mark.parametrize("HEAD_SZ", [128])
+@pytest.mark.parametrize("causal", [False])
+@pytest.mark.parametrize("dtype", [torch.float16])
+def test_la_bwd_vs_flash_bwd_bench_nonvarlen(
+    BATCH: int,
+    NUM_Q_HEADS: int,
+    NUM_K_HEADS: int,
+    SEQLEN_Q: int,
+    SEQLEN_K: int,
+    HEAD_SZ: int,
+    causal: bool,
+    dtype: torch.dtype,
+    device: str = "cuda",
+):
+    _run_la_bwd_process_test(
+        BATCH,
+        NUM_Q_HEADS,
+        NUM_K_HEADS,
+        HEAD_SZ,
+        SEQLEN_Q,
+        SEQLEN_K,
+        causal,
+        dtype,
+        device,
+    )
