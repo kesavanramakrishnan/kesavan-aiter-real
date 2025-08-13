@@ -97,8 +97,7 @@ def reference_attention(q, k, v, n_ctx, n_ctx_q, sm_scale, causal):
 @pytest.mark.parametrize(
     "causal, batch, h, n_ctx_q, n_ctx, d, total_programs, init_dtype, BLOCK_M, BLOCK_N, waves_per_eu, num_warps ",
     [
-        (False, 1024, 8, 8192, [8192], 128, 304, torch.float16, 128, 64, 1, 4),
-        # (False, 1, 8, 8192, [8192], 128, 304, torch.float16, 128, 64, 1, 4),
+        (False, 1024, 16, 128, [8192]*1024, 128, 304, torch.float16, 128, 64, 1, 4),
         # Added from bench_mha
         # (False, 2, 48, 16384, [8192, 8192], 128, 304, torch.float16, 128, 64, 1, 4),
         # Added from bench_mha_la

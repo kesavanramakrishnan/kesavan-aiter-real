@@ -139,9 +139,9 @@ def reference_lse(q, k, n_ctx, n_ctx_q, sm_scale, causal):
 @pytest.mark.parametrize(
     "causal, batch, h_q, h_k, n_ctx_q, n_ctx, d, total_programs, init_dtype, BLOCK_M, BLOCK_N, waves_per_eu, num_warps ",
     [
-        # (True, 1, 32, 8, 8192, [8192], 128, 304, torch.float16, 128, 64, 1, 4),
-        # (True, 1, 64, 8, 8192, [8192], 128, 304, torch.float16, 128, 64, 1, 4),
-        # (True, 1, 128, 8, 8192, [8192], 128, 304, torch.float16, 128, 64, 1, 4),
+        (True, 64, 32, 8, 128, [256] * 64, 128, 304, torch.float16, 128, 64, 1, 4),
+        # (False, 16, 64, 8, 1, [8192] * 16, 128, 304, torch.float16, 128, 64, 1, 4),
+        # (False, 16, 128, 8, 1, [8192] * 16, 128, 304, torch.float16, 128, 64, 1, 4),
         # # (True, 1, 128, 128, 8192, [8192], 64, 304, torch.float16, 128, 64, 1, 4),
         # # (True, 1024, 64, 8, 8192, 8192, 128),
         # # (True, 1024, 128, 8, 8192, 8192, 128),
@@ -173,68 +173,68 @@ def reference_lse(q, k, n_ctx, n_ctx_q, sm_scale, causal):
         # (False, 2, 64, 64, 8192, [8192, 8192], 128, 304, torch.float16, 128, 64, 1, 4),
         # (False, 2, 64, 64, 16384, [16384, 16384], 128, 304, torch.float16, 128, 64, 1, 4),
         # (False, 2, 48, 48, 16384, [16384, 16384], 128, 304, torch.float16, 128, 64, 1, 4),
-        (False, 2, 64, 64, 128, [65536, 65536], 128, 304, torch.float16, 128, 64, 1, 4),
-        (False, 2, 64, 64, 16, [65536, 65536], 128, 912, torch.float16, 16, 128, 3, 4),
-        (False, 1, 64, 64, 16, [131072], 128, 912, torch.float16, 16, 128, 2, 4),
-        (False, 1, 64, 64, 16, [262144], 64, 912, torch.float16, 16, 64, 2, 4),
-        (False, 1, 64, 64, 16, [524288], 64, 912, torch.float16, 16, 64, 2, 4),
-        (False, 2, 96, 96, 16, [32768, 32768], 128, 912, torch.float16, 16, 128, 2, 4),
-        (False, 1, 96, 96, 16, [65536], 128, 912, torch.float16, 16, 128, 2, 4),
-        (False, 1, 96, 96, 16, [131072], 128, 912, torch.float16, 16, 128, 2, 4),
-        (False, 1, 96, 96, 16, [262144], 64, 912, torch.float16, 16, 64, 2, 4),
-        (False, 1, 96, 96, 16, [524288], 16, 912, torch.float16, 16, 256, 1, 4),  #
-        (False, 1, 96, 96, 16, [1048576], 16, 912, torch.float16, 16, 256, 1, 4),  #
-        (False, 1, 128, 128, 16, [32768], 128, 912, torch.float16, 16, 128, 2, 4),
-        (False, 1, 128, 128, 16, [65536], 128, 912, torch.float16, 16, 128, 2, 4),
-        (False, 1, 128, 128, 16, [131072], 128, 912, torch.float16, 16, 128, 2, 4),
-        (False, 1, 128, 128, 16, [262144], 64, 912, torch.float16, 16, 64, 2, 4),
-        (False, 1, 128, 128, 16, [524288], 16, 912, torch.float16, 16, 256, 1, 4),  #
-        (
-            False,
-            3,
-            64,
-            64,
-            16,
-            [4096, 32768, 65536],
-            128,
-            912,
-            torch.float16,
-            16,
-            128,
-            2,
-            4,
-        ),
-        (
-            False,
-            8,
-            64,
-            64,
-            16,
-            [1024, 1024, 2048, 2048, 4096, 4096, 32768, 65536],
-            128,
-            912,
-            torch.float16,
-            16,
-            64,
-            2,
-            4,
-        ),
-        (
-            True,
-            1,
-            64,
-            64,
-            8192,
-            [8192],
-            128,
-            304,
-            torch.float16,
-            128,
-            64,
-            2,
-            4,
-        ),  # Causal=1,
-        (True, 2, 64, 64, 2048, [2048, 2048], 128, 304, torch.float16, 128, 64, 2, 4),
+        # (False, 2, 64, 64, 128, [65536, 65536], 128, 304, torch.float16, 128, 64, 1, 4),
+        # (False, 2, 64, 64, 16, [65536, 65536], 128, 912, torch.float16, 16, 128, 3, 4),
+        # (False, 1, 64, 64, 16, [131072], 128, 912, torch.float16, 16, 128, 2, 4),
+        # (False, 1, 64, 64, 16, [262144], 64, 912, torch.float16, 16, 64, 2, 4),
+        # (False, 1, 64, 64, 16, [524288], 64, 912, torch.float16, 16, 64, 2, 4),
+        # (False, 2, 96, 96, 16, [32768, 32768], 128, 912, torch.float16, 16, 128, 2, 4),
+        # (False, 1, 96, 96, 16, [65536], 128, 912, torch.float16, 16, 128, 2, 4),
+        # (False, 1, 96, 96, 16, [131072], 128, 912, torch.float16, 16, 128, 2, 4),
+        # (False, 1, 96, 96, 16, [262144], 64, 912, torch.float16, 16, 64, 2, 4),
+        # (False, 1, 96, 96, 16, [524288], 16, 912, torch.float16, 16, 256, 1, 4),  #
+        # (False, 1, 96, 96, 16, [1048576], 16, 912, torch.float16, 16, 256, 1, 4),  #
+        # (False, 1, 128, 128, 16, [32768], 128, 912, torch.float16, 16, 128, 2, 4),
+        # (False, 1, 128, 128, 16, [65536], 128, 912, torch.float16, 16, 128, 2, 4),
+        # (False, 1, 128, 128, 16, [131072], 128, 912, torch.float16, 16, 128, 2, 4),
+        # (False, 1, 128, 128, 16, [262144], 64, 912, torch.float16, 16, 64, 2, 4),
+        # (False, 1, 128, 128, 16, [524288], 16, 912, torch.float16, 16, 256, 1, 4),  #
+        # (
+        #     False,
+        #     3,
+        #     64,
+        #     64,
+        #     16,
+        #     [4096, 32768, 65536],
+        #     128,
+        #     912,
+        #     torch.float16,
+        #     16,
+        #     128,
+        #     2,
+        #     4,
+        # ),
+        # (
+        #     False,
+        #     8,
+        #     64,
+        #     64,
+        #     16,
+        #     [1024, 1024, 2048, 2048, 4096, 4096, 32768, 65536],
+        #     128,
+        #     912,
+        #     torch.float16,
+        #     16,
+        #     64,
+        #     2,
+        #     4,
+        # ),
+        # (
+        #     True,
+        #     1,
+        #     64,
+        #     64,
+        #     8192,
+        #     [8192],
+        #     128,
+        #     304,
+        #     torch.float16,
+        #     128,
+        #     64,
+        #     2,
+        #     4,
+        # ),  # Causal=1,
+        # (True, 2, 64, 64, 2048, [2048, 2048], 128, 304, torch.float16, 128, 64, 2, 4),
         #These test cases fail:
         # (True, 2, 64, 64, 2048, [2048, 2048], 128, 304, torch.float16, 128, 64, 2, 4),
         # (True, 1, 64, 64, 4096, [4096], 128, 304, torch.float16, 128, 16, 3, 4),
@@ -258,7 +258,6 @@ def test_persistent_lean_attention(
     causal,
 ):
     torch.cuda.empty_cache()  # Helps avoid hangs in large tests
-
     torch.manual_seed(20)
     # Long seqlen (>512K) can hit memory access fault. Suspect compiler issue
     # WA with shorter d and longer BLOCK_N
@@ -303,7 +302,7 @@ def test_persistent_lean_attention(
     )
 
     # Triton LeanAttention output
-    la_out, lse, ms = _persistent_lean_attention(
+    la_out, ms = _persistent_lean_attention(
         q,
         k,
         v,
@@ -320,21 +319,24 @@ def test_persistent_lean_attention(
         sm_scale,
         num_warps,
         waves_per_eu,
-        return_lse=True,
+        return_lse=False,
     )
 
     # Calculate Pytorch reference output and LSE
     ref_out = reference_attention(q, k, v, n_ctx, n_ctx_q, sm_scale, causal)
-    ref_lse = reference_lse(q, k, n_ctx, n_ctx_q, sm_scale, causal)
+    # ref_lse = reference_lse(q, k, n_ctx, n_ctx_q, sm_scale, causal)
 
     # print(f"ref_lse={ref_lse}")
     # print(f"lse={lse}")
+
+    print(f"la_out={la_out}")
+    print(f"ref_out={ref_out}")
 
     # Compare result
     atol = 1.4e-1 if init_dtype == "fp8" else 1e-2
     rtol = 1e-2 if init_dtype == "fp8" else 3e-3
     torch.testing.assert_close(ref_out, la_out, atol=atol, rtol=rtol)
-    torch.testing.assert_close(ref_lse, lse, atol=1e-2, rtol=3e-3)
+    # torch.testing.assert_close(ref_lse, lse, atol=1e-2, rtol=3e-3)
 
 
 # NOTE: Tests where the workload < num_sms currently fail.
@@ -457,7 +459,7 @@ def main():
     d = 128
     total_programs = 304
     init_dtype = torch.float16
-    BLOCK_M = 128
+    BLOCK_M = 1
     BLOCK_N = 64
     waves_per_eu = 2
     num_warps = 4

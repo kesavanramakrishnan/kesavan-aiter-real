@@ -118,7 +118,7 @@ def model_benchmark_configs(args):
         models=models_arg,
     )
     fa_configs = []
-    BS = args.b if args.b else 1024
+    BS = args.b if args.b else 16
 
     for model_name, config in configs.items():
         HQ = config["num_attention_heads"]
