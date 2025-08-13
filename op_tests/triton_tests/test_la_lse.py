@@ -139,7 +139,7 @@ def reference_lse(q, k, n_ctx, n_ctx_q, sm_scale, causal):
 @pytest.mark.parametrize(
     "causal, batch, h_q, h_k, n_ctx_q, n_ctx, d, total_programs, init_dtype, BLOCK_M, BLOCK_N, waves_per_eu, num_warps ",
     [
-        (True, 64, 32, 8, 128, [256] * 64, 128, 304, torch.float16, 128, 64, 1, 4),
+        (False, 512, 32, 8, 128, [8192] * 512, 128, 304, torch.float16, 128, 64, 1, 4),
         # (False, 16, 64, 8, 1, [8192] * 16, 128, 304, torch.float16, 128, 64, 1, 4),
         # (False, 16, 128, 8, 1, [8192] * 16, 128, 304, torch.float16, 128, 64, 1, 4),
         # # (True, 1, 128, 128, 8192, [8192], 64, 304, torch.float16, 128, 64, 1, 4),
@@ -257,6 +257,7 @@ def test_persistent_lean_attention(
     num_warps,
     causal,
 ):
+    # print("here")
     torch.cuda.empty_cache()  # Helps avoid hangs in large tests
     torch.manual_seed(20)
     # Long seqlen (>512K) can hit memory access fault. Suspect compiler issue

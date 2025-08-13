@@ -185,6 +185,8 @@ def _persistent_lean_attention(
         max_tiles_per_wg=max_tiles_per_wg,
         causal=causal,
         MASKED_BLOCKS=MASKED_BLOCKS,
+        batch_size=batch_size,
+        batch_num_block_n=batch_num_block_n,
     )
 
     max_output_tile_cnt = max_output_tile_cnt + 4
@@ -377,6 +379,8 @@ def calculate_max_output_tiles_analytically(
     max_tiles_per_wg: int,
     causal: bool,
     MASKED_BLOCKS: int,
+    batch_size: int,
+    batch_num_block_n,
 ):
     """
     Calculates the maximum number of output tiles any single workgroup will process
@@ -424,8 +428,31 @@ def calculate_max_output_tiles_analytically(
             wg_end_in_head = min(end_iter, head_start_iter + tiles_per_head)
 
             if not causal:
-                # For non-causal, each head is one output tile.
-                total_output_tiles_for_wg += 1
+                # For non-causal, each head has one output tile per batch item.
+                # Count how many batch segments this WG's range intersects within this head.
+                # batch_num_block_n is a prefix-sum over the number of K/V BLOCK_N tiles per batch item.
+                if hasattr(batch_num_block_n, "tolist"):
+                    # Convert torch tensor (possibly CUDA) to Python list
+                    prefix_sums = batch_num_block_n.tolist()
+                else:
+                    prefix_sums = batch_num_block_n
+
+                # Build per-batch segment ranges relative to the head start.
+                prev_end = 0
+                segments = []
+                for b in range(batch_size):
+                    end = prefix_sums[b]
+                    segments.append((prev_end, end))
+                    prev_end = end
+
+                # Convert WG head-local range
+                relative_start = wg_start_in_head - head_start_iter
+                relative_end = wg_end_in_head - head_start_iter
+
+                # Count intersections
+                for seg_start, seg_end in segments:
+                    if (relative_start < seg_end) and (relative_end > seg_start):
+                        total_output_tiles_for_wg += 1
                 continue
 
             # --- Causal Logic using Binary Search ---
