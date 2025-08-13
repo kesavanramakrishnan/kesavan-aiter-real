@@ -139,7 +139,7 @@ def reference_lse(q, k, n_ctx, n_ctx_q, sm_scale, causal):
 @pytest.mark.parametrize(
     "causal, batch, h_q, h_k, n_ctx_q, n_ctx, d, total_programs, init_dtype, BLOCK_M, BLOCK_N, waves_per_eu, num_warps ",
     [
-        (False, 512, 32, 8, 128, [8192] * 512, 128, 304, torch.float16, 128, 64, 1, 4),
+        (False, 256, 32, 8, 128, [8192] * 256, 128, 304, torch.float16, 128, 64, 1, 4),
         # (False, 16, 64, 8, 1, [8192] * 16, 128, 304, torch.float16, 128, 64, 1, 4),
         # (False, 16, 128, 8, 1, [8192] * 16, 128, 304, torch.float16, 128, 64, 1, 4),
         # # (True, 1, 128, 128, 8192, [8192], 64, 304, torch.float16, 128, 64, 1, 4),

@@ -428,16 +428,15 @@ def calculate_max_output_tiles_analytically(
             wg_end_in_head = min(end_iter, head_start_iter + tiles_per_head)
 
             if not causal:
-                # For non-causal, each head has one output tile per batch item.
-                # Count how many batch segments this WG's range intersects within this head.
-                # batch_num_block_n is a prefix-sum over the number of K/V BLOCK_N tiles per batch item.
+                # For non-causal, each head has one output tile per batch item per M-block.
+                # Count how many batch segments this WG's range intersects within one M-block for this head,
+                # then multiply by the number of M-blocks to form a safe upper bound.
                 if hasattr(batch_num_block_n, "tolist"):
-                    # Convert torch tensor (possibly CUDA) to Python list
                     prefix_sums = batch_num_block_n.tolist()
                 else:
                     prefix_sums = batch_num_block_n
 
-                # Build per-batch segment ranges relative to the head start.
+                # Build per-batch segment ranges relative to the head start for a single M-block span.
                 prev_end = 0
                 segments = []
                 for b in range(batch_size):
@@ -445,14 +444,18 @@ def calculate_max_output_tiles_analytically(
                     segments.append((prev_end, end))
                     prev_end = end
 
-                # Convert WG head-local range
+                # WG's range relative to the head start
                 relative_start = wg_start_in_head - head_start_iter
                 relative_end = wg_end_in_head - head_start_iter
 
-                # Count intersections
+                # Number of segments intersected within a single M-block
+                seg_intersections = 0
                 for seg_start, seg_end in segments:
                     if (relative_start < seg_end) and (relative_end > seg_start):
-                        total_output_tiles_for_wg += 1
+                        seg_intersections += 1
+
+                # Safe upper bound across all M-blocks this head has
+                total_output_tiles_for_wg += max(1, seg_intersections) * max(1, num_m_blocks)
                 continue
 
             # --- Causal Logic using Binary Search ---
@@ -954,7 +957,7 @@ def la_persistent_inner(
             + offs_m[:, None] * stride_opm
             + offs_k[None, :] * stride_opn
         )
-
+        
         tl.store(mp_ptrs, m_i, mask=mask_m, cache_modifier=".wt")
         tl.store(lp_ptrs, l_i, mask=mask_m, cache_modifier=".wt")
         tl.store(op_ptrs, acc, mask=mask_m[:, None], cache_modifier=".wt")
