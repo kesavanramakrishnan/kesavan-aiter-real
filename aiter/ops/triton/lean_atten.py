@@ -76,13 +76,6 @@ def persistent_lean_attention(
         config = _get_config(causal=causal, batch_size=batch_size)
     sm_count = arch_info.get_num_sms()
 
-    # Ensure we don't pass kernel launch keywords via both Triton kernel and config dict
-    # Remove any Triton launch keywords from config to avoid duplicates
-    safe_config = config.copy() if config is not None else {}
-    for kw in ("num_warps", "num_stages"):
-        if kw in safe_config:
-            del safe_config[kw]
-
     return _persistent_lean_attention(
         q=q,
         k=k,
@@ -100,7 +93,7 @@ def persistent_lean_attention(
         sm_scale=sm_scale,
         num_warps=config["num_warps"],
         waves_per_eu=config["waves_per_eu"],
-        config=safe_config,
+        config=config,
     )
 
 
@@ -248,8 +241,7 @@ def _persistent_lean_attention(
         num_splits=num_splits,
         max_output_tile_cnt=max_output_tile_cnt,
         num_warps=num_warps,
-        num_stages=config.get("num_stages", 1),
-        NUM_HEADS=H,
+        num_stages=1,
     )
     """
     kernel_timing["attn_fwd"]["end_event"].record()
@@ -583,7 +575,6 @@ def la_persistent(
     tiles_per_head: tl.constexpr,
     num_splits: tl.constexpr,
     max_output_tile_cnt: tl.constexpr,
-    NUM_HEADS: tl.constexpr,
 ):
     if is_pod:
         current_pid = pod_pid
@@ -659,7 +650,6 @@ def la_persistent(
                 max_tiles_per_wg=max_tiles_per_wg,
                 tiles_per_head=tiles_per_head,
                 num_splits=num_splits,
-                NUM_HEADS=NUM_HEADS,
             )
 
 
@@ -706,7 +696,6 @@ def la_persistent_inner(
     max_tiles_per_wg: tl.constexpr,
     tiles_per_head: tl.constexpr,
     num_splits: tl.constexpr,
-    NUM_HEADS: tl.constexpr,
 ):
 
     tl.assume(stride_qm > 0)  # n_ctx_q
@@ -729,22 +718,7 @@ def la_persistent_inner(
     # while iter < cta_end_tile_gid:
     # Calculate index of current head output tile
     # The tiles_per_head is the sum of # BLOCK_N in K/V sequence of all batches
-    # Swizzled global tile order: interpret iter in a head-first, lane-interleaved order
-    # tile_head_idx = iter // tiles_per_head
-    h_lin = iter // tiles_per_head  # head index in swizzled order
-    # Map swizzled head index to physical head id pinned to XCD lanes (NUM_XCD=8)
-    NUM_XCD: tl.constexpr = 8
-    base = NUM_HEADS // NUM_XCD
-    rem = NUM_HEADS % NUM_XCD
-    # Balanced mapping: first base rows have all lanes, last row has `rem` lanes
-    if h_lin < base * NUM_XCD:
-        lane = h_lin % NUM_XCD
-        rank = h_lin // NUM_XCD
-    else:
-        lane = h_lin - base * NUM_XCD  # 0 .. rem-1
-        rank = base
-    heads_before_lane = lane * base + tl.minimum(lane, rem)
-    tile_head_idx = heads_before_lane + rank  # physical head id used for memory strides
+    tile_head_idx = iter // tiles_per_head
     # To generate an otuput tile, a loop over [tile_iter, tile_iter_end) lean tiles is needed
     # [tile_iter, tile_iter_end) are in the form of global tile id
     if causal:
@@ -754,13 +728,13 @@ def la_persistent_inner(
         # per_head_tile_size: per head # BLOCK_N of each output tile
         per_head_tile_idx, per_head_tile_size, total_blocks = find_group(
             iter
-            - (h_lin * tiles_per_head)
+            - (tile_head_idx * tiles_per_head)
             - (tile_batch_idx * (tiles_per_head // batch_size)),
             MASKED_BLOCKS,
             num_m_blocks,
         )
         tile_iter = (
-            h_lin * tiles_per_head
+            tile_head_idx * tiles_per_head
             + (tile_batch_idx * (tiles_per_head // batch_size))
             + total_blocks
         )
@@ -768,12 +742,11 @@ def la_persistent_inner(
         tile_idx = (
             tile_head_idx * batch_size + tile_batch_idx
         ) * num_m_blocks + per_head_tile_idx
-    
     else:
         tile_idx = (
             tile_head_idx * batch_size
         )  # Output tile idx, 1 output tile per head per batch
-        tile_iter = h_lin * tiles_per_head
+        tile_iter = tile_head_idx * tiles_per_head
         if batch_size == 1:
             req_size = tiles_per_head
         else:
@@ -787,45 +760,6 @@ def la_persistent_inner(
                 tile_idx = tile_idx + b
                 tile_iter_end = tile_iter + (next_req_size - req_size)
             req_size = next_req_size
-    # if causal:
-    #     tile_batch_idx = (iter % tiles_per_head) // (tiles_per_head // batch_size)
-    #     # Does not support ragged batching. All requests in the batch have the same context length (per_head_tile_size)
-    #     # tiles_per_head: total sum of # BLOCK_N in K/V sequence of all batches
-    #     # per_head_tile_size: per head # BLOCK_N of each output tile
-    #     per_head_tile_idx, per_head_tile_size, total_blocks = find_group(
-    #         iter
-    #         - (tile_head_idx * tiles_per_head)
-    #         - (tile_batch_idx * (tiles_per_head // batch_size)),
-    #         MASKED_BLOCKS,
-    #         num_m_blocks,
-    #     )
-    #     tile_iter = (
-    #         tile_head_idx * tiles_per_head
-    #         + (tile_batch_idx * (tiles_per_head // batch_size))
-    #         + total_blocks
-    #     )
-    #     tile_iter_end = tile_iter + (per_head_tile_size)
-    #     tile_idx = (
-    #         tile_head_idx * batch_size + tile_batch_idx
-    #     ) * num_m_blocks + per_head_tile_idx
-    # else:
-    #     tile_idx = (
-    #         tile_head_idx * batch_size
-    #     )  # Output tile idx, 1 output tile per head per batch
-    #     tile_iter = tile_head_idx * tiles_per_head
-    #     if batch_size == 1:
-    #         req_size = tiles_per_head
-    #     else:
-    #         req_size = tl.load(batch_num_block_n)
-    #     tile_iter_end = tile_iter + req_size
-    #     for b in range(1, batch_size):
-    #         next_req_size = tl.load(batch_num_block_n + b)
-    #         local_head_iter = iter % tiles_per_head
-    #         if (local_head_iter < next_req_size) and (local_head_iter >= req_size):
-    #             tile_iter = tile_iter + req_size
-    #             tile_idx = tile_idx + b
-    #             tile_iter_end = tile_iter + (next_req_size - req_size)
-    #         req_size = next_req_size
     # Local lean tile ID within a loop of an output tile
     local_iter = iter - tile_iter
     local_iter_end = tl.minimum(tile_iter_end, cta_end_tile_gid) - tile_iter

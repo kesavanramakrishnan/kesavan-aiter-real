@@ -25,8 +25,15 @@ configs.append(
     triton.testing.Benchmark(
         x_names=["CAUSAL", "BATCH", "NUM_HEADS", "SEQLEN", "HEAD_SZ"],
         x_vals=[
-            (False, 1, 4, 128, 128),
-            (False, 2, 64, 8192, 128),
+            (True, 1, 1, 1024, 64),
+            (True, 1, 1, 2048, 64),
+            (True, 1, 1, 4096, 64),
+            (True, 1, 1, 4096, 64),
+            # (True, 1, 1, 8192, 64),
+            # (True, 1, 1, 16384, 64),
+            # (True, 1, 1, 32768, 64),
+            # (True, 1, 1, 65536, 64),
+            # (False, 2, 64, 8192, 128),
         ],
         line_arg="provider",
         line_vals=["lean", "onek"],

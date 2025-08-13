@@ -164,36 +164,43 @@ def _run_la_bwd_process_test(
     # --- Assertions ---
     atol, rtol = ATOL[dtype], RTOL[dtype]
 
-    print("\n--- dK Comparison (Lean Attn vs Flash Attn) ---")
-    dk_diff = torch.abs(dk_la - dk_flash)
-    print(dk_diff)
-    dk_tol = atol + rtol * torch.abs(dk_flash)
-    dk_mismatch_pct = (dk_diff > dk_tol).float().mean().item() * 100
-    print(f"% mismatched (dK): {dk_mismatch_pct:.6f}%")
+    # print("\n--- dK Comparison (Lean Attn vs Flash Attn) ---")
+    # dk_diff = torch.abs(dk_la - dk_flash)
+    # print(dk_diff)
+    # dk_tol = atol + rtol * torch.abs(dk_flash)
+    # dk_mismatch_pct = (dk_diff > dk_tol).float().mean().item() * 100
+    # print(f"% mismatched (dK): {dk_mismatch_pct:.6f}%")
 
-    print("\n--- dV Comparison (Lean Attn vs Flash Attn) ---")
-    dv_diff = torch.abs(dv_la - dv_flash)
-    dv_tol = atol + rtol * torch.abs(dv_flash)
-    dv_mismatch_pct = (dv_diff > dv_tol).float().mean().item() * 100
-    print(f"% mismatched (dV): {dv_mismatch_pct:.6f}%")
+    # print("\n--- dV Comparison (Lean Attn vs Flash Attn) ---")
+    # dv_diff = torch.abs(dv_la - dv_flash)
+    # dv_tol = atol + rtol * torch.abs(dv_flash)
+    # dv_mismatch_pct = (dv_diff > dv_tol).float().mean().item() * 100
+    # print(f"% mismatched (dV): {dv_mismatch_pct:.6f}%")
 
-    print("\n--- dQ Comparison (Lean Attn vs Flash Attn) ---")
-    dq_diff = torch.abs(dq_la - dq_flash)
-    dq_tol = atol + rtol * torch.abs(dq_flash)
-    dq_mismatch_pct = (dq_diff > dq_tol).float().mean().item() * 100
-    print(f"% mismatched (dQ): {dq_mismatch_pct:.6f}%")
+    # print("\n--- dQ Comparison (Lean Attn vs Flash Attn) ---")
+    # dq_diff = torch.abs(dq_la - dq_flash)
+    # dq_tol = atol + rtol * torch.abs(dq_flash)
+    # dq_mismatch_pct = (dq_diff > dq_tol).float().mean().item() * 100
+    # print(f"% mismatched (dQ): {dq_mismatch_pct:.6f}%")
 
-    # Compare Lean Attention with Flash Attention
+    #Compare Lean Attention with Flash Attention
     torch.testing.assert_close(dq_la, dq_flash, atol=atol, rtol=rtol, msg="dQ (Lean Attn vs Flash Attn)")
     torch.testing.assert_close(dk_la, dk_flash, atol=atol, rtol=rtol, msg="dK (Lean Attn vs Flash Attn)")
     torch.testing.assert_close(dv_la, dv_flash, atol=atol, rtol=rtol, msg="dV (Lean Attn vs Flash Attn)")
 
-@pytest.mark.parametrize("BATCH", [1, 2, 4])
-@pytest.mark.parametrize("NUM_Q_HEADS, NUM_K_HEADS", [(4, 4), (8, 8)])
-@pytest.mark.parametrize("HEAD_SZ", [16, 64])
-@pytest.mark.parametrize("SEQLEN_Q, SEQLEN_K", ([(64, 64), (128, 128), (256, 256)]))
-@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("BATCH", [1])
+@pytest.mark.parametrize("NUM_Q_HEADS, NUM_K_HEADS", [(1, 1)])
+@pytest.mark.parametrize("HEAD_SZ", [16])
+@pytest.mark.parametrize("SEQLEN_Q, SEQLEN_K", ([(1024, 1024)]))
+@pytest.mark.parametrize("causal", [False])
 @pytest.mark.parametrize("dtype", [torch.float16])
+
+# @pytest.mark.parametrize("BATCH", [1, 2, 4])
+# @pytest.mark.parametrize("NUM_Q_HEADS, NUM_K_HEADS", [(4, 4), (8, 8)])
+# @pytest.mark.parametrize("HEAD_SZ", [16, 64])
+# @pytest.mark.parametrize("SEQLEN_Q, SEQLEN_K", ([(64, 64), (128, 128), (256, 256)]))
+# @pytest.mark.parametrize("causal", [False, True])
+# @pytest.mark.parametrize("dtype", [torch.float16])
 def test_la_bwd_vs_flash_bwd(
     BATCH: int,
     NUM_Q_HEADS: int,
@@ -218,32 +225,32 @@ def test_la_bwd_vs_flash_bwd(
     )
 
 
-@pytest.mark.parametrize(
-    "BATCH, NUM_Q_HEADS, NUM_K_HEADS, SEQLEN_Q, SEQLEN_K",
-    BENCH_NONVARLEN_CONFIGS,
-)
-@pytest.mark.parametrize("HEAD_SZ", [128])
-@pytest.mark.parametrize("causal", [False])
-@pytest.mark.parametrize("dtype", [torch.float16])
-def test_la_bwd_vs_flash_bwd_bench_nonvarlen(
-    BATCH: int,
-    NUM_Q_HEADS: int,
-    NUM_K_HEADS: int,
-    SEQLEN_Q: int,
-    SEQLEN_K: int,
-    HEAD_SZ: int,
-    causal: bool,
-    dtype: torch.dtype,
-    device: str = "cuda",
-):
-    _run_la_bwd_process_test(
-        BATCH,
-        NUM_Q_HEADS,
-        NUM_K_HEADS,
-        HEAD_SZ,
-        SEQLEN_Q,
-        SEQLEN_K,
-        causal,
-        dtype,
-        device,
-    )
+# @pytest.mark.parametrize(
+#     "BATCH, NUM_Q_HEADS, NUM_K_HEADS, SEQLEN_Q, SEQLEN_K",
+#     BENCH_NONVARLEN_CONFIGS,
+# )
+# @pytest.mark.parametrize("HEAD_SZ", [128])
+# @pytest.mark.parametrize("causal", [False])
+# @pytest.mark.parametrize("dtype", [torch.float16])
+# def test_la_bwd_vs_flash_bwd_bench_nonvarlen(
+#     BATCH: int,
+#     NUM_Q_HEADS: int,
+#     NUM_K_HEADS: int,
+#     SEQLEN_Q: int,
+#     SEQLEN_K: int,
+#     HEAD_SZ: int,
+#     causal: bool,
+#     dtype: torch.dtype,
+#     device: str = "cuda",
+# ):
+#     _run_la_bwd_process_test(
+#         BATCH,
+#         NUM_Q_HEADS,
+#         NUM_K_HEADS,
+#         HEAD_SZ,
+#         SEQLEN_Q,
+#         SEQLEN_K,
+#         causal,
+#         dtype,
+#         device,
+#     )

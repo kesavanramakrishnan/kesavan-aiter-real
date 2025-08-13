@@ -24,7 +24,7 @@ def find_group(x, MASKED_BLOCKS: tl.constexpr, num_m_blocks: tl.constexpr):
     final_task_size = 0
     final_total_blocks = 0
     found = False
-    for i in range(0, num_m_blocks):
+    for i in tl.static_range(0, num_m_blocks):
         pair_idx = i // 2
         if (i % 2) == 0:
             q_block_idx = pair_idx
@@ -226,6 +226,8 @@ def la_bwd_dkdv_inner(
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     CAUSAL: tl.constexpr,
+    MAX_TILES_PER_WG_KV_CONST: tl.constexpr,
+    NUM_M_BLOCKS_TOTAL: tl.constexpr,
 ):
     """
     Compute dK and dV by tiling over K/V-blocks and iterating over Q^T tiles.
@@ -278,10 +280,14 @@ def la_bwd_dkdv_inner(
     else:
         iter_start_kv = (max_tiles_per_wg_kv - 1) * (pid - high_load_wgs_kv) + high_load_wgs_kv * max_tiles_per_wg_kv
         num_to_process_kv = max_tiles_per_wg_kv - 1
+    
+    # print("iter_start_kv: ", iter_start_kv)
+    # print("num_to_process_kv: ", num_to_process_kv)
 
-    for i in range(0, num_to_process_kv):
+    for i in tl.static_range(0, MAX_TILES_PER_WG_KV_CONST):
+        active = i < num_to_process_kv
         iter_kv = iter_start_kv + i
-        valid_kv = iter_kv < total_tiles_kv
+        valid_kv = active & (iter_kv < total_tiles_kv)
 
         # Map linear KV tile id -> (head_idx, n_linear) and then to (batch_idx, n_block_in_batch)
         kv_id = iter_kv
@@ -302,7 +308,7 @@ def la_bwd_dkdv_inner(
             prev_running_blocks = 0
             match_prev_blocks = 0
             found = 0
-            for b in range(0, B):
+            for b in tl.static_range(0, B):
                 blocks_total = tl.load(batch_num_block_n + b, mask=valid_kv, other=0) if b > 0 else tl.load(batch_num_block_n, mask=valid_kv, other=0)
                 is_match = (found == 0) & (n_linear < blocks_total)
                 batch_idx = tl.where(is_match, b, batch_idx)
@@ -333,8 +339,7 @@ def la_bwd_dkdv_inner(
         dv_acc = tl.zeros([BLOCK_N, HEAD_DIM], dtype=tl.float32)
         dk_acc = tl.zeros([BLOCK_N, HEAD_DIM], dtype=tl.float32)
 
-        # Iterate over all Q m-blocks for this batch/head using pointer increments
-        num_m_blocks_total = (N_CTX_Q + BLOCK_M - 1) // BLOCK_M
+        # Iterate over all Q m-blocks for this batch/head using pointer increments (static)
         # Base absolute q row start for this batch
         q_start_abs = batch_idx * N_CTX_Q
         # Build base pointers once
@@ -367,7 +372,7 @@ def la_bwd_dkdv_inner(
         # Alignment hints
         qT_ptrs = tl.multiple_of(qT_ptrs, (16, 1))
         doT_ptrs = tl.multiple_of(doT_ptrs, (16, 1))
-        for _ in range(0, num_m_blocks_total):
+        for _ in tl.static_range(NUM_M_BLOCKS_TOTAL):
             q_tile_T = tl.load(qT_ptrs, mask=valid_kv)
             do_tile_T = tl.load(doT_ptrs, mask=valid_kv)
             m_rows = tl.load(m_ptrs, mask=(valid_kv & (offs_m < BLOCK_M)), other=-float("inf"))
@@ -460,6 +465,7 @@ def la_bwd_dq_inner(
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     CAUSAL: tl.constexpr,
+    MAX_N_BLOCKS_PER_BATCH_CONST: tl.constexpr,
 ):
     """
     Compute dQ by tiling over Q-blocks and streaming through all K/V tiles for
@@ -544,7 +550,7 @@ def la_bwd_dq_inner(
         else:
             # Ragged non-causal: derive per-batch block range from cumulative counts
             blocks_prev = 0
-            for b in range(0, B):
+            for b in tl.static_range(0, B):
                 blocks_total = tl.load(batch_num_block_n + b, mask=valid_q, other=0) if b > 0 else tl.load(batch_num_block_n, mask=valid_q, other=0)
                 if b == batch_idx:
                     num_n_blocks_per_batch = blocks_total - blocks_prev
@@ -574,13 +580,17 @@ def la_bwd_dq_inner(
         k_start_abs = b_seq_size_blocks * BLOCK_N
 
         # Stream across all K/V tiles for this batch/head
-        for _ in range(0, num_n_blocks_per_batch):
-            k_tile = tl.load(k_ptrs, mask=valid_q, other=0.0)
-            v_tile = tl.load(v_ptrs, mask=valid_q, other=0.0)
+        for it in tl.static_range(0, MAX_N_BLOCKS_PER_BATCH_CONST):
+            active = it < num_n_blocks_per_batch
+            # Mask loads by 'active' to avoid doing work on inactive iterations
+            mask_kv_iter = valid_q & active
+            k_tile = tl.load(k_ptrs, mask=mask_kv_iter, other=0.0)
+            v_tile = tl.load(v_ptrs, mask=mask_kv_iter, other=0.0)
 
             # Reconstruct logits and probabilities using exp2
             qk = tl.dot(q_tile, tl.trans(k_tile)) * sm_scale
             p = tl.math.exp2(qk * RCP_LN2 - m_rows[:, None] * RCP_LN2)
+            p = tl.where(active, p, 0.0)
 
             if CAUSAL:
                 mask = (q_start_abs + offs_m[:, None]) >= (k_start_abs + offs_n[None, :])
@@ -588,13 +598,17 @@ def la_bwd_dq_inner(
 
             # Form dS and accumulate contribution to dQ
             dp = tl.dot(do_tile, tl.trans(v_tile))
+            dp = dp * tl.where(active, 1.0, 0.0)
             ds = p * (dp - delta_rows[:, None])
             dq_acc += tl.dot(ds.to(k_tile.dtype), k_tile)
 
             # Advance pointers and absolute K start
-            k_ptrs += BLOCK_N * stride_kn
-            v_ptrs += BLOCK_N * stride_vn
-            k_start_abs += BLOCK_N
+            # Guard pointer increments with 'active' so we don't walk off valid range
+            inc_kn = tl.where(active, BLOCK_N * stride_kn, 0)
+            inc_vn = tl.where(active, BLOCK_N * stride_vn, 0)
+            k_ptrs += inc_kn
+            v_ptrs += inc_vn
+            k_start_abs += tl.where(active, BLOCK_N, 0)
 
         # Final scale and store dQ tile
         dq_acc = dq_acc * sm_scale
@@ -667,6 +681,9 @@ def la_bwd_fused_streamk(
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     CAUSAL: tl.constexpr,
+    NUM_M_BLOCKS_TOTAL: tl.constexpr,
+    MAX_TILES_PER_WG_KV_CONST: tl.constexpr,
+    MAX_N_BLOCKS_PER_BATCH_CONST: tl.constexpr,
 ):
     """
     Fused per-CTA kernel: execute dK/dV first, then dQ, to maximize data reuse and
@@ -677,6 +694,9 @@ def la_bwd_fused_streamk(
     offs_m = tl.arange(0, BLOCK_M)
     offs_n = tl.arange(0, BLOCK_N)
     offs_k = tl.arange(0, HEAD_DIM)
+
+    # print(f"max_tiles_per_wg_kv: {max_tiles_per_wg_kv}")
+    # print(f"max_tiles_per_wg_q: {max_tiles_per_wg_q}")
 
     # Phase 1: dK/dV in transposed domain
     la_bwd_dkdv_inner(
@@ -725,6 +745,8 @@ def la_bwd_fused_streamk(
         BLOCK_M=BLOCK_M,
         BLOCK_N=BLOCK_N,
         CAUSAL=CAUSAL,
+        MAX_TILES_PER_WG_KV_CONST=MAX_TILES_PER_WG_KV_CONST,
+        NUM_M_BLOCKS_TOTAL=NUM_M_BLOCKS_TOTAL,
     )
 
     # Phase 2: dQ (Q-streaming)
@@ -770,6 +792,7 @@ def la_bwd_fused_streamk(
         BLOCK_M=BLOCK_M,
         BLOCK_N=BLOCK_N,
         CAUSAL=CAUSAL,
+        MAX_N_BLOCKS_PER_BATCH_CONST=MAX_N_BLOCKS_PER_BATCH_CONST,
     )
 
 
@@ -798,7 +821,7 @@ def persistent_lean_attention_bwd(
     """
     if config is None:
         # Use a minimal default to avoid external JSON dependency during tests
-        config = {"BLOCK_SIZE_M": 64, "BLOCK_SIZE_N": 64, "num_warps": 4, "waves_per_eu": 1}
+        config = {"BLOCK_SIZE_M": 128, "BLOCK_SIZE_N": 64, "num_warps": 4, "waves_per_eu": 1}
     # Resolve total programs (CTAs) preference: explicit arg > config > device
     total_programs_pref = None
     if num_programs is not None:
@@ -902,6 +925,7 @@ def persistent_lean_attention_bwd(
     # Q scheduling (tiles are Q m-blocks × heads × batches)
     num_m_blocks_total = (N_CTX_Q + BLOCK_M - 1) // BLOCK_M
     total_tiles_q = batch_size * H * num_m_blocks_total
+    # print("total_kv_tiles: ", total_tiles_q)
     max_tiles_per_wg_q = (total_tiles_q + total_programs - 1) // total_programs
     high_load_wgs_q = total_tiles_q - ((max_tiles_per_wg_q - 1) * total_programs)
 
@@ -940,10 +964,13 @@ def persistent_lean_attention_bwd(
         BLOCK_M=BLOCK_M,
         BLOCK_N=BLOCK_N,
         CAUSAL=causal,
+        MAX_TILES_PER_WG_KV_CONST=max_tiles_per_wg_kv,
+        MAX_N_BLOCKS_PER_BATCH_CONST=num_n_blocks,
         num_warps=config["num_warps"],
         waves_per_eu=config["waves_per_eu"],
         num_stages=1,
         num_ctas=1,
+        NUM_M_BLOCKS_TOTAL=num_m_blocks_total,
     )
     print(f"la bwd kernel {la_bwd_kernel.n_regs} registers used, {la_bwd_kernel.n_spills} spills")
     return

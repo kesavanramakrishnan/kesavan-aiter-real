@@ -51,35 +51,39 @@ def _get_config(
         config.copy()
     )  # return a copy to avoid mutation of stored config in LRU cache
 
+
 def persistent_lean_attention(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    Mp: torch.Tensor,
-    Lp: torch.Tensor,
-    Op: torch.Tensor,
-    locks: torch.Tensor,
-    batch_num_block_n: torch.Tensor,
+    q: torch.Tensor,  # (B * seq_len_q, H, d)
+    k: torch.Tensor,  # (total_seq_len_k, H, d) -> supports ragged batching
+    v: torch.Tensor,  # (total_seq_len_k, H, d)
+    Mp: torch.Tensor,  # temp buffer to store partial max during sm
+    Lp: torch.Tensor,  # temp buffer to store partial se during sm
+    Op: torch.Tensor,  # (total_programs, n_ctx_q, d)
+    locks: torch.Tensor,  # (H, seq_len_q) -> used to synchronize blocks
+    batch_num_block_n: torch.Tensor,  # (B) -> cumulative sum of BLOCK_N
     batch_size: int,
     sm_scale: torch.float16,
-    causal: bool = True,
+    causal: bool = True,  # causal masking
     config: Optional[dict] = None,
-    lse_out: Optional[torch.Tensor] = None,  # NEW
+    return_lse: bool = False,
 ):
-    ...
+    """
+    Lean Attention kernel.
+    """
+    _LOGGER.info(
+        f"LEAN_ATTEN_PAGED: q={tuple(q.shape)}  k={tuple(k.shape)}  v={tuple(v.shape)} Mp={tuple(Mp.shape)} Lp={tuple(Lp.shape)}  Op={tuple(Op.shape)}"
+    )
     if config is None:
         config = _get_config(causal=causal, batch_size=batch_size)
-
-    # NEW: allocate LSE buffer if not provided; shape matches [B*Seqlen_q, H]
-    if lse_out is None:
-        lse_out = torch.empty((q.shape[0], q.shape[1]),
-                              dtype=torch.float32, device=q.device)
-
     sm_count = arch_info.get_num_sms()
 
     return _persistent_lean_attention(
-        q=q, k=k, v=v,
-        Mp=Mp, Lp=Lp, Op=Op,
+        q=q,
+        k=k,
+        v=v,
+        Mp=Mp,
+        Lp=Lp,
+        Op=Op,
         locks=locks,
         batch_num_block_n=batch_num_block_n,
         total_programs=sm_count,
@@ -91,9 +95,8 @@ def persistent_lean_attention(
         num_warps=config["num_warps"],
         waves_per_eu=config["waves_per_eu"],
         config=config,
-        lse_out=lse_out,  # NEW
+        return_lse=return_lse,
     )
-
 
 
 # Support tensor in [B, Seqlen, H, d] format. Taking tensors in [B*Seqlen, H, d] as inputs
@@ -115,7 +118,7 @@ def _persistent_lean_attention(
     num_warps: int,
     waves_per_eu: int,
     config: dict = {},
-    lse_out: torch.Tensor = None,
+    return_lse: bool = False,
 ):
     """
     Inner kernel launching function.
@@ -125,7 +128,8 @@ def _persistent_lean_attention(
     assert (
         HEAD_DIM_Q == HEAD_DIM_K and HEAD_DIM_K == HEAD_DIM_V
     ), "Incompatible Q/K/V Hidden Dimensions"
-    assert HEAD_DIM_K in {16, 32, 64, 128, 256}
+    # print(f"HEAD_DIM_K={HEAD_DIM_K}")
+    assert HEAD_DIM_K in {16, 32, 56, 64, 128, 256}
 
     # MASKED_BLOCKS is used for prefill/causal for BLOCK_M > BLOCK_N
     # For MI300, BLOCK_M=128, BLOCK_N=64 is better for performance
@@ -138,9 +142,16 @@ def _persistent_lean_attention(
 
     N_CTX_Q = q.shape[0] // batch_size
     N_CTX_K = k.shape[0]  # This is the sum of all ctx_n in a batch
-    H = q.shape[1]
+    H_Q = q.shape[1]
 
     qk_scale = sm_scale * LOG_TWO_E
+
+    # Determine KV heads for GQA
+    H_K = k.shape[1]
+    assert (
+        H_Q % H_K == 0
+    ), "For GQA, the number of Q heads must be divisible by K/V heads"
+    GQA_GROUP_SIZE = H_Q // H_K
 
     (
         num_m_blocks,
@@ -156,20 +167,20 @@ def _persistent_lean_attention(
         batch_size,
         N_CTX_Q,
         N_CTX_K,
-        H,
-        H,
+        H_Q,  # number of query heads
+        H_K,  # number of key/value heads
         BLOCK_M,
         BLOCK_N,
         total_programs,
     )
 
-    print(
-        f"high_load_wgs={high_load_wgs}, max_tiles_per_wg={max_tiles_per_wg}, tiles_per_head={tiles_per_head}"
-    )
-    print(
-        f"total_programs={total_programs}, num_splits={num_splits}, even_split={even_split}"
-    )
-    print(f"num_m_blocks={num_m_blocks}, num_n_blocks={num_n_blocks}")
+    # print(
+    #     f"high_load_wgs={high_load_wgs}, max_tiles_per_wg={max_tiles_per_wg}, tiles_per_head={tiles_per_head}"
+    # )
+    # print(
+    #     f"total_programs={total_programs}, num_splits={num_splits}, even_split={even_split}"
+    # )
+    # print(f"num_m_blocks={num_m_blocks}, num_n_blocks={num_n_blocks}")
 
     max_output_tile_cnt = calculate_max_output_tiles_analytically(
         tiles_per_head=tiles_per_head,
@@ -186,6 +197,10 @@ def _persistent_lean_attention(
     grid = (total_programs, 1, 1)
 
     o = torch.empty_like(q, dtype=v.dtype)
+    lse = None
+    if return_lse:
+        # LSE must have one row per query token across the full batch (matches q.shape[0])
+        lse = torch.empty((q.shape[0], H_Q), dtype=torch.float32, device=q.device)
 
     """
     kernel_timing = {
@@ -199,31 +214,58 @@ def _persistent_lean_attention(
     kernel_timing["attn_fwd"]["start_event"].record()
     """
     la_kernel = la_persistent[grid](
-        False, 0,
-        q, k, v, qk_scale,
-        Mp, Lp, Op,
+        False,
+        0,
+        q,
+        k,
+        v,
+        qk_scale,
+        Mp,
+        Lp,
+        Op,
         o,
-        lse_out,
-        batch_num_block_n, locks,
-        q.stride(0), q.stride(1), q.stride(2),
-        k.stride(0), k.stride(1), k.stride(2),
-        v.stride(0), v.stride(1), v.stride(2),
-        o.stride(0), o.stride(1), o.stride(2),
-        Op.stride(0), Op.stride(1), Op.stride(2),
-        # NEW: LSE strides (m, h)
-        lse_out.stride(0),  # stride_lsem
-        lse_out.stride(1),  # stride_lseh
+        lse if return_lse else torch.empty(1, device=q.device, dtype=torch.float32),
+        batch_num_block_n,
+        locks,
+        q.stride(0),  # N_CTX_Q
+        q.stride(1),  # H
+        q.stride(2),  # Head_Dim
+        k.stride(0),
+        k.stride(1),
+        k.stride(2),
+        v.stride(0),
+        v.stride(1),
+        v.stride(2),
+        o.stride(0),
+        o.stride(1),
+        o.stride(2),
+        (lse.stride(0) if return_lse else 0),
+        (lse.stride(1) if return_lse else 0),
+        Op.stride(0),  # total_programs
+        Op.stride(1),  # n_ctx_q
+        Op.stride(2),  # head_dim
         HEAD_DIM=HEAD_DIM_K,
-        BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N,
+        BLOCK_M=BLOCK_M,
+        BLOCK_N=BLOCK_N,
         MASKED_BLOCKS=MASKED_BLOCKS,
-        batch_size=batch_size, causal=causal,
-        num_m_blocks=num_m_blocks, num_n_blocks=num_n_blocks,
-        high_load_wgs=high_load_wgs, max_tiles_per_wg=max_tiles_per_wg,
-        tiles_per_head=tiles_per_head, num_splits=num_splits,
+        batch_size=batch_size,
+        causal=causal,
+        num_m_blocks=num_m_blocks,
+        num_n_blocks=num_n_blocks,
+        # leanAttention params
+        high_load_wgs=high_load_wgs,
+        max_tiles_per_wg=max_tiles_per_wg,
+        tiles_per_head=tiles_per_head,
+        num_splits=num_splits,
         max_output_tile_cnt=max_output_tile_cnt,
-        waves_per_eu=waves_per_eu, num_warps=num_warps,
-        num_stages=1, num_ctas=1,
-        **config,
+        # Triton launch meta-parameters
+        num_warps=num_warps,
+        num_stages=1,
+        num_heads_q=H_Q,
+        num_heads_k=H_K,
+        gqa_group_size=GQA_GROUP_SIZE,
+        store_lse=return_lse,
+        ln_2=(1.0 / LOG_TWO_E),
     )
     """
     kernel_timing["attn_fwd"]["end_event"].record()
@@ -235,6 +277,8 @@ def _persistent_lean_attention(
     """
     # print(f"la kernel {la_kernel.n_regs} registers used, {la_kernel.n_spills} spills")
     ms = 0
+    if return_lse:
+        return o, lse, ms
     return o, ms
 
 
@@ -243,8 +287,8 @@ def get_num_splits_and_buffer_sizes(
     batch_size,
     max_seqlen_q,
     max_seqlen_k,
-    num_heads,
-    num_heads_k,
+    num_heads,  # number of query heads (H_Q)
+    num_heads_k,  # number of key/value heads (H_K)
     BLOCK_M,
     BLOCK_N,
     num_SMs,
@@ -257,8 +301,7 @@ def get_num_splits_and_buffer_sizes(
     num_m_blocks = (max_seqlen_q + BLOCK_M - 1) // BLOCK_M
     num_n_blocks = (max_seqlen_k + BLOCK_N - 1) // BLOCK_N
 
-    # TODO: Support Grouped-Query Attention
-    max_seqlen_q = max_seqlen_q * num_heads // num_heads_k
+    # GQA: tiles are produced per Q head; KV heads only affect data indexing, not total tile count per head.
 
     # print(f"block_m: {BLOCK_M}, block_n: {BLOCK_N} ")
     # print(f"num_m_block: {num_m_blocks}, num_n_block: {num_n_blocks} ")
@@ -279,7 +322,8 @@ def get_num_splits_and_buffer_sizes(
         # Decode or Not Causal
         tiles_per_head = num_m_blocks * num_n_blocks
 
-    total_tiles = tiles_per_head * num_heads_k  # Total tiles across all heads
+    # Total tiles across all query heads
+    total_tiles = tiles_per_head * num_heads
 
     # StreamK Lean has as many threadblocks as SMs
     # This should be a function of tile size and number of scratchpad space
@@ -315,7 +359,8 @@ def get_num_splits_and_buffer_sizes(
     high_load_tbs = total_tiles - ((max_tiles_per_tb - 1) * lean_griddimz)
 
     # Needed for causal. This is (per batch n_ctx) // BLOCK_N
-    num_n_blocks = num_n_blocks // batch_size
+    if causal:
+        num_n_blocks = num_n_blocks // batch_size
 
     return (
         num_m_blocks,
@@ -516,26 +561,55 @@ def _attention_inner(
 
 @triton.jit
 def la_persistent(
-    is_pod, pod_pid,
-    Q, K, V, qk_scale,
-    Mp, Lp, Op,
+    is_pod,
+    pod_pid,
+    Q,
+    K,
+    V,
+    qk_scale,
+    Mp,
+    Lp,
+    Op,
     Out,
-    LSE,                       # NEW
-    batch_num_block_n, locks,
-    stride_qm, stride_qh, stride_qk,
-    stride_kn, stride_kh, stride_kk,
-    stride_vn, stride_vh, stride_vk,
-    stride_om, stride_oh, stride_on,
-    stride_oph, stride_opm, stride_opn,
-    stride_lsem, stride_lseh,  # NEW
+    LSE,
+    batch_num_block_n,
+    locks,
+    stride_qm,  # n_ctx_q
+    stride_qh,  # Head
+    stride_qk,  # head_dim
+    stride_kn,
+    stride_kh,
+    stride_kk,
+    stride_vn,
+    stride_vh,
+    stride_vk,
+    stride_om,  # n_ctx_q
+    stride_oh,  # Head
+    stride_on,  # head_dim
+    stride_lsem,  # n_ctx_q for LSE
+    stride_lseh,  # Head for LSE
+    stride_oph,  # total_programs
+    stride_opm,  # n_ctx_q
+    stride_opn,  # head_dim
     HEAD_DIM: tl.constexpr,
-    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
     MASKED_BLOCKS: tl.constexpr,
-    batch_size: tl.constexpr, causal: tl.constexpr,
-    num_m_blocks: tl.constexpr, num_n_blocks: tl.constexpr,
-    high_load_wgs: tl.constexpr, max_tiles_per_wg: tl.constexpr,
-    tiles_per_head: tl.constexpr, num_splits: tl.constexpr,
+    batch_size: tl.constexpr,
+    causal: tl.constexpr,
+    num_m_blocks: tl.constexpr,
+    num_n_blocks: tl.constexpr,
+    # leanAttention params
+    high_load_wgs: tl.constexpr,
+    max_tiles_per_wg: tl.constexpr,
+    tiles_per_head: tl.constexpr,
+    num_splits: tl.constexpr,
     max_output_tile_cnt: tl.constexpr,
+    num_heads_q: tl.constexpr,
+    num_heads_k: tl.constexpr,
+    gqa_group_size: tl.constexpr,
+    store_lse: tl.constexpr,
+    ln_2,
 ):
     if is_pod:
         current_pid = pod_pid
@@ -570,21 +644,55 @@ def la_persistent(
     for i in tl.static_range(max_output_tile_cnt + 1):
         if iter < cta_end_tile_gid:
             iter = la_persistent_inner(
-                Q, K, V, qk_scale, Mp, Lp, Op, Out,
-                LSE,                          # NEW
-                batch_num_block_n, locks,
-                stride_qm, stride_qh, stride_qk,
-                stride_kn, stride_kh, stride_kk,
-                stride_vn, stride_vh, stride_vk,
-                stride_om, stride_oh, stride_on,
-                stride_oph, stride_opm, stride_opn,
-                stride_lsem, stride_lseh,      # NEW
-                iter=iter, cta_end_tile_gid=cta_end_tile_gid, current_pid=current_pid,
-                HEAD_DIM=HEAD_DIM, BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N,
-                MASKED_BLOCKS=MASKED_BLOCKS, batch_size=batch_size, causal=causal,
-                num_m_blocks=num_m_blocks, num_n_blocks=num_n_blocks,
-                high_load_wgs=high_load_wgs, max_tiles_per_wg=max_tiles_per_wg,
-                tiles_per_head=tiles_per_head, num_splits=num_splits,
+                Q,
+                K,
+                V,
+                qk_scale,
+                Mp,
+                Lp,
+                Op,
+                Out,
+                LSE,
+                batch_num_block_n,
+                locks,
+                stride_qm,  # n_ctx_q
+                stride_qh,  # Head
+                stride_qk,  # head_dim
+                stride_kn,
+                stride_kh,
+                stride_kk,
+                stride_vn,
+                stride_vh,
+                stride_vk,
+                stride_om,  # n_ctx_q
+                stride_oh,  # Head
+                stride_on,  # head_dim
+                stride_lsem,
+                stride_lseh,
+                stride_oph,  # total_programs
+                stride_opm,  # n_ctx_q
+                stride_opn,  # head_dim
+                iter=iter,
+                cta_end_tile_gid=cta_end_tile_gid,
+                current_pid=current_pid,
+                HEAD_DIM=HEAD_DIM,
+                BLOCK_M=BLOCK_M,
+                BLOCK_N=BLOCK_N,
+                MASKED_BLOCKS=MASKED_BLOCKS,
+                batch_size=batch_size,
+                causal=causal,
+                num_m_blocks=num_m_blocks,
+                num_n_blocks=num_n_blocks,
+                # leanAttention params
+                high_load_wgs=high_load_wgs,
+                max_tiles_per_wg=max_tiles_per_wg,
+                tiles_per_head=tiles_per_head,
+                num_splits=num_splits,
+                num_heads_q=num_heads_q,
+                num_heads_k=num_heads_k,
+                gqa_group_size=gqa_group_size,
+                store_lse=store_lse,
+                ln_2=ln_2,
             )
 
 
@@ -613,11 +721,11 @@ def la_persistent_inner(
     stride_om,  # n_ctx_q
     stride_oh,  # Head
     stride_on,  # head_dim
+    stride_lsem,
+    stride_lseh,
     stride_oph,  # total_programs
     stride_opm,  # n_ctx_q
     stride_opn,  # head_dim
-    stride_lsem, 
-    stride_lseh,
     iter,
     cta_end_tile_gid,
     current_pid,
@@ -634,6 +742,11 @@ def la_persistent_inner(
     max_tiles_per_wg: tl.constexpr,
     tiles_per_head: tl.constexpr,
     num_splits: tl.constexpr,
+    num_heads_q: tl.constexpr,
+    num_heads_k: tl.constexpr,
+    gqa_group_size: tl.constexpr,
+    store_lse: tl.constexpr,
+    ln_2,
 ):
 
     tl.assume(stride_qm > 0)  # n_ctx_q
@@ -656,6 +769,7 @@ def la_persistent_inner(
     # while iter < cta_end_tile_gid:
     # Calculate index of current head output tile
     # The tiles_per_head is the sum of # BLOCK_N in K/V sequence of all batches
+    # Q head index for this output tile
     tile_head_idx = iter // tiles_per_head
     # To generate an otuput tile, a loop over [tile_iter, tile_iter_end) lean tiles is needed
     # [tile_iter, tile_iter_end) are in the form of global tile id
@@ -681,23 +795,29 @@ def la_persistent_inner(
             tile_head_idx * batch_size + tile_batch_idx
         ) * num_m_blocks + per_head_tile_idx
     else:
-        tile_idx = (
-            tile_head_idx * batch_size
-        )  # Output tile idx, 1 output tile per head per batch
-        tile_iter = tile_head_idx * tiles_per_head
-        if batch_size == 1:
-            req_size = tiles_per_head
-        else:
-            req_size = tl.load(batch_num_block_n)
-        tile_iter_end = tile_iter + req_size
+        head_start = tile_head_idx * tiles_per_head
+        local_head_iter = iter - head_start
+        total_n_blocks = num_n_blocks
+        # Identify M-block for this head using total_n_blocks across all batches
+        m_block_idx = local_head_iter // total_n_blocks
+        n_block_total = local_head_iter - m_block_idx * total_n_blocks
+        # Determine batch slice for this n_block_total using cumulative sums
+        prev_cum = 0
+        cur_cum = tl.load(batch_num_block_n)
+        tile_batch_idx = 0
         for b in range(1, batch_size):
-            next_req_size = tl.load(batch_num_block_n + b)
-            local_head_iter = iter % tiles_per_head
-            if (local_head_iter < next_req_size) and (local_head_iter >= req_size):
-                tile_iter = tile_iter + req_size
-                tile_idx = tile_idx + b
-                tile_iter_end = tile_iter + (next_req_size - req_size)
-            req_size = next_req_size
+            cond = n_block_total >= cur_cum
+            prev_cum = tl.where(cond, cur_cum, prev_cum)
+            next_cum = tl.load(batch_num_block_n + b)
+            cur_cum = tl.where(cond, next_cum, cur_cum)
+            tile_batch_idx = tl.where(cond, tile_batch_idx + 1, tile_batch_idx)
+        # Per-batch n index within this M-block
+        local_n_in_batch = n_block_total - prev_cum
+        tile_idx = tile_head_idx * batch_size + tile_batch_idx
+        # Start and end global lean-tile ids for this output tile (one M-block for one batch)
+        tile_iter = head_start + m_block_idx * total_n_blocks + prev_cum
+        batch_req_blocks = cur_cum - prev_cum
+        tile_iter_end = tile_iter + batch_req_blocks
     # Local lean tile ID within a loop of an output tile
     local_iter = iter - tile_iter
     local_iter_end = tl.minimum(tile_iter_end, cta_end_tile_gid) - tile_iter
@@ -719,22 +839,28 @@ def la_persistent_inner(
     if causal:
         b_seq_size = tile_batch_idx * num_n_blocks
     else:
-        tile_batch_idx = tile_idx % batch_size
+        # For non-causal, b_seq_size is previous batch cumulative blocks within this head
         b_seq_size = 0
         if tile_batch_idx > 0:
-            b_seq_size = tl.load(
-                batch_num_block_n + tile_batch_idx - 1
-            )  # Previous batch size
+            b_seq_size = tl.load(batch_num_block_n + tile_batch_idx - 1)
 
+    # For non-causal, map the 1D local_iter into (m_block_idx, n_block_idx)
+    if not causal:
+        n_block_idx = iter - tile_iter
+    else:
+        n_block_idx = 0
+
+    # Map Q head to KV head for GQA
+    tile_khead_idx = tile_head_idx // gqa_group_size
     k_offs = (
-        (b_seq_size + local_iter) * BLOCK_N * stride_kn
-        + tile_head_idx * stride_kh
+        (b_seq_size + (n_block_idx if not causal else local_iter)) * BLOCK_N * stride_kn
+        + tile_khead_idx * stride_kh
         + offs_n[None, :] * stride_kn
         + offs_k[:, None] * stride_kk
     )
     v_offs = (
-        (b_seq_size + local_iter) * BLOCK_N * stride_vn
-        + tile_head_idx * stride_vh
+        (b_seq_size + (n_block_idx if not causal else local_iter)) * BLOCK_N * stride_vn
+        + tile_khead_idx * stride_vh
         + offs_n[:, None] * stride_vn
         + offs_k[None, :] * stride_vk
     )
@@ -748,8 +874,8 @@ def la_persistent_inner(
         q_idx = per_head_tile_idx + tile_batch_idx * num_m_blocks
         q_start_m = q_idx * BLOCK_M
     else:
-        q_idx = tile_batch_idx
-        q_start_m = 0
+        q_idx = tile_batch_idx * num_m_blocks + m_block_idx
+        q_start_m = q_idx * BLOCK_M
 
     q_offs = (
         q_idx * BLOCK_M * stride_qm
@@ -923,16 +1049,14 @@ def la_persistent_inner(
         tl.store(o_ptrs0, acc0.to(Out.type.element_ty))
         tl.store(o_ptrs1, acc1.to(Out.type.element_ty))
 
-        ln2 = tl.log(tl.full([1], 2.0, tl.float32))  # scalar ln(2)
-        lse = tl.math.log(l_i) + m_i * ln2
-
-        lse_ptrs = (
-            LSE
-            + (q_idx * BLOCK_M) * stride_lsem
-            + tile_head_idx * stride_lseh
-            + offs_m * stride_lsem
-        )
-        tl.store(lse_ptrs, lse)  # keep fp32 for numerical stability
+        if store_lse:
+            lse_vals = m_i * ln_2 + tl.log(l_i)
+            lse_ptrs = (
+                LSE
+                + (q_idx * BLOCK_M + offs_m) * stride_lsem
+                + tile_head_idx * stride_lseh
+            )
+            tl.store(lse_ptrs, lse_vals)
 
     # update iter
     iter = iter + (local_iter_end - local_iter)

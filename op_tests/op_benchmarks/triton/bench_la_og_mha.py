@@ -9,7 +9,7 @@ import triton
 from bisect import bisect_right
 
 # Import both attention functions
-from aiter.ops.triton.lean_atten_lse import persistent_lean_attention, _get_config
+from aiter.ops.triton.lean_atten import persistent_lean_attention
 from aiter.ops.triton.mha import flash_attn_func
 from aiter.ops.triton.utils import arch_info
 
@@ -111,33 +111,35 @@ def calculate_max_output_tiles_analytically(
         max_total_output_tiles = max(max_total_output_tiles, total_output_tiles_for_wg)
     return max_total_output_tiles
 
-# --- Unified Benchmark Configuration with GQA (H_Q, H_K) ---
+# --- Unified Benchmark Configuration ---
 
 configs = []
-# Common comparison set. We include both MHA (only when H_Q == H_K) and Lean (supports GQA).
+# We define a common set of parameters for an apples-to-apples comparison.
+# The `provider` will switch between 'lean' and 'mha'.
 configs.append(
     triton.testing.Benchmark(
-        x_names=["CAUSAL", "BATCH", "H_Q", "H_K", "SEQLEN_Q", "SEQLEN_K", "HEAD_SZ"],
+        x_names=["CAUSAL", "BATCH", "NUM_HEADS", "SEQLEN_Q", "SEQLEN_K", "HEAD_SZ"],
         x_vals=[
-            # (True, 1, 32, 8, 8192, 8192, 128),
-            # (True, 1, 64, 8, 8192, 8192, 128),
-            # (True, 1, 128, 8, 8192, 8192, 128),
-            # (True, 1, 128, 128, 8192, 8192, 56),
-            (False, 1, 64, 64, 128, 16384, 128),
-            (False, 1, 96, 96, 128, 32768, 128),
-            (True, 1, 64, 64, 8192, 8192, 128),
-            (True, 2, 64, 64, 8192, 8192, 128),
-            (True, 1, 64, 64, 16384, 16384, 128),
-            # # GQA variants for Lean path
-            # (False, 1, 64, 16, 8192, 8192, 128),  # group size 4
-            # (False, 2, 64, 32, 4096, 4096, 128),  # group size 2
-            # (False, 2, 64, 16, 4096, 2048, 128),  # ragged decode
+            # (True, 1, 64, 8192, 8192, 128),
+            # (True, 2, 64, 8192, 8192, 128),
+            # (True, 2, 64, 16384, 16384, 128),
+            # (False, 2, 64, 8192, 8192, 128),
+            # (False, 2, 64, 16384, 16384, 128),
+            (False, 1, 64, 128, 16384, 128),
+            (False, 1, 96, 128, 32768, 128),
+            (True, 1, 64, 8192, 8192, 128),
+            (True, 2, 64, 8192, 8192, 128),
+            (True, 1, 64, 16384, 16384, 128),
+            # (False, 2, 48, 16384, 8192, 128),
+            # Add other configurations here for comparison
+            # (True, 1, 64, 4096, 4096, 128),
+            # (True, 4, 32, 2048, 2048, 64),
         ],
         line_arg="provider",
         line_vals=["lean", "mha"],
         line_names=["Lean Attn (ms)", "MHA (ms)"],
         ylabel="ms",
-        plot_name="attention-comparison-gqa",
+        plot_name="attention-comparison",
         args={},
     )
 )
@@ -146,8 +148,7 @@ configs.append(
 def bench_attention(
     CAUSAL,
     BATCH,
-    H_Q,
-    H_K,
+    NUM_HEADS,
     SEQLEN_Q,
     SEQLEN_K,
     HEAD_SZ,
@@ -179,18 +180,14 @@ def bench_attention(
             list_sum_block_n.append(len_sum)
         batch_num_block_n = torch.tensor(list_sum_block_n, device=device, dtype=torch.int32)
 
-        # Allocate LA tensors (GQA-aware)
-        q = torch.randn((SEQLEN_Q * BATCH, H_Q, HEAD_SZ), dtype=init_dtype, device=device)
-        k = torch.randn((sum_n_ctx, H_K, HEAD_SZ), dtype=init_dtype, device=device)
-        v = torch.randn((sum_n_ctx, H_K, HEAD_SZ), dtype=init_dtype, device=device)
+        # Allocate LA tensors (different shapes than MHA)
+        q = torch.randn((SEQLEN_Q * BATCH, NUM_HEADS, HEAD_SZ), dtype=init_dtype, device=device)
+        k = torch.randn((sum_n_ctx, NUM_HEADS, HEAD_SZ), dtype=init_dtype, device=device)
+        v = torch.randn((sum_n_ctx, NUM_HEADS, HEAD_SZ), dtype=init_dtype, device=device)
         Mp = torch.empty((sm_count, SEQLEN_Q), device=device, dtype=torch.float32)
         Lp = torch.empty((sm_count, SEQLEN_Q), device=device, dtype=torch.float32)
         Op = torch.empty((sm_count, SEQLEN_Q, HEAD_SZ), device=device, dtype=torch.float32)
         locks = torch.zeros((sm_count,), device=device, dtype=torch.int32)
-
-        # Pull default config and override H_Q/H_K so kernel reads heads from config
-        la_config = _get_config(causal=CAUSAL, batch_size=BATCH)
-        la_config["H_Q"], la_config["H_K"] = H_Q, H_K
 
         fn = lambda: persistent_lean_attention(
             q=q,
@@ -204,17 +201,16 @@ def bench_attention(
             batch_size=BATCH,
             sm_scale=sm_scale,
             causal=CAUSAL,
-            config=la_config,
-            return_lse=False,
         )
 
     elif provider == 'mha':
-        # --- MHA BASELINE (requires H_Q == H_K) ---
-        if H_Q != H_K:
-            return 0.0
-        q = torch.randn((BATCH, SEQLEN_Q, H_Q, HEAD_SZ), dtype=init_dtype, device=device)
-        k = torch.randn((BATCH, SEQLEN_K, H_Q, HEAD_SZ), dtype=init_dtype, device=device)
-        v = torch.randn((BATCH, SEQLEN_K, H_Q, HEAD_SZ), dtype=init_dtype, device=device)
+        # --- MHA SETUP ---
+        # MHA uses standard uniform tensors
+        q = torch.randn((BATCH, SEQLEN_Q, NUM_HEADS, HEAD_SZ), dtype=init_dtype, device=device)
+        k = torch.randn((BATCH, SEQLEN_K, NUM_HEADS, HEAD_SZ), dtype=init_dtype, device=device)
+        v = torch.randn((BATCH, SEQLEN_K, NUM_HEADS, HEAD_SZ), dtype=init_dtype, device=device)
+
+        # MHA function has a simpler interface
         fn = lambda: flash_attn_func(q, k, v, causal=CAUSAL)
 
     # Run the benchmark for the selected provider

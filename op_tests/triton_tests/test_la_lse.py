@@ -19,7 +19,8 @@ def get_lean_attn_inputs(
     n_ctx_q: int,
     n_ctx: List[int],
     block_n: int,
-    h: int,
+    h_q: int,
+    h_k: int,
     d: int,
     total_programs: int,
     init_dtype: Union[torch.dtype, str],
@@ -30,13 +31,13 @@ def get_lean_attn_inputs(
     except ValueError:
         print(f"N_CTX contains non-numeric values: {n_ctx}")
     # Allocate Tensors
-    q = torch.empty((n_ctx_q * batch, h, d), dtype=init_dtype, device="cuda").normal_(
+    q = torch.empty((n_ctx_q * batch, h_q, d), dtype=init_dtype, device="cuda").normal_(
         mean=0.0, std=0.5
     )
-    k = torch.empty((sum_n_ctx, h, d), dtype=init_dtype, device="cuda").normal_(
+    k = torch.empty((sum_n_ctx, h_k, d), dtype=init_dtype, device="cuda").normal_(
         mean=0.0, std=0.5
     )
-    v = torch.empty((sum_n_ctx, h, d), dtype=init_dtype, device="cuda").normal_(
+    v = torch.empty((sum_n_ctx, h_k, d), dtype=init_dtype, device="cuda").normal_(
         mean=0.0, std=0.5
     )
 
@@ -67,64 +68,131 @@ def get_lean_attn_inputs(
 
 
 def reference_attention(q, k, v, n_ctx, n_ctx_q, sm_scale, causal):
-    # LSE: NEW — allocate reference LSE buffer [B*Seqlen_q, H]
-    ref_lse = torch.empty((q.shape[0], q.shape[1]), dtype=torch.float32, device=q.device)
 
+    # Calculate Pytorch reference output with GQA mapping
     ref_out = torch.empty_like(q, dtype=q.dtype)
     start = 0
     start_q = 0
 
     for b in n_ctx:
-        qb = q[start_q : (start_q + int(n_ctx_q)), :, :]
-        qb_reshaped = qb.transpose(0, 1)            # [H, n_ctx_q, d]
-        kb = k[start : (start + int(b)), :, :]
-        kb_reshaped = kb.transpose(0, 1)            # [H, b, d]
-        vb = v[start : (start + int(b)), :, :]
-        vb_reshaped = vb.transpose(0, 1)            # [H, b, d]
+        qb = q[start_q : (start_q + int(n_ctx_q)), :, :]  # [n_ctx_q, H_Q, d]
+        kb = k[start : (start + int(b)), :, :]  # [b, H_K, d]
+        vb = v[start : (start + int(b)), :, :]  # [b, H_K, d]
 
-        logits = torch.matmul(qb_reshaped, kb_reshaped.transpose(-2, -1)) * sm_scale   # [H, n_ctx_q, b]
-        if causal:
-            M = torch.tril(torch.ones((n_ctx_q, b), device=q.device))
-            mask = M == 0
-            logits[:, mask] = float("-inf")
+        H_Q = qb.shape[1]
+        H_K = kb.shape[1]
+        assert H_Q % H_K == 0
+        group_size = H_Q // H_K
 
-        # LSE: NEW — natural-log logsumexp over K-dim
-        lse = torch.logsumexp(logits.float(), dim=-1)      # [H, n_ctx_q]
-        ref_lse[start_q : (start_q + int(n_ctx_q)), :] = lse.transpose(0, 1)  # -> [n_ctx_q, H]
+        out_b = torch.empty_like(qb)
+        for hq in range(H_Q):
+            hk = hq // group_size
+            qh = qb[:, hq, :]  # [n_ctx_q, d]
+            kh = kb[:, hk, :]  # [b, d]
+            vh = vb[:, hk, :]  # [b, d]
+            scores = (qh @ kh.T) * sm_scale  # [n_ctx_q, b]
+            if causal:
+                M = torch.tril(torch.ones((n_ctx_q, b), device=qh.device, dtype=torch.bool))
+                scores = scores.masked_fill(~M, float("-inf"))
+            probs = torch.softmax(scores.float(), dim=-1).to(q.dtype)  # [n_ctx_q, b]
+            out_h = probs @ vh  # [n_ctx_q, d]
+            out_b[:, hq, :] = out_h
 
-        p = torch.softmax(logits.float(), dim=-1).to(q.dtype)
-        refb = torch.matmul(p, vb_reshaped)                # [H, n_ctx_q, d]
-        ref_out[start_q : (start_q + int(n_ctx_q)), :, :] = refb.transpose(0, 1)
+        ref_out[start_q : (start_q + int(n_ctx_q)), :, :] = out_b
+        start += b
+        start_q += n_ctx_q
+    return ref_out
+
+
+def reference_lse(q, k, n_ctx, n_ctx_q, sm_scale, causal):
+    # Natural-log sum-exp per row per Q head with GQA mapping
+    ref_lse = torch.empty((q.shape[0], q.shape[1]), dtype=torch.float32, device=q.device)
+    start = 0
+    start_q = 0
+
+    for b in n_ctx:
+        qb = q[start_q : (start_q + int(n_ctx_q)), :, :]  # [n_ctx_q, H_Q, d]
+        kb = k[start : (start + int(b)), :, :]  # [b, H_K, d]
+
+        H_Q = qb.shape[1]
+        H_K = kb.shape[1]
+        assert H_Q % H_K == 0
+        group_size = H_Q // H_K
+
+        for hq in range(H_Q):
+            hk = hq // group_size
+            qh = qb[:, hq, :]  # [n_ctx_q, d]
+            kh = kb[:, hk, :]  # [b, d]
+            scores = (qh @ kh.T) * sm_scale  # [n_ctx_q, b]
+            if causal:
+                M = torch.tril(torch.ones((n_ctx_q, b), device=qh.device, dtype=torch.bool))
+                scores = scores.masked_fill(~M, float("-inf"))
+            lse_row = torch.logsumexp(scores.float(), dim=-1)  # [n_ctx_q]
+            ref_lse[start_q : (start_q + int(n_ctx_q)), hq] = lse_row
 
         start += b
         start_q += n_ctx_q
 
-    return ref_out, ref_lse
-
+    return ref_lse
 
 
 @pytest.mark.parametrize(
-    "causal, batch, h, n_ctx_q, n_ctx, d, total_programs, init_dtype, BLOCK_M, BLOCK_N, waves_per_eu, num_warps ",
+    "causal, batch, h_q, h_k, n_ctx_q, n_ctx, d, total_programs, init_dtype, BLOCK_M, BLOCK_N, waves_per_eu, num_warps ",
     [
-        (False, 2, 64, 128, [65536, 65536], 128, 304, torch.float16, 128, 64, 1, 4),
-        (False, 2, 64, 16, [65536, 65536], 128, 912, torch.float16, 16, 128, 3, 4),
-        (False, 1, 64, 16, [131072], 128, 912, torch.float16, 16, 128, 2, 4),
-        (False, 1, 64, 16, [262144], 64, 912, torch.float16, 16, 64, 2, 4),
-        (False, 1, 64, 16, [524288], 64, 912, torch.float16, 16, 64, 2, 4),
-        (False, 2, 96, 16, [32768, 32768], 128, 912, torch.float16, 16, 128, 2, 4),
-        (False, 1, 96, 16, [65536], 128, 912, torch.float16, 16, 128, 2, 4),
-        (False, 1, 96, 16, [131072], 128, 912, torch.float16, 16, 128, 2, 4),
-        (False, 1, 96, 16, [262144], 64, 912, torch.float16, 16, 64, 2, 4),
-        (False, 1, 96, 16, [524288], 16, 912, torch.float16, 16, 256, 1, 4),  #
-        (False, 1, 96, 16, [1048576], 16, 912, torch.float16, 16, 256, 1, 4),  #
-        (False, 1, 128, 16, [32768], 128, 912, torch.float16, 16, 128, 2, 4),
-        (False, 1, 128, 16, [65536], 128, 912, torch.float16, 16, 128, 2, 4),
-        (False, 1, 128, 16, [131072], 128, 912, torch.float16, 16, 128, 2, 4),
-        (False, 1, 128, 16, [262144], 64, 912, torch.float16, 16, 64, 2, 4),
-        (False, 1, 128, 16, [524288], 16, 912, torch.float16, 16, 256, 1, 4),  #
+        # (True, 1, 32, 8, 8192, [8192], 128, 304, torch.float16, 128, 64, 1, 4),
+        # (True, 1, 64, 8, 8192, [8192], 128, 304, torch.float16, 128, 64, 1, 4),
+        # (True, 1, 128, 8, 8192, [8192], 128, 304, torch.float16, 128, 64, 1, 4),
+        # # (True, 1, 128, 128, 8192, [8192], 64, 304, torch.float16, 128, 64, 1, 4),
+        # # (True, 1024, 64, 8, 8192, 8192, 128),
+        # # (True, 1024, 128, 8, 8192, 8192, 128),
+        # # (True, 1024, 128, 128, 8192, 8192, 56),
+        # # Baseline MHA (H_Q == H_K)
+        # (False, 1, 8, 8, 8192, [8192], 128, 304, torch.float16, 128, 64, 1, 4),
+        # # GQA group size 4: 8Q -> 2KV
+        # (False, 1, 8, 2, 8192, [8192], 128, 304, torch.float16, 128, 64, 1, 4),
+        # (True, 1, 8, 2, 8192, [8192], 128, 304, torch.float16, 128, 64, 1, 4),
+        # # GQA group size 2: 16Q -> 8KV
+        # (False, 1, 16, 8, 8192, [8192], 128, 304, torch.float16, 128, 64, 1, 4),
+        # # Smaller ctx
+        # (False, 1, 32, 8, 4096, [4096], 128, 304, torch.float16, 128, 64, 1, 4),
+        # # Batch=2 equal ctx
+        # (False, 2, 8, 2, 4096, [4096, 4096], 128, 304, torch.float16, 128, 64, 1, 4),
+        # # Batch=2 ragged decode
+        # (False, 2, 8, 2, 4096, [4096, 4096], 128, 304, torch.float16, 128, 64, 1, 4),
+        # (True, 2, 8, 2, 4096, [4096, 4096], 128, 304, torch.float16, 128, 64, 1, 4),
+        # (False, 4, 64, 8, 4096, [4096, 4096, 4096, 4096], 128, 304, torch.float16, 128, 64, 1, 4),
+        # #Added from bench_mha
+        # (False, 2, 48, 48, 16384, [8192, 8192], 128, 304, torch.float16, 128, 64, 1, 4),
+        # #Added from bench_mha_la
+        # (False, 1, 64, 64, 128, [16384], 128, 304, torch.float16, 128, 64, 1, 4),
+        # (False, 1, 96, 96, 128, [32768], 128, 304, torch.float16, 128, 64, 1, 4),
+        # (True, 1, 64, 64, 8192, [8192], 128, 304, torch.float16, 128, 64, 2, 4),
+        # (True, 2, 64, 64, 8192, [8192, 8192], 128, 304, torch.float16, 128, 64, 2, 4),
+        # (True, 1, 64, 64, 16384, [16384], 128, 304, torch.float16, 128, 64, 2, 4),
+        # (True, 2, 64, 64, 16384, [16384, 16384], 128, 304, torch.float16, 128, 64, 2, 4),
+        # (False, 2, 64, 64, 8192, [8192, 8192], 128, 304, torch.float16, 128, 64, 1, 4),
+        # (False, 2, 64, 64, 16384, [16384, 16384], 128, 304, torch.float16, 128, 64, 1, 4),
+        # (False, 2, 48, 48, 16384, [16384, 16384], 128, 304, torch.float16, 128, 64, 1, 4),
+        (False, 2, 64, 64, 128, [65536, 65536], 128, 304, torch.float16, 128, 64, 1, 4),
+        (False, 2, 64, 64, 16, [65536, 65536], 128, 912, torch.float16, 16, 128, 3, 4),
+        (False, 1, 64, 64, 16, [131072], 128, 912, torch.float16, 16, 128, 2, 4),
+        (False, 1, 64, 64, 16, [262144], 64, 912, torch.float16, 16, 64, 2, 4),
+        (False, 1, 64, 64, 16, [524288], 64, 912, torch.float16, 16, 64, 2, 4),
+        (False, 2, 96, 96, 16, [32768, 32768], 128, 912, torch.float16, 16, 128, 2, 4),
+        (False, 1, 96, 96, 16, [65536], 128, 912, torch.float16, 16, 128, 2, 4),
+        (False, 1, 96, 96, 16, [131072], 128, 912, torch.float16, 16, 128, 2, 4),
+        (False, 1, 96, 96, 16, [262144], 64, 912, torch.float16, 16, 64, 2, 4),
+        (False, 1, 96, 96, 16, [524288], 16, 912, torch.float16, 16, 256, 1, 4),  #
+        (False, 1, 96, 96, 16, [1048576], 16, 912, torch.float16, 16, 256, 1, 4),  #
+        (False, 1, 128, 128, 16, [32768], 128, 912, torch.float16, 16, 128, 2, 4),
+        (False, 1, 128, 128, 16, [65536], 128, 912, torch.float16, 16, 128, 2, 4),
+        (False, 1, 128, 128, 16, [131072], 128, 912, torch.float16, 16, 128, 2, 4),
+        (False, 1, 128, 128, 16, [262144], 64, 912, torch.float16, 16, 64, 2, 4),
+        (False, 1, 128, 128, 16, [524288], 16, 912, torch.float16, 16, 256, 1, 4),  #
         (
             False,
             3,
+            64,
             64,
             16,
             [4096, 32768, 65536],
@@ -140,6 +208,7 @@ def reference_attention(q, k, v, n_ctx, n_ctx_q, sm_scale, causal):
             False,
             8,
             64,
+            64,
             16,
             [1024, 1024, 2048, 2048, 4096, 4096, 32768, 65536],
             128,
@@ -154,6 +223,7 @@ def reference_attention(q, k, v, n_ctx, n_ctx_q, sm_scale, causal):
             True,
             1,
             64,
+            64,
             8192,
             [8192],
             128,
@@ -164,17 +234,18 @@ def reference_attention(q, k, v, n_ctx, n_ctx_q, sm_scale, causal):
             2,
             4,
         ),  # Causal=1,
-        (True, 2, 64, 2048, [2048, 2048], 128, 304, torch.float16, 128, 64, 2, 4),
-        # These test cases fail:
-        # (True, 2, 64, 2048, [2048, 2048], 128, 304, torch.float16, 128, 64, 2, 4),
-        # (True, 1, 64, 4096, [4096], 128, 304, torch.float16, 128, 16, 3, 4),
-        # (False, 1, 64, 4096, [4096], 128, 304, torch.float16, 128, 16, 3, 4),
+        (True, 2, 64, 64, 2048, [2048, 2048], 128, 304, torch.float16, 128, 64, 2, 4),
+        #These test cases fail:
+        # (True, 2, 64, 64, 2048, [2048, 2048], 128, 304, torch.float16, 128, 64, 2, 4),
+        # (True, 1, 64, 64, 4096, [4096], 128, 304, torch.float16, 128, 16, 3, 4),
+        # (False, 1, 64, 64, 4096, [4096], 128, 304, torch.float16, 128, 16, 3, 4),
     ],
 )
 def test_persistent_lean_attention(
     request,
     batch,
-    h,
+    h_q,
+    h_k,
     n_ctx_q,
     n_ctx,
     d,
@@ -224,70 +295,46 @@ def test_persistent_lean_attention(
         n_ctx_q,
         n_ctx,
         BLOCK_N,
-        h,
+        h_q,
+        h_k,
         d,
         total_programs,
         init_dtype,
     )
 
-    # # Triton LeanAttention output
-    # la_out, ms = _persistent_lean_attention(
-    #     q,
-    #     k,
-    #     v,
-    #     Mp,
-    #     Lp,
-    #     Op,
-    #     locks,
-    #     batch_num_block_n,
-    #     total_programs,
-    #     BLOCK_M,
-    #     BLOCK_N,
-    #     causal,
-    #     batch,
-    #     sm_scale,
-    #     num_warps,
-    #     waves_per_eu,
-    # )
-
-    lse_out = torch.empty((q.shape[0], q.shape[1]), dtype=torch.float32, device=q.device)
-
     # Triton LeanAttention output
-    try:
-        # LSE: NEW — prefer passing lse_out if your kernel supports it
-        la_out, ms = _persistent_lean_attention(
-            q, k, v, Mp, Lp, Op, locks, batch_num_block_n,
-            total_programs, BLOCK_M, BLOCK_N, causal, batch,
-            sm_scale, num_warps, waves_per_eu,
-            lse_out=lse_out,   # <-- LSE: NEW
-        )
-    except TypeError:
-        # Fallback if LSE plumbing isn't merged yet
-        la_out, ms = _persistent_lean_attention(
-            q, k, v, Mp, Lp, Op, locks, batch_num_block_n,
-            total_programs, BLOCK_M, BLOCK_N, causal, batch,
-            sm_scale, num_warps, waves_per_eu,
-        )
+    la_out, lse, ms = _persistent_lean_attention(
+        q,
+        k,
+        v,
+        Mp,
+        Lp,
+        Op,
+        locks,
+        batch_num_block_n,
+        total_programs,
+        BLOCK_M,
+        BLOCK_N,
+        causal,
+        batch,
+        sm_scale,
+        num_warps,
+        waves_per_eu,
+        return_lse=True,
+    )
 
-    # PyTorch reference (now returns LSE too)
-    ref_out, ref_lse = reference_attention(q, k, v, n_ctx, n_ctx_q, sm_scale, causal)
-
-    # Compare result
-    atol = 1.4e-1 if init_dtype == "fp8" else 1e-2
-    rtol = 1e-2 if init_dtype == "fp8" else 3e-3
-    torch.testing.assert_close(ref_out, la_out, atol=atol, rtol=rtol)
-
-    # LSE: NEW — validate natural-log normalizers
-    lse_atol = 3e-2 if init_dtype == "fp8" else 1e-2
-    lse_rtol = 3e-3
-    if 'lse_out' in locals():
-        torch.testing.assert_close(ref_lse, lse_out, atol=lse_atol, rtol=lse_rtol)
-    # Calculate Pytorch refence output
+    # Calculate Pytorch reference output and LSE
     ref_out = reference_attention(q, k, v, n_ctx, n_ctx_q, sm_scale, causal)
+    ref_lse = reference_lse(q, k, n_ctx, n_ctx_q, sm_scale, causal)
+
+    # print(f"ref_lse={ref_lse}")
+    # print(f"lse={lse}")
+
     # Compare result
     atol = 1.4e-1 if init_dtype == "fp8" else 1e-2
     rtol = 1e-2 if init_dtype == "fp8" else 3e-3
     torch.testing.assert_close(ref_out, la_out, atol=atol, rtol=rtol)
+    torch.testing.assert_close(ref_lse, lse, atol=1e-2, rtol=3e-3)
 
 
 # NOTE: Tests where the workload < num_sms currently fail.
@@ -297,7 +344,8 @@ def test_persistent_lean_attention(
     "Known issue with lean attention causes these tests to fail. La is a WIP."
 )
 @pytest.mark.parametrize("batch", [1])
-@pytest.mark.parametrize("h", [16])
+@pytest.mark.parametrize("h_q", [16])
+@pytest.mark.parametrize("h_k", [16])
 @pytest.mark.parametrize("n_ctx_q", [8192])
 @pytest.mark.parametrize("n_ctx", [[8192]])
 @pytest.mark.parametrize("d", [32])
@@ -305,7 +353,8 @@ def test_persistent_lean_attention(
 @pytest.mark.parametrize("init_dtype", [torch.float16])
 def test_persistent_lean_attention_outer(
     batch,
-    h,
+    h_q,
+    h_k,
     n_ctx_q,
     n_ctx,
     d,
@@ -332,13 +381,18 @@ def test_persistent_lean_attention_outer(
         n_ctx_q,
         n_ctx,
         config["BLOCK_SIZE_N"],
-        h,
+        h_q,
+        h_k,
         d,
         sm_count,
         init_dtype,
     )
 
     # Triton LeanAttention output
+    # Override heads in config so kernel reads H_Q/H_K from config dict
+    config = _get_config(batch_size=batch, causal=causal)
+    config["H_Q"], config["H_K"] = h_q, h_k
+
     la_out = persistent_lean_attention(
         q,
         k,
@@ -396,7 +450,8 @@ def print_mismatches(ref_out, la_out, atol=1e-8, rtol=1e-5):
 def main():
     batch = 1
     causal = False
-    h = 8
+    h_q = 8
+    h_k = 8
     n_ctx_q = 128
     n_ctx = [1024]
     d = 128
@@ -435,30 +490,37 @@ def main():
         n_ctx_q,
         n_ctx,
         BLOCK_N,
-        h,
+        h_q,
+        h_k,
         d,
         total_programs,
         init_dtype,
     )
 
-    lse_out = torch.empty((q.shape[0], q.shape[1]), dtype=torch.float32, device=q.device)
+    # Triton LeanAttention output
+    la_out, ms = _persistent_lean_attention(
+        q,
+        k,
+        v,
+        Mp,
+        Lp,
+        Op,
+        locks,
+        batch_num_block_n,
+        total_programs,
+        BLOCK_M,
+        BLOCK_N,
+        causal,
+        batch,
+        sm_scale,
+        num_warps,
+        waves_per_eu,
+    )
+    # print(f"ms={ms}")
 
-    try:
-        la_out, ms = _persistent_lean_attention(
-            q, k, v, Mp, Lp, Op, locks, batch_num_block_n,
-            total_programs, BLOCK_M, BLOCK_N, causal, batch,
-            sm_scale, num_warps, waves_per_eu,
-            lse_out=lse_out,   # LSE: NEW
-        )
-    except TypeError:
-        la_out, ms = _persistent_lean_attention(
-            q, k, v, Mp, Lp, Op, locks, batch_num_block_n,
-            total_programs, BLOCK_M, BLOCK_N, causal, batch,
-            sm_scale, num_warps, waves_per_eu,
-        )
+    ref_out = reference_attention(q, k, v, n_ctx, n_ctx_q, sm_scale, causal)
 
-    ref_out, ref_lse = reference_attention(q, k, v, n_ctx, n_ctx_q, sm_scale, causal)
-
+    # Compare result
     atol = 1.4e-1 if init_dtype == "fp8" else 1e-2
     rtol = 1e-2 if init_dtype == "fp8" else 3e-3
     try:
@@ -466,18 +528,7 @@ def main():
     except AssertionError:
         print("Assertion failed! Showing mismatches:")
         print_mismatches(ref_out, la_out, atol, rtol)
-        raise
-
-    # LSE: NEW — check LSE
-    if 'lse_out' in locals():
-        lse_atol = 3e-2 if init_dtype == "fp8" else 1e-2
-        lse_rtol = 3e-3
-        try:
-            torch.testing.assert_close(ref_lse, lse_out, atol=lse_atol, rtol=lse_rtol)
-        except AssertionError:
-            print("LSE assertion failed! Showing mismatches:")
-            print_mismatches(ref_lse, lse_out, atol=lse_atol, rtol=lse_rtol)
-            raise
+        raise  # Re-raise the exception after printing mismatches
 
     # torch.testing.assert_close(ref_out, la_out, atol=atol, rtol=rtol)
 
