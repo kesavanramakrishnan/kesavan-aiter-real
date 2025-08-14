@@ -39,6 +39,21 @@ BENCH_NONVARLEN_CONFIGS = [
 ]
 
 
+HEAD_SZ_128_BENCH_CONFIGS = [
+    (16, 16, 16, 1024, 1024),
+    (8, 16, 16, 2048, 2048),
+    (4, 16, 16, 4096, 4096),
+    (2, 16, 16, 8192, 8192),
+    (8, 16, 16, 1024, 4096),
+    (1, 16, 16, 4096, 16384),
+    (2, 48, 48, 1024, 1024),
+    (2, 48, 48, 2048, 1024),
+    (2, 48, 48, 4096, 8192),
+    (2, 48, 48, 8192, 4096),
+    (2, 48, 48, 16384, 8192),
+]
+
+
 def _run_la_bwd_process_test(
     BATCH: int,
     NUM_Q_HEADS: int,
@@ -229,6 +244,36 @@ def test_la_bwd_vs_flash_bwd(
         device,
     )
 
+
+@pytest.mark.parametrize(
+    "BATCH, NUM_Q_HEADS, NUM_K_HEADS, SEQLEN_Q, SEQLEN_K",
+    HEAD_SZ_128_BENCH_CONFIGS,
+)
+@pytest.mark.parametrize("HEAD_SZ", [128])
+@pytest.mark.parametrize("causal", [False])
+@pytest.mark.parametrize("dtype", [torch.float16])
+def test_la_bwd_vs_flash_bwd_head_sz_128(
+    BATCH: int,
+    NUM_Q_HEADS: int,
+    NUM_K_HEADS: int,
+    SEQLEN_Q: int,
+    SEQLEN_K: int,
+    HEAD_SZ: int,
+    causal: bool,
+    dtype: torch.dtype,
+    device: str = "cuda",
+):
+    _run_la_bwd_process_test(
+        BATCH,
+        NUM_Q_HEADS,
+        NUM_K_HEADS,
+        HEAD_SZ,
+        SEQLEN_Q,
+        SEQLEN_K,
+        causal,
+        dtype,
+        device,
+    )
 
 # @pytest.mark.parametrize(
 #     "BATCH, NUM_Q_HEADS, NUM_K_HEADS, SEQLEN_Q, SEQLEN_K",

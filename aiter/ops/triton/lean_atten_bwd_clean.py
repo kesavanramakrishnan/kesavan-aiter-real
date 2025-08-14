@@ -1034,7 +1034,7 @@ def persistent_lean_attention_bwd(
     sm_scale: float,
     causal: bool = True,
     config: Optional[dict] = None,
-    num_programs: Optional[int] = None,
+    num_programs: Optional[int] = 304,
 ):
     """
     Host-side launcher for the split backward pass.
@@ -1059,7 +1059,9 @@ def persistent_lean_attention_bwd(
             NK_tmp = k.shape[0]
             db = _load_bwd_tuned_db(db_path)
             tuned = _select_bwd_config(db, causal, batch_size, H_tmp, D_tmp, NQ_tmp, NK_tmp)
+            tuned_np_mult = None
             if tuned:
+                tuned_np_mult = tuned.get("num_programs_mult")
                 # do not override num_programs from DB; user controls it
                 tuned = {k: v for k, v in tuned.items() if k != "num_programs" and k != "num_programs_mult"}
                 config.update(tuned)
@@ -1067,15 +1069,30 @@ def persistent_lean_attention_bwd(
         pass
     # Resolve total programs (CTAs) preference: explicit arg > config > device
     total_programs_pref = None
+    sm_count = None
     if num_programs is not None:
         total_programs_pref = int(num_programs)
     elif "num_ctas" in config:
         total_programs_pref = int(config["num_ctas"])
     else:
         try:
-            total_programs_pref = int(arch_info.get_num_sms())
+            sm_count = int(arch_info.get_num_sms())
+            total_programs_pref = sm_count
         except Exception:
-            total_programs_pref = int(torch.cuda.get_device_properties(q.device).multi_processor_count)
+            sm_count = int(torch.cuda.get_device_properties(q.device).multi_processor_count)
+            total_programs_pref = sm_count
+
+    # If enabled, apply tuned grid size from DB multiplier when user hasn't set num_programs explicitly
+    try:
+        use_tuned_grid = os.environ.get("AITER_BWD_USE_TUNED_GRID", "0") == "1"
+        if use_tuned_grid and (num_programs is None):
+            # tuned_np_mult set above when DB entry exists
+            if 'tuned' in locals():
+                tuned_np_mult = locals().get('tuned_np_mult', None)
+                if tuned_np_mult and sm_count:
+                    total_programs_pref = max(1, int(tuned_np_mult) * int(sm_count))
+    except Exception:
+        pass
 
     BLOCK_M = config["BLOCK_SIZE_M"]
     BLOCK_N = config["BLOCK_SIZE_N"]

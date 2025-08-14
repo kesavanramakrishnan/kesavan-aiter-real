@@ -50,11 +50,12 @@ def _default_config_grid() -> List[Dict]:
     num_warps_kv = [1, 2, 4]
 
     waves_per_eu_vals = [1, 2]
+    num_programs_mult_vals = [1, 2]
 
     cfgs = []
-    for (bmq, bnq, nwq, bmk, bnk, nwk, wpe) in itertools.product(
+    for (bmq, bnq, nwq, bmk, bnk, nwk, wpe, np_mult) in itertools.product(
         block_m_q, block_n_q, num_warps_q, block_m_kv, block_n_kv, num_warps_kv,
-        waves_per_eu_vals
+        waves_per_eu_vals, num_programs_mult_vals
     ):
         cfgs.append({
             "BLOCK_SIZE_M": bmq,
@@ -64,6 +65,7 @@ def _default_config_grid() -> List[Dict]:
             "BLOCK_SIZE_N_KV": bnk,
             "num_warps_kv": nwk,
             "waves_per_eu": wpe,
+            "num_programs_mult": np_mult,
         })
     return cfgs
 
@@ -93,7 +95,14 @@ def allocate_tensors(scn: Dict, dtype: torch.dtype, device: torch.device):
 def run_once(scn: Dict, cfg: Dict, dtype: torch.dtype, device: torch.device, warmup: int, iters: int) -> Tuple[float, float]:
     q, k, v, do, o, lse, dq, dk, dv = allocate_tensors(scn, dtype, device)
     scale = 1.0 / math.sqrt(scn["head_dim"])
-    num_programs = None  # user controls grid externally; keep None here
+    # Derive num_programs from multiplier if present; user can still override externally
+    sm_count = torch.cuda.get_device_properties(device).multi_processor_count
+    num_programs = None
+    if "num_programs_mult" in cfg:
+        try:
+            num_programs = max(1, int(cfg["num_programs_mult"]) * int(sm_count))
+        except Exception:
+            num_programs = None
 
     # ensure deterministic-ish
     torch.cuda.synchronize()
