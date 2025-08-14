@@ -284,10 +284,10 @@ def la_bwd_dkdv_inner(
     # print("iter_start_kv: ", iter_start_kv)
     # print("num_to_process_kv: ", num_to_process_kv)
 
-    for i in tl.static_range(0, MAX_TILES_PER_WG_KV_CONST):
-        active = i < num_to_process_kv
+    # Iterate dynamically over the tiles assigned to this CTA to avoid large unrolling
+    for i in range(0, num_to_process_kv):
         iter_kv = iter_start_kv + i
-        valid_kv = active & (iter_kv < total_tiles_kv)
+        valid_kv = iter_kv < total_tiles_kv
 
         # Map linear KV tile id -> (head_idx, n_linear) and then to (batch_idx, n_block_in_batch)
         kv_id = iter_kv
@@ -308,7 +308,7 @@ def la_bwd_dkdv_inner(
             prev_running_blocks = 0
             match_prev_blocks = 0
             found = 0
-            for b in tl.static_range(0, B):
+            for b in range(0, B):
                 blocks_total = tl.load(batch_num_block_n + b, mask=valid_kv, other=0) if b > 0 else tl.load(batch_num_block_n, mask=valid_kv, other=0)
                 is_match = (found == 0) & (n_linear < blocks_total)
                 batch_idx = tl.where(is_match, b, batch_idx)
@@ -336,70 +336,60 @@ def la_bwd_dkdv_inner(
 
         k_start_abs = (b_seq_size + n_block_in_batch) * BLOCK_N
 
+        # Accumulators will be computed in two passes to reduce peak live registers
         dv_acc = tl.zeros([BLOCK_N, HEAD_DIM], dtype=tl.float32)
-        dk_acc = tl.zeros([BLOCK_N, HEAD_DIM], dtype=tl.float32)
 
         # Iterate over all Q m-blocks for this batch/head using pointer increments (static)
         # Base absolute q row start for this batch
         q_start_abs = batch_idx * N_CTX_Q
-        # Build base pointers once
-        qT_ptrs = (
+        # Build base pointers once (for dV pass)
+        qT_ptrs_dv = (
             Q
             + q_start_abs * stride_qm
             + head_idx * stride_qh
             + offs_k[:, None] * stride_qk
             + offs_m[None, :] * stride_qm
         )
-        doT_ptrs = (
+        doT_ptrs_dv = (
             DO
             + q_start_abs * stride_dom
             + head_idx * stride_doh
             + offs_k[:, None] * stride_dok
             + offs_m[None, :] * stride_dom
         )
-        m_ptrs = (
+        m_ptrs_dv = (
             M
             + batch_idx * stride_mb
             + head_idx * stride_mh
             + offs_m * stride_mm
         )
-        delta_ptrs = (
-            Delta
-            + batch_idx * stride_deltab
-            + head_idx * stride_deltah
-            + offs_m * stride_deltam
-        )
         # Alignment hints
-        qT_ptrs = tl.multiple_of(qT_ptrs, (16, 1))
-        doT_ptrs = tl.multiple_of(doT_ptrs, (16, 1))
-        for _ in tl.static_range(NUM_M_BLOCKS_TOTAL):
-            q_tile_T = tl.load(qT_ptrs, mask=valid_kv)
-            do_tile_T = tl.load(doT_ptrs, mask=valid_kv)
-            m_rows = tl.load(m_ptrs, mask=(valid_kv & (offs_m < BLOCK_M)), other=-float("inf"))
-            delta_rows = tl.load(delta_ptrs, mask=(valid_kv & (offs_m < BLOCK_M)), other=0.0)
+        qT_ptrs_dv = tl.multiple_of(qT_ptrs_dv, (16, 1))
+        doT_ptrs_dv = tl.multiple_of(doT_ptrs_dv, (16, 1))
+        q_start_abs_dv = q_start_abs
+        # Dynamic loop over m-blocks to reduce unrolling and register pressure
+        num_m_blocks_total_dyn = tl.cdiv(N_CTX_Q, BLOCK_M)
+        for _it in range(0, num_m_blocks_total_dyn):
+            q_tile_T = tl.load(qT_ptrs_dv, mask=valid_kv)
+            do_tile_T = tl.load(doT_ptrs_dv, mask=valid_kv)
+            m_rows = tl.load(m_ptrs_dv, mask=(valid_kv & (offs_m < BLOCK_M)), other=-float("inf"))
 
             # Reconstruct logits and probabilities in the transposed domain using exp2
             qk_T = tl.dot(k_tile, q_tile_T) * sm_scale
             p_T = tl.math.exp2(qk_T * RCP_LN2 - m_rows[None, :] * RCP_LN2)
 
             if CAUSAL:
-                mask_T = (q_start_abs + offs_m[None, :]) >= (k_start_abs + offs_n[:, None])
+                mask_T = (q_start_abs_dv + offs_m[None, :]) >= (k_start_abs + offs_n[:, None])
                 p_T = tl.where(mask_T & valid_kv, p_T, 0.0)
 
-            # dV first (streaming-friendly order)
+            # dV accumulation
             dv_acc += tl.dot(p_T.to(do_tile_T.type.element_ty), tl.trans(do_tile_T))
 
-            # Then dP and dK
-            dp_T = tl.dot(v_tile, do_tile_T)  # shape (BLOCK_N, BLOCK_M)
-            ds_T = p_T * (dp_T - delta_rows[None, :])
-            dk_acc += tl.dot(ds_T.to(q_tile_T.type.element_ty), tl.trans(q_tile_T))
-
             # Advance pointers and absolute row start
-            q_start_abs += BLOCK_M
-            qT_ptrs += BLOCK_M * stride_qm
-            doT_ptrs += BLOCK_M * stride_dom
-            m_ptrs += BLOCK_M * stride_mm
-            delta_ptrs += BLOCK_M * stride_deltam
+            q_start_abs_dv += BLOCK_M
+            qT_ptrs_dv += BLOCK_M * stride_qm
+            doT_ptrs_dv += BLOCK_M * stride_dom
+            m_ptrs_dv += BLOCK_M * stride_mm
 
         # Store accumulated dV and scaled dK for this KV tile
         dv_ptrs_out = (
@@ -417,8 +407,70 @@ def la_bwd_dkdv_inner(
             + offs_k[None, :] * stride_dkk_out
         )
         dv_ptrs_out = tl.multiple_of(dv_ptrs_out, (1, 16))
-        dk_ptrs_out = tl.multiple_of(dk_ptrs_out, (1, 16))
         tl.store(dv_ptrs_out, dv_acc.to(DV.type.element_ty), mask=valid_kv)
+
+        # Reuse registers for dK pass
+        dk_acc = tl.zeros([BLOCK_N, HEAD_DIM], dtype=tl.float32)
+        # Reinitialize pointers for dK accumulation
+        qT_ptrs_dk = (
+            Q
+            + (batch_idx * N_CTX_Q) * stride_qm
+            + head_idx * stride_qh
+            + offs_k[:, None] * stride_qk
+            + offs_m[None, :] * stride_qm
+        )
+        doT_ptrs_dk = (
+            DO
+            + (batch_idx * N_CTX_Q) * stride_dom
+            + head_idx * stride_doh
+            + offs_k[:, None] * stride_dok
+            + offs_m[None, :] * stride_dom
+        )
+        m_ptrs_dk = (
+            M
+            + batch_idx * stride_mb
+            + head_idx * stride_mh
+            + offs_m * stride_mm
+        )
+        delta_ptrs_dk = (
+            Delta
+            + batch_idx * stride_deltab
+            + head_idx * stride_deltah
+            + offs_m * stride_deltam
+        )
+        qT_ptrs_dk = tl.multiple_of(qT_ptrs_dk, (16, 1))
+        doT_ptrs_dk = tl.multiple_of(doT_ptrs_dk, (16, 1))
+        q_start_abs_dk = batch_idx * N_CTX_Q
+        for _it in range(0, num_m_blocks_total_dyn):
+            q_tile_T = tl.load(qT_ptrs_dk, mask=valid_kv)
+            do_tile_T = tl.load(doT_ptrs_dk, mask=valid_kv)
+            m_rows = tl.load(m_ptrs_dk, mask=(valid_kv & (offs_m < BLOCK_M)), other=-float("inf"))
+            delta_rows = tl.load(delta_ptrs_dk, mask=(valid_kv & (offs_m < BLOCK_M)), other=0.0)
+
+            qk_T = tl.dot(k_tile, q_tile_T) * sm_scale
+            p_T = tl.math.exp2(qk_T * RCP_LN2 - m_rows[None, :] * RCP_LN2)
+            if CAUSAL:
+                mask_T = (q_start_abs_dk + offs_m[None, :]) >= (k_start_abs + offs_n[:, None])
+                p_T = tl.where(mask_T & valid_kv, p_T, 0.0)
+
+            # Load v tile only when needed to compute dp_T to reduce its live range
+            v_tile = tl.load(V + (
+                (b_seq_size + n_block_in_batch) * BLOCK_N * stride_vn
+                + head_idx * stride_vh
+                + offs_n[:, None] * stride_vn
+                + offs_k[None, :] * stride_vk
+            ), mask=valid_kv, other=0.0)
+            dp_T = tl.dot(v_tile, do_tile_T)
+            ds_T = p_T * (dp_T - delta_rows[None, :])
+            dk_acc += tl.dot(ds_T.to(q_tile_T.type.element_ty), tl.trans(q_tile_T))
+
+            q_start_abs_dk += BLOCK_M
+            qT_ptrs_dk += BLOCK_M * stride_qm
+            doT_ptrs_dk += BLOCK_M * stride_dom
+            m_ptrs_dk += BLOCK_M * stride_mm
+            delta_ptrs_dk += BLOCK_M * stride_deltam
+
+        dk_ptrs_out = tl.multiple_of(dk_ptrs_out, (1, 16))
         tl.store(dk_ptrs_out, (dk_acc * sm_scale).to(DK.type.element_ty), mask=valid_kv)
 
 
@@ -580,35 +632,31 @@ def la_bwd_dq_inner(
         k_start_abs = b_seq_size_blocks * BLOCK_N
 
         # Stream across all K/V tiles for this batch/head
-        for it in tl.static_range(0, MAX_N_BLOCKS_PER_BATCH_CONST):
-            active = it < num_n_blocks_per_batch
-            # Mask loads by 'active' to avoid doing work on inactive iterations
-            mask_kv_iter = valid_q & active
+        # Dynamic loop to avoid heavy unrolling and register pressure
+        for it in range(0, num_n_blocks_per_batch):
+            # Mask loads by range
+            mask_kv_iter = valid_q
             k_tile = tl.load(k_ptrs, mask=mask_kv_iter, other=0.0)
-            v_tile = tl.load(v_ptrs, mask=mask_kv_iter, other=0.0)
 
             # Reconstruct logits and probabilities using exp2
             qk = tl.dot(q_tile, tl.trans(k_tile)) * sm_scale
             p = tl.math.exp2(qk * RCP_LN2 - m_rows[:, None] * RCP_LN2)
-            p = tl.where(active, p, 0.0)
 
             if CAUSAL:
                 mask = (q_start_abs + offs_m[:, None]) >= (k_start_abs + offs_n[None, :])
                 p = tl.where(mask, p, 0.0)
 
+            # Load V tile only when needed for dP to shorten live range
+            v_tile = tl.load(v_ptrs, mask=mask_kv_iter, other=0.0)
             # Form dS and accumulate contribution to dQ
             dp = tl.dot(do_tile, tl.trans(v_tile))
-            dp = dp * tl.where(active, 1.0, 0.0)
             ds = p * (dp - delta_rows[:, None])
             dq_acc += tl.dot(ds.to(k_tile.dtype), k_tile)
 
             # Advance pointers and absolute K start
-            # Guard pointer increments with 'active' so we don't walk off valid range
-            inc_kn = tl.where(active, BLOCK_N * stride_kn, 0)
-            inc_vn = tl.where(active, BLOCK_N * stride_vn, 0)
-            k_ptrs += inc_kn
-            v_ptrs += inc_vn
-            k_start_abs += tl.where(active, BLOCK_N, 0)
+            k_ptrs += BLOCK_N * stride_kn
+            v_ptrs += BLOCK_N * stride_vn
+            k_start_abs += BLOCK_N
 
         # Final scale and store dQ tile
         dq_acc = dq_acc * sm_scale

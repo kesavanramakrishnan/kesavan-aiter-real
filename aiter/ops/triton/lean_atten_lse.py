@@ -577,9 +577,13 @@ def _attention_inner(
         l_i = l_i * alpha + l_ij
         m_i = m_ij.to(m_i.dtype)
 
+        BLOCK_N64 = tl.full((), BLOCK_N, tl.int64)
+        stride_kn64 = tl.full((), stride_kn, tl.int64)
+        stride_vn64 = tl.full((), stride_vn, tl.int64)
+
         # update k/v pointer
-        v_ptrs += BLOCK_N * stride_vn
-        k_ptrs += BLOCK_N * stride_kn
+        v_ptrs += BLOCK_N64 * stride_vn64
+        k_ptrs += BLOCK_N64 * stride_kn64
 
     return m_i, l_i, acc
 
@@ -860,6 +864,11 @@ def la_persistent_inner(
     offs_n = tl.arange(0, BLOCK_N)
     offs_k = tl.arange(0, HEAD_DIM)
 
+    # Minimal 64-bit casts: only for the stride(0) term in K/V pointers
+    BLOCK_N64 = tl.full((), BLOCK_N, tl.int64)
+    stride_kn64 = tl.full((), stride_kn, tl.int64)
+    stride_vn64 = tl.full((), stride_vn, tl.int64)
+
     if causal:
         b_seq_size = tile_batch_idx * num_n_blocks
     else:
@@ -869,16 +878,17 @@ def la_persistent_inner(
             b_seq_size = tl.load(
                 batch_num_block_n + tile_batch_idx - 1
             )  # Previous batch size
-
+    
     tile_khead_idx = tile_head_idx // gqa_group_size
+    bn64 = tl.full((), b_seq_size, tl.int64) + tl.full((), local_iter, tl.int64)
     k_offs = (
-        (b_seq_size + local_iter) * BLOCK_N * stride_kn
+        (bn64 * BLOCK_N64) * stride_kn64
         + tile_khead_idx * stride_kh
         + offs_n[None, :] * stride_kn
         + offs_k[:, None] * stride_kk
     )
     v_offs = (
-        (b_seq_size + local_iter) * BLOCK_N * stride_vn
+        (bn64 * BLOCK_N64) * stride_vn64
         + tile_khead_idx * stride_vh
         + offs_n[:, None] * stride_vn
         + offs_k[None, :] * stride_vk
@@ -940,7 +950,10 @@ def la_persistent_inner(
 
     # lean output tile epilogue
     # Compute per-row mask to avoid OOB when n_ctx_q < BLOCK_M
-    rows_remaining = n_ctx_q_rows - q_start_m
+    # q_start_m is a global row index across all batches. Convert to per-batch row index.
+    batch_base_rows = tile_batch_idx * n_ctx_q_rows
+    q_start_m_in_batch = q_start_m - batch_base_rows
+    rows_remaining = n_ctx_q_rows - q_start_m_in_batch
     rows_remaining = tl.maximum(0, rows_remaining)
     rows_in_tile = tl.minimum(BLOCK_M, rows_remaining)
     if not causal:
@@ -1030,8 +1043,7 @@ def la_persistent_inner(
                     Op
                     + cta * stride_oph
                     + offs_m[:, None] * stride_opm
-                    + (tl.arange(0, HEAD_DIM // 2)[None, :] + HEAD_DIM // 2)
-                    * stride_opn
+                    + (tl.arange(0, HEAD_DIM // 2)[None, :] + HEAD_DIM // 2) * stride_opn
                 )
 
                 m_cta = tl.load(mp_ptrs)
