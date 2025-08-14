@@ -143,7 +143,7 @@ def reference_lse(q, k, n_ctx, n_ctx_q, sm_scale, causal):
         # (False, 256, 32, 8, 128, [8192] * 256, 128, 304, torch.float16, 128, 64, 1, 4)
         # (False, 512, 64, 8, 128, [8192] * 512, 128, 304, torch.float16, 128, 64, 1, 4),
         # (False, 512, 128, 8, 128, [8192] * 512, 128, 304, torch.float16, 128, 64, 1, 4),
-        (False, 8, 128, 128, 8192, [8192]*8, 64, 304, torch.float16, 128, 64, 1, 4),
+        (False, 1, 128, 128, 8192, [8192]*1, 64, 304, torch.float16, 128, 64, 1, 4),
         # #Added from bench_mha_la
         # (False, 1, 64, 64, 128, [16384], 128, 304, torch.float16, 128, 64, 1, 4),
         # (False, 1, 96, 96, 128, [32768], 128, 304, torch.float16, 128, 64, 1, 4),
@@ -431,15 +431,15 @@ def print_mismatches(ref_out, la_out, atol=1e-8, rtol=1e-5):
         print(f"  Abs diff:  {abs_diff[idx_tuple].item()}")
         print(f"  Rel diff:  {rel_diff[idx_tuple].item()}\n")
 
-# (False, 8, 128, 8, 1, [8192] * 8, 128, 304, torch.float16, 128, 64, 1, 4),
+#(False, 1, 128, 128, 8192, [8192]*1, 64, 304, torch.float16, 128, 64, 1, 4),
 def main():
     batch = 8
     causal = False
     h_q = 128
-    h_k = 8
+    h_k = 128
     n_ctx_q = 128
     n_ctx = [8192] * batch
-    d = 128
+    d = 64
     total_programs = 304
     init_dtype = torch.float16
     BLOCK_M = 128

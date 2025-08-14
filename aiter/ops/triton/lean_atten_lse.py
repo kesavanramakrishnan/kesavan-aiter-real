@@ -678,8 +678,65 @@ def la_persistent(
     tl.assume(stride_opm > 0)  # n_ctx_q
     tl.assume(stride_opn > 0)  # head_dim
 
-    for i in tl.static_range(max_output_tile_cnt + 1):
-        if iter < cta_end_tile_gid:
+    if causal:
+        for i in tl.static_range(max_output_tile_cnt + 1):
+            if iter < cta_end_tile_gid:
+                iter = la_persistent_inner(
+                    Q,
+                    K,
+                    V,
+                    qk_scale,
+                    Mp,
+                    Lp,
+                    Op,
+                    Out,
+                    LSE,
+                    batch_num_block_n,
+                    locks,
+                    stride_qm,  # n_ctx_q
+                    stride_qh,  # Head
+                    stride_qk,  # head_dim
+                    stride_kn,
+                    stride_kh,
+                    stride_kk,
+                    stride_vn,
+                    stride_vh,
+                    stride_vk,
+                    stride_om,  # n_ctx_q
+                    stride_oh,  # Head
+                    stride_on,  # head_dim
+                    stride_lsem,
+                    stride_lseh,
+                    n_ctx_q_rows,
+                    stride_oph,  # total_programs
+                    stride_opm,  # n_ctx_q
+                    stride_opn,  # head_dim
+                    program_count,
+                    iter=iter,
+                    cta_end_tile_gid=cta_end_tile_gid,
+                    current_pid=current_pid,
+                    HEAD_DIM=HEAD_DIM,
+                    BLOCK_M=BLOCK_M,
+                    BLOCK_N=BLOCK_N,
+                    MASKED_BLOCKS=MASKED_BLOCKS,
+                    batch_size=batch_size,
+                    causal=causal,
+                    num_m_blocks=num_m_blocks,
+                    num_n_blocks=num_n_blocks,
+                    # leanAttention params
+                    high_load_wgs=high_load_wgs,
+                    max_tiles_per_wg=max_tiles_per_wg,
+                    tiles_per_head=tiles_per_head,
+                    num_splits=num_splits,
+                    num_heads_q=num_heads_q,
+                    num_heads_k=num_heads_k,
+                    gqa_group_size=gqa_group_size,
+                    store_lse=store_lse,
+                    ln_2=ln_2,
+                    use_64_indexing=use_64_indexing,
+                )
+    else:
+        while iter < cta_end_tile_gid:
             iter = la_persistent_inner(
                 Q,
                 K,
@@ -887,37 +944,37 @@ def la_persistent_inner(
     else:
         tile_khead_idx = tile_head_idx // gqa_group_size
 
-    # if use_64_indexing:
-    BLOCK_N64 = tl.full((), BLOCK_N, tl.int64)
-    stride_kn64 = tl.full((), stride_kn, tl.int64)
-    stride_vn64 = tl.full((), stride_vn, tl.int64)
-    bn64 = tl.full((), b_seq_size, tl.int64) + tl.full((), local_iter, tl.int64)
-    k_offs = (
-        (bn64 * BLOCK_N64) * stride_kn64
-        + tile_khead_idx * stride_kh
-        + offs_n[None, :] * stride_kn
-        + offs_k[:, None] * stride_kk
-    )
-    v_offs = (
-        (bn64 * BLOCK_N64) * stride_vn64
-        + tile_khead_idx * stride_vh
-        + offs_n[:, None] * stride_vn
-        + offs_k[None, :] * stride_vk
-    )
-    # else:
-    #     bn32 = b_seq_size + local_iter
-    #     k_offs = (
-    #         (bn32 * BLOCK_N) * stride_kn
-    #         + tile_khead_idx * stride_kh
-    #         + offs_n[None, :] * stride_kn
-    #         + offs_k[:, None] * stride_kk
-    #     )
-    #     v_offs = (
-    #         (bn32 * BLOCK_N) * stride_vn
-    #         + tile_khead_idx * stride_vh
-    #         + offs_n[:, None] * stride_vn
-    #         + offs_k[None, :] * stride_vk
-    #     )
+    if use_64_indexing:
+        BLOCK_N64 = tl.full((), BLOCK_N, tl.int64)
+        stride_kn64 = tl.full((), stride_kn, tl.int64)
+        stride_vn64 = tl.full((), stride_vn, tl.int64)
+        bn64 = tl.full((), b_seq_size, tl.int64) + tl.full((), local_iter, tl.int64)
+        k_offs = (
+            (bn64 * BLOCK_N64) * stride_kn64
+            + tile_khead_idx * stride_kh
+            + offs_n[None, :] * stride_kn
+            + offs_k[:, None] * stride_kk
+        )
+        v_offs = (
+            (bn64 * BLOCK_N64) * stride_vn64
+            + tile_khead_idx * stride_vh
+            + offs_n[:, None] * stride_vn
+            + offs_k[None, :] * stride_vk
+        )
+    else:
+        bn32 = b_seq_size + local_iter
+        k_offs = (
+            (bn32 * BLOCK_N) * stride_kn
+            + tile_khead_idx * stride_kh
+            + offs_n[None, :] * stride_kn
+            + offs_k[:, None] * stride_kk
+        )
+        v_offs = (
+            (bn32 * BLOCK_N) * stride_vn
+            + tile_khead_idx * stride_vh
+            + offs_n[:, None] * stride_vn
+            + offs_k[None, :] * stride_vk
+        )
 
     k_ptrs = K + k_offs
     k_ptrs = tl.multiple_of(k_ptrs, (16, 1))
@@ -966,7 +1023,7 @@ def la_persistent_inner(
         HEAD_DIM,
         local_iter,
         local_iter_end,
-        use_64_indexing=True,
+        use_64_indexing=use_64_indexing,
     )
 
     # initialize pointer to m and l

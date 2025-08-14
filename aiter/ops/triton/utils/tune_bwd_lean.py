@@ -40,21 +40,22 @@ def _default_shape_grid() -> List[Dict]:
 
 
 def _default_config_grid() -> List[Dict]:
-    # Modest grid to start; expand as needed
-    block_m_q = [32, 64, 128]
-    block_n_q = [64]  # restrict to stable BN
-    num_warps_q = [2, 4]  # avoid 8-warps instability
+    # Tunable space (narrow and stable by default)
+    block_m_q = [64, 128]
+    block_n_q = [64]  # stable
+    num_warps_q = [2, 4]
 
     block_m_kv = [32, 64, 128]
-    block_n_kv = [64]  # restrict to stable BN for KV
-    num_warps_kv = [2, 4]
+    block_n_kv = [64]  # stable
+    num_warps_kv = [1, 2, 4]
 
-    # waves_per_eu often 1 is a good default; num_stages is fixed in kernel for now
+    waves_per_eu_vals = [1, 2]
+
     cfgs = []
-    for (bmq, bnq, nwq, bmk, bnk, nwk) in itertools.product(
-        block_m_q, block_n_q, num_warps_q, block_m_kv, block_n_kv, num_warps_kv
+    for (bmq, bnq, nwq, bmk, bnk, nwk, wpe) in itertools.product(
+        block_m_q, block_n_q, num_warps_q, block_m_kv, block_n_kv, num_warps_kv,
+        waves_per_eu_vals
     ):
-        # Keep causal-friendly combos (BLOCK_M multiple of BLOCK_N) for causal
         cfgs.append({
             "BLOCK_SIZE_M": bmq,
             "BLOCK_SIZE_N": bnq,
@@ -62,7 +63,7 @@ def _default_config_grid() -> List[Dict]:
             "BLOCK_SIZE_M_KV": bmk,
             "BLOCK_SIZE_N_KV": bnk,
             "num_warps_kv": nwk,
-            "waves_per_eu": 1,
+            "waves_per_eu": wpe,
         })
     return cfgs
 
@@ -92,6 +93,7 @@ def allocate_tensors(scn: Dict, dtype: torch.dtype, device: torch.device):
 def run_once(scn: Dict, cfg: Dict, dtype: torch.dtype, device: torch.device, warmup: int, iters: int) -> Tuple[float, float]:
     q, k, v, do, o, lse, dq, dk, dv = allocate_tensors(scn, dtype, device)
     scale = 1.0 / math.sqrt(scn["head_dim"])
+    num_programs = None  # user controls grid externally; keep None here
 
     # ensure deterministic-ish
     torch.cuda.synchronize()
@@ -105,6 +107,7 @@ def run_once(scn: Dict, cfg: Dict, dtype: torch.dtype, device: torch.device, war
             sm_scale=scale,
             causal=scn["causal"],
             config=cfg,
+            num_programs=num_programs,
         )
     torch.cuda.synchronize()
 
@@ -120,6 +123,7 @@ def run_once(scn: Dict, cfg: Dict, dtype: torch.dtype, device: torch.device, war
             sm_scale=scale,
             causal=scn["causal"],
             config=cfg,
+            num_programs=num_programs,
         )
     end.record()
     torch.cuda.synchronize()
