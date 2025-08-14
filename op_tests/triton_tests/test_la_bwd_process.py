@@ -182,7 +182,8 @@ def _run_la_bwd_process_test(
     # dq_tol = atol + rtol * torch.abs(dq_flash)
     # dq_mismatch_pct = (dq_diff > dq_tol).float().mean().item() * 100
     # print(f"% mismatched (dQ): {dq_mismatch_pct:.6f}%")
-
+    # print("dk_la", dk_la)
+    # print("dk_flash", dk_flash)
     #Compare Lean Attention with Flash Attention
     torch.testing.assert_close(dq_la, dq_flash, atol=atol, rtol=rtol, msg="dQ (Lean Attn vs Flash Attn)")
     torch.testing.assert_close(dk_la, dk_flash, atol=atol, rtol=rtol, msg="dK (Lean Attn vs Flash Attn)")

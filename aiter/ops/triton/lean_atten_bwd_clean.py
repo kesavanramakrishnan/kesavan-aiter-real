@@ -331,8 +331,12 @@ def la_bwd_dkdv_inner(
             + offs_n[:, None] * stride_vn
             + offs_k[None, :] * stride_vk
         )
-        k_tile = tl.load(K + k_offs, mask=valid_kv, other=0.0)
-        v_tile = tl.load(V + v_offs, mask=valid_kv, other=0.0)
+        k_ptrs_kv = K + k_offs
+        v_ptrs_kv = V + v_offs
+        k_ptrs_kv = tl.multiple_of(k_ptrs_kv, (1, 16))
+        v_ptrs_kv = tl.multiple_of(v_ptrs_kv, (1, 16))
+        k_tile = tl.load(k_ptrs_kv, mask=valid_kv, other=0.0)
+        v_tile = tl.load(v_ptrs_kv, mask=valid_kv, other=0.0)
 
         k_start_abs = (b_seq_size + n_block_in_batch) * BLOCK_N
 
@@ -367,12 +371,13 @@ def la_bwd_dkdv_inner(
         qT_ptrs_dv = tl.multiple_of(qT_ptrs_dv, (16, 1))
         doT_ptrs_dv = tl.multiple_of(doT_ptrs_dv, (16, 1))
         q_start_abs_dv = q_start_abs
-        # Dynamic loop over m-blocks to reduce unrolling and register pressure
+        # Dynamic loop over m-blocks with double-buffering to hide latency
         num_m_blocks_total_dyn = tl.cdiv(N_CTX_Q, BLOCK_M)
+        # Prefetch first tiles
+        q_tile_T = tl.load(qT_ptrs_dv, mask=valid_kv)
+        do_tile_T = tl.load(doT_ptrs_dv, mask=valid_kv)
+        m_rows = tl.load(m_ptrs_dv, mask=(valid_kv & (offs_m < BLOCK_M)), other=-float("inf"))
         for _it in range(0, num_m_blocks_total_dyn):
-            q_tile_T = tl.load(qT_ptrs_dv, mask=valid_kv)
-            do_tile_T = tl.load(doT_ptrs_dv, mask=valid_kv)
-            m_rows = tl.load(m_ptrs_dv, mask=(valid_kv & (offs_m < BLOCK_M)), other=-float("inf"))
 
             # Reconstruct logits and probabilities in the transposed domain using exp2
             qk_T = tl.dot(k_tile, q_tile_T) * sm_scale
@@ -385,11 +390,16 @@ def la_bwd_dkdv_inner(
             # dV accumulation
             dv_acc += tl.dot(p_T.to(do_tile_T.type.element_ty), tl.trans(do_tile_T))
 
-            # Advance pointers and absolute row start
+            # Advance pointers and absolute row start, prefetch next
             q_start_abs_dv += BLOCK_M
             qT_ptrs_dv += BLOCK_M * stride_qm
             doT_ptrs_dv += BLOCK_M * stride_dom
             m_ptrs_dv += BLOCK_M * stride_mm
+            # Prefetch next tiles for next iteration guarded by runtime branch
+            if (_it + 1) < num_m_blocks_total_dyn:
+                q_tile_T = tl.load(qT_ptrs_dv, mask=valid_kv, other=0.0)
+                do_tile_T = tl.load(doT_ptrs_dv, mask=valid_kv, other=0.0)
+                m_rows = tl.load(m_ptrs_dv, mask=(valid_kv & (offs_m < BLOCK_M)), other=-float("inf"))
 
         # Store accumulated dV and scaled dK for this KV tile
         dv_ptrs_out = (
@@ -441,11 +451,12 @@ def la_bwd_dkdv_inner(
         qT_ptrs_dk = tl.multiple_of(qT_ptrs_dk, (16, 1))
         doT_ptrs_dk = tl.multiple_of(doT_ptrs_dk, (16, 1))
         q_start_abs_dk = batch_idx * N_CTX_Q
+        # Prefetch first tiles
+        q_tile_T = tl.load(qT_ptrs_dk, mask=valid_kv)
+        do_tile_T = tl.load(doT_ptrs_dk, mask=valid_kv)
+        m_rows = tl.load(m_ptrs_dk, mask=(valid_kv & (offs_m < BLOCK_M)), other=-float("inf"))
+        delta_rows = tl.load(delta_ptrs_dk, mask=(valid_kv & (offs_m < BLOCK_M)), other=0.0)
         for _it in range(0, num_m_blocks_total_dyn):
-            q_tile_T = tl.load(qT_ptrs_dk, mask=valid_kv)
-            do_tile_T = tl.load(doT_ptrs_dk, mask=valid_kv)
-            m_rows = tl.load(m_ptrs_dk, mask=(valid_kv & (offs_m < BLOCK_M)), other=-float("inf"))
-            delta_rows = tl.load(delta_ptrs_dk, mask=(valid_kv & (offs_m < BLOCK_M)), other=0.0)
 
             qk_T = tl.dot(k_tile, q_tile_T) * sm_scale
             p_T = tl.math.exp2(qk_T * RCP_LN2 - m_rows[None, :] * RCP_LN2)
@@ -469,6 +480,12 @@ def la_bwd_dkdv_inner(
             doT_ptrs_dk += BLOCK_M * stride_dom
             m_ptrs_dk += BLOCK_M * stride_mm
             delta_ptrs_dk += BLOCK_M * stride_deltam
+            # Prefetch next tiles for next iteration guarded by runtime branch
+            if (_it + 1) < num_m_blocks_total_dyn:
+                q_tile_T = tl.load(qT_ptrs_dk, mask=valid_kv, other=0.0)
+                do_tile_T = tl.load(doT_ptrs_dk, mask=valid_kv, other=0.0)
+                m_rows = tl.load(m_ptrs_dk, mask=(valid_kv & (offs_m < BLOCK_M)), other=-float("inf"))
+                delta_rows = tl.load(delta_ptrs_dk, mask=(valid_kv & (offs_m < BLOCK_M)), other=0.0)
 
         dk_ptrs_out = tl.multiple_of(dk_ptrs_out, (1, 16))
         tl.store(dk_ptrs_out, (dk_acc * sm_scale).to(DK.type.element_ty), mask=valid_kv)
@@ -631,12 +648,13 @@ def la_bwd_dq_inner(
         v_ptrs = tl.multiple_of(v_ptrs, (1, 16))
         k_start_abs = b_seq_size_blocks * BLOCK_N
 
-        # Stream across all K/V tiles for this batch/head
-        # Dynamic loop to avoid heavy unrolling and register pressure
+        # Stream across all K/V tiles for this batch/head with double-buffering
+        # Prefetch first K tile
+        mask_kv_iter = valid_q
+        k_tile = tl.load(k_ptrs, mask=mask_kv_iter, other=0.0)
+        k_ptrs_next = k_ptrs + BLOCK_N * stride_kn
+        v_ptrs_next = v_ptrs + BLOCK_N * stride_vn
         for it in range(0, num_n_blocks_per_batch):
-            # Mask loads by range
-            mask_kv_iter = valid_q
-            k_tile = tl.load(k_ptrs, mask=mask_kv_iter, other=0.0)
 
             # Reconstruct logits and probabilities using exp2
             qk = tl.dot(q_tile, tl.trans(k_tile)) * sm_scale
@@ -653,9 +671,13 @@ def la_bwd_dq_inner(
             ds = p * (dp - delta_rows[:, None])
             dq_acc += tl.dot(ds.to(k_tile.dtype), k_tile)
 
-            # Advance pointers and absolute K start
-            k_ptrs += BLOCK_N * stride_kn
-            v_ptrs += BLOCK_N * stride_vn
+            # Advance pointers and absolute K start, prefetch next K tile guarded by runtime branch
+            if (it + 1) < num_n_blocks_per_batch:
+                k_ptrs = k_ptrs_next
+                v_ptrs = v_ptrs_next
+                k_ptrs_next += BLOCK_N * stride_kn
+                v_ptrs_next += BLOCK_N * stride_vn
+                k_tile = tl.load(k_ptrs, mask=mask_kv_iter, other=0.0)
             k_start_abs += BLOCK_N
 
         # Final scale and store dQ tile
@@ -888,7 +910,7 @@ def persistent_lean_attention_bwd(
         config = {
         "split_kernels": True,
         "BLOCK_SIZE_M": 128, "BLOCK_SIZE_N": 64, "num_warps": 4,
-        "BLOCK_SIZE_M_KV": 64, "BLOCK_SIZE_N_KV": 32, "num_warps_kv": 2, "waves_per_eu": 1,
+        "BLOCK_SIZE_M_KV": 64, "BLOCK_SIZE_N_KV": 64, "num_warps_kv": 2, "waves_per_eu": 1,
         }
     # Resolve total programs (CTAs) preference: explicit arg > config > device
     total_programs_pref = None
