@@ -2,6 +2,7 @@ import math
 import time
 import itertools
 import argparse
+import json
 from typing import Dict, List, Tuple
 
 import torch
@@ -41,12 +42,12 @@ def _default_shape_grid() -> List[Dict]:
 def _default_config_grid() -> List[Dict]:
     # Modest grid to start; expand as needed
     block_m_q = [32, 64, 128]
-    block_n_q = [32, 64, 128]
-    num_warps_q = [2, 4, 8]
+    block_n_q = [64]  # restrict to stable BN
+    num_warps_q = [2, 4]  # avoid 8-warps instability
 
     block_m_kv = [32, 64, 128]
-    block_n_kv = [32, 64, 128]
-    num_warps_kv = [2, 4, 8]
+    block_n_kv = [64]  # restrict to stable BN for KV
+    num_warps_kv = [2, 4]
 
     # waves_per_eu often 1 is a good default; num_stages is fixed in kernel for now
     cfgs = []
@@ -146,6 +147,7 @@ def main():
     parser.add_argument("--warmup", default=10, type=int)
     parser.add_argument("--limit_scenarios", default=None, type=int, help="Limit number of scenarios for quick runs")
     parser.add_argument("--limit_configs", default=None, type=int, help="Limit number of configs per scenario")
+    parser.add_argument("--out", type=str, default="bwd_split_autotune.json", help="Path to write best-config DB as JSON")
     args = parser.parse_args()
 
     device = torch.device(args.device)
@@ -165,7 +167,7 @@ def main():
 
     for scn in scenarios:
         best_ms = float("inf"); best_cfg = None; best_tflops = 0.0
-        # Filter illegal configs for causal: BLOCK_M % BLOCK_N == 0 for both Q and KV
+        # Filter illegal/unstable configs for causal and known-bad mixes
         legal_cfgs = []
         for cfg in cfg_grid:
             legal = True
@@ -174,6 +176,24 @@ def main():
                     legal = False
                 if (cfg["BLOCK_SIZE_M_KV"] % cfg["BLOCK_SIZE_N_KV"]) != 0:
                     legal = False
+                # Prefer BM >= BN in causal to avoid large masked tails
+                if cfg["BLOCK_SIZE_M"] < cfg["BLOCK_SIZE_N"]:
+                    legal = False
+                if cfg["BLOCK_SIZE_M_KV"] < cfg["BLOCK_SIZE_N_KV"]:
+                    legal = False
+            # Heuristic: very small N tiles with high warps are unstable on some backends
+            if cfg["BLOCK_SIZE_N"] == 32 and cfg["num_warps"] >= 8:
+                legal = False
+            if cfg["BLOCK_SIZE_N_KV"] == 32 and cfg["num_warps_kv"] >= 8:
+                legal = False
+            # Stronger filter: avoid N=32 entirely for now
+            if cfg["BLOCK_SIZE_N"] == 32 or cfg["BLOCK_SIZE_N_KV"] == 32:
+                legal = False
+            # Avoid 8 warps on small tiles to reduce compiler pressure
+            if cfg["num_warps"] >= 8 and (cfg["BLOCK_SIZE_M"] <= 64 or cfg["BLOCK_SIZE_N"] <= 64):
+                legal = False
+            if cfg["num_warps_kv"] >= 8 and (cfg["BLOCK_SIZE_M_KV"] <= 64 or cfg["BLOCK_SIZE_N_KV"] <= 64):
+                legal = False
             # Also filter ridiculous tile larger than context
             if cfg["BLOCK_SIZE_M"] > scn["n_ctx_q"] or cfg["BLOCK_SIZE_M_KV"] > scn["n_ctx_q"]:
                 legal = False
@@ -201,6 +221,29 @@ def main():
     print("\n==== Summary (best per scenario) ====")
     for scn, cfg, ms, tf in results:
         print(f"{format_scn(scn)} | {ms:.3f} ms | {tf:.2f} TF/s | cfg={cfg}")
+
+    # Write config DB to disk
+    db = []
+    for scn, cfg, ms, tf in results:
+        db.append({
+            "key": {
+                "causal": int(scn["causal"]),
+                "B": scn["batch"],
+                "H": scn["heads"],
+                "D": scn["head_dim"],
+                "NQ": scn["n_ctx_q"],
+                "NK": scn["n_ctx_k"],
+            },
+            "config": cfg,
+            "ms": ms,
+            "tflops": tf,
+        })
+    try:
+        with open(args.out, "w") as f:
+            json.dump(db, f)
+        print(f"\nWrote {len(db)} best-config entries to {args.out}")
+    except Exception as e:
+        print(f"Failed to write autotune DB to {args.out}: {e}")
 
 
 if __name__ == "__main__":

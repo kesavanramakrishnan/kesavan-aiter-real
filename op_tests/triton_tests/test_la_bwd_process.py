@@ -185,23 +185,27 @@ def _run_la_bwd_process_test(
     # print("dk_la", dk_la)
     # print("dk_flash", dk_flash)
     #Compare Lean Attention with Flash Attention
+    # print("dq_la", dq_la)
+    # print("dq_flash", dq_flash)
+
+    
     torch.testing.assert_close(dq_la, dq_flash, atol=atol, rtol=rtol, msg="dQ (Lean Attn vs Flash Attn)")
     torch.testing.assert_close(dk_la, dk_flash, atol=atol, rtol=rtol, msg="dK (Lean Attn vs Flash Attn)")
     torch.testing.assert_close(dv_la, dv_flash, atol=atol, rtol=rtol, msg="dV (Lean Attn vs Flash Attn)")
 
-# @pytest.mark.parametrize("BATCH", [1, 2, 4, 8, 16])
-# @pytest.mark.parametrize("NUM_Q_HEADS, NUM_K_HEADS", [(1, 1), (16,16), (48,48)])
-# @pytest.mark.parametrize("HEAD_SZ", [64])
-# @pytest.mark.parametrize("SEQLEN_Q, SEQLEN_K", ([(1024, 1024), (2048, 2048), (4096, 4096), (8192, 8192), (1024, 4096)]))
-# @pytest.mark.parametrize("causal", [False, True])
-# @pytest.mark.parametrize("dtype", [torch.float16])
-
-@pytest.mark.parametrize("BATCH", [16])
-@pytest.mark.parametrize("NUM_Q_HEADS, NUM_K_HEADS", [(16,16)])
-@pytest.mark.parametrize("HEAD_SZ", [128])
-@pytest.mark.parametrize("SEQLEN_Q, SEQLEN_K", ([(1024, 1024)]))
-@pytest.mark.parametrize("causal", [False])
+@pytest.mark.parametrize("BATCH", [1, 2, 4, 8, 16])
+@pytest.mark.parametrize("NUM_Q_HEADS, NUM_K_HEADS", [(1, 1), (16,16), (48,48)])
+@pytest.mark.parametrize("HEAD_SZ", [64])
+@pytest.mark.parametrize("SEQLEN_Q, SEQLEN_K", ([(1024, 1024), (2048, 2048), (4096, 4096), (8192, 8192), (1024, 4096)]))
+@pytest.mark.parametrize("causal", [False, True])
 @pytest.mark.parametrize("dtype", [torch.float16])
+
+# @pytest.mark.parametrize("BATCH", [16])
+# @pytest.mark.parametrize("NUM_Q_HEADS, NUM_K_HEADS", [(16,16)])
+# @pytest.mark.parametrize("HEAD_SZ", [128])
+# @pytest.mark.parametrize("SEQLEN_Q, SEQLEN_K", ([(1024, 1024)]))
+# @pytest.mark.parametrize("causal", [False])
+# @pytest.mark.parametrize("dtype", [torch.float16])
 def test_la_bwd_vs_flash_bwd(
     BATCH: int,
     NUM_Q_HEADS: int,
