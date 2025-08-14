@@ -6,7 +6,7 @@ import triton.language as tl
 import aiter.ops.triton.utils.arch_info as arch_info
 
 # Lean attention backward pass (Triton)
-# - Computes dQ, dK, dV with a fused kernel per-CTA: dK/dV first, then dQ.
+# - Computes dQ, dK, dV with separate kernels: dK/dV first, then dQ.
 # - dK/dV inner loop operates in the transposed domain (tile K, iterate Q^T)
 #   to improve locality and simplify accumulation shapes.
 # - Supports causal and non-causal (ragged) sequences via `batch_num_block_n`.
@@ -671,19 +671,16 @@ def la_bwd_dq_inner(
 
 
 @triton.jit
-def la_bwd_fused_streamk(
-    # tensors
+def la_bwd_kv_streamk(
     Q,
     K,
     V,
     DO,
     M,
     Delta,
-    DQ,
     DK,
     DV,
     batch_num_block_n,
-    # strides
     stride_qm,
     stride_qh,
     stride_qk,
@@ -702,51 +699,27 @@ def la_bwd_fused_streamk(
     stride_deltab,
     stride_deltah,
     stride_deltam,
-    stride_dqm,
-    stride_dqh,
-    stride_dqk,
     stride_dkn_out,
     stride_dkh_out,
     stride_dkk_out,
     stride_dvn_out,
     stride_dvh_out,
     stride_dvk_out,
-    # scalars/scheduling
     sm_scale,
     N_CTX_Q,
     total_n_blocks_all_batches,
-    # KV scheduling
     total_tiles_kv,
     high_load_wgs_kv,
     max_tiles_per_wg_kv,
-    # Q scheduling
-    total_tiles_q,
-    high_load_wgs_q,
-    max_tiles_per_wg_q,
     H: tl.constexpr,
     B: tl.constexpr,
     HEAD_DIM: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     CAUSAL: tl.constexpr,
-    NUM_M_BLOCKS_TOTAL: tl.constexpr,
     MAX_TILES_PER_WG_KV_CONST: tl.constexpr,
-    MAX_N_BLOCKS_PER_BATCH_CONST: tl.constexpr,
+    NUM_M_BLOCKS_TOTAL: tl.constexpr,
 ):
-    """
-    Fused per-CTA kernel: execute dK/dV first, then dQ, to maximize data reuse and
-    minimize launch overhead. Work distribution mirrors the host-side scheduling.
-    """
-    pid = tl.program_id(0)
-
-    offs_m = tl.arange(0, BLOCK_M)
-    offs_n = tl.arange(0, BLOCK_N)
-    offs_k = tl.arange(0, HEAD_DIM)
-
-    # print(f"max_tiles_per_wg_kv: {max_tiles_per_wg_kv}")
-    # print(f"max_tiles_per_wg_q: {max_tiles_per_wg_q}")
-
-    # Phase 1: dK/dV in transposed domain
     la_bwd_dkdv_inner(
         Q,
         K,
@@ -797,7 +770,52 @@ def la_bwd_fused_streamk(
         NUM_M_BLOCKS_TOTAL=NUM_M_BLOCKS_TOTAL,
     )
 
-    # Phase 2: dQ (Q-streaming)
+
+@triton.jit
+def la_bwd_q_streamk(
+    Q,
+    K,
+    V,
+    DO,
+    M,
+    Delta,
+    DQ,
+    batch_num_block_n,
+    stride_qm,
+    stride_qh,
+    stride_qk,
+    stride_kn,
+    stride_kh,
+    stride_kk,
+    stride_vn,
+    stride_vh,
+    stride_vk,
+    stride_dom,
+    stride_doh,
+    stride_dok,
+    stride_mb,
+    stride_mh,
+    stride_mm,
+    stride_deltab,
+    stride_deltah,
+    stride_deltam,
+    stride_dqm,
+    stride_dqh,
+    stride_dqk,
+    sm_scale,
+    N_CTX_Q,
+    total_n_blocks_all_batches,
+    total_tiles_q,
+    high_load_wgs_q,
+    max_tiles_per_wg_q,
+    H: tl.constexpr,
+    B: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    CAUSAL: tl.constexpr,
+    MAX_N_BLOCKS_PER_BATCH_CONST: tl.constexpr,
+):
     la_bwd_dq_inner(
         Q,
         K,
@@ -842,8 +860,6 @@ def la_bwd_fused_streamk(
         CAUSAL=CAUSAL,
         MAX_N_BLOCKS_PER_BATCH_CONST=MAX_N_BLOCKS_PER_BATCH_CONST,
     )
-
-
 def persistent_lean_attention_bwd(
     q: torch.Tensor,     # (B * seq_len_q, H, d)
     k: torch.Tensor,     # (total_seq_len_k, H, d)
@@ -862,14 +878,18 @@ def persistent_lean_attention_bwd(
     num_programs: Optional[int] = None,
 ):
     """
-    Host-side launcher for the fused backward pass.
+    Host-side launcher for the split backward pass.
     - Validates shapes, derives scheduling, constructs Delta = sum(do * o) per row.
     - Builds a minimal `batch_num_block_n` if not provided to support ragged non-causal.
-    - Launches a single fused kernel where each CTA computes dK/dV then dQ.
+    - Launches two kernels: KV pass (dK/dV) then Q pass (dQ).
     """
     if config is None:
         # Use a minimal default to avoid external JSON dependency during tests
-        config = {"BLOCK_SIZE_M": 128, "BLOCK_SIZE_N": 64, "num_warps": 4, "waves_per_eu": 1}
+        config = {
+        "split_kernels": True,
+        "BLOCK_SIZE_M": 128, "BLOCK_SIZE_N": 64, "num_warps": 4,
+        "BLOCK_SIZE_M_KV": 64, "BLOCK_SIZE_N_KV": 32, "num_warps_kv": 2, "waves_per_eu": 1,
+        }
     # Resolve total programs (CTAs) preference: explicit arg > config > device
     total_programs_pref = None
     if num_programs is not None:
@@ -920,7 +940,7 @@ def persistent_lean_attention_bwd(
 
     grid = (total_programs,)
 
-    # NOTE: `DqOp` and `locks` are not used by the current fused design;
+    # NOTE: `DqOp` and `locks` are not used by the current design;
     # retained here only for potential experimentation with host-block reductions.
     DqOp = torch.empty(
         (total_programs, BLOCK_M, HEAD_DIM), device=q.device, dtype=dq.dtype
@@ -977,17 +997,52 @@ def persistent_lean_attention_bwd(
     max_tiles_per_wg_q = (total_tiles_q + total_programs - 1) // total_programs
     high_load_wgs_q = total_tiles_q - ((max_tiles_per_wg_q - 1) * total_programs)
 
-    la_bwd_kernel = la_bwd_fused_streamk[grid](
-        q,
-        k,
-        v,
-        do,
-        softmax_lse,
-        Delta,
-        dq,
-        dk,
-        dv,
-        batch_num_block_n,
+    # Launch KV-only kernel
+    # Allow KV pass to use smaller tiles / fewer warps to reduce register pressure
+    BLOCK_M_KV = int(config.get("BLOCK_SIZE_M_KV", BLOCK_M))
+    BLOCK_N_KV = int(config.get("BLOCK_SIZE_N_KV", BLOCK_N))
+    num_m_blocks_total_kv = (N_CTX_Q + BLOCK_M_KV - 1) // BLOCK_M_KV
+    total_n_blocks_all_batches_kv = (N_CTX_K + BLOCK_N_KV - 1) // BLOCK_N_KV
+    total_kv_tiles_kv = total_n_blocks_all_batches_kv * H
+    max_tiles_per_wg_kv_kv = (total_kv_tiles_kv + total_programs - 1) // total_programs
+    high_load_wgs_kv_kv = total_kv_tiles_kv - ((max_tiles_per_wg_kv_kv - 1) * total_programs)
+    num_warps_kv = int(config.get("num_warps_kv", 2))
+
+    # Build KV-specific batch_num_block_n if non-causal to match KV BLOCK_N_KV mapping
+    kv_batch_num_block_n = batch_num_block_n
+    if (not causal):
+        num_n_blocks_total_kv = (N_CTX_K + BLOCK_N_KV - 1) // BLOCK_N_KV
+        if batch_size > 1:
+            per_batch_blocks_kv = num_n_blocks_total_kv // batch_size
+            kv_batch_num_block_n = (
+                torch.arange(1, batch_size + 1, device=q.device, dtype=torch.int32)
+                * per_batch_blocks_kv
+            )
+        else:
+            kv_batch_num_block_n = torch.tensor([num_n_blocks_total_kv], device=q.device, dtype=torch.int32)
+
+    kv_kernel = la_bwd_kv_streamk[grid](
+        q, k, v, do, softmax_lse, Delta, dk, dv, kv_batch_num_block_n,
+        q.stride(0), q.stride(1), q.stride(2),
+        k.stride(0), k.stride(1), k.stride(2),
+        v.stride(0), v.stride(1), v.stride(2),
+        do.stride(0), do.stride(1), do.stride(2),
+        softmax_lse.stride(0), softmax_lse.stride(1), softmax_lse.stride(2),
+        Delta.stride(0), Delta.stride(1), Delta.stride(2),
+        dk.stride(0), dk.stride(1), dk.stride(2),
+        dv.stride(0), dv.stride(1), dv.stride(2),
+        sm_scale, N_CTX_Q,
+        total_n_blocks_all_batches_kv,
+        total_kv_tiles_kv, high_load_wgs_kv_kv, max_tiles_per_wg_kv_kv,
+        H=H, B=batch_size, HEAD_DIM=HEAD_DIM, BLOCK_M=BLOCK_M_KV, BLOCK_N=BLOCK_N_KV, CAUSAL=causal,
+        MAX_TILES_PER_WG_KV_CONST=max_tiles_per_wg_kv_kv,
+        NUM_M_BLOCKS_TOTAL=num_m_blocks_total_kv,
+        num_warps=num_warps_kv, waves_per_eu=config["waves_per_eu"], num_stages=1, num_ctas=1,
+    )
+
+    # Launch Q-only kernel (Q path uses original BLOCK_N mapping)
+    q_kernel = la_bwd_q_streamk[grid](
+        q, k, v, do, softmax_lse, Delta, dq, batch_num_block_n,
         q.stride(0), q.stride(1), q.stride(2),
         k.stride(0), k.stride(1), k.stride(2),
         v.stride(0), v.stride(1), v.stride(2),
@@ -995,30 +1050,13 @@ def persistent_lean_attention_bwd(
         softmax_lse.stride(0), softmax_lse.stride(1), softmax_lse.stride(2),
         Delta.stride(0), Delta.stride(1), Delta.stride(2),
         dq.stride(0), dq.stride(1), dq.stride(2),
-        dk.stride(0), dk.stride(1), dk.stride(2),
-        dv.stride(0), dv.stride(1), dv.stride(2),
-        sm_scale,
-        N_CTX_Q,
+        sm_scale, N_CTX_Q,
         total_n_blocks_all_batches,
-        total_kv_tiles,
-        high_load_wgs_kv,
-        max_tiles_per_wg_kv,
-        total_tiles_q,
-        high_load_wgs_q,
-        max_tiles_per_wg_q,
-        H=H,
-        B=batch_size,
-        HEAD_DIM=HEAD_DIM,
-        BLOCK_M=BLOCK_M,
-        BLOCK_N=BLOCK_N,
-        CAUSAL=causal,
-        MAX_TILES_PER_WG_KV_CONST=max_tiles_per_wg_kv,
+        total_tiles_q, high_load_wgs_q, max_tiles_per_wg_q,
+        H=H, B=batch_size, HEAD_DIM=HEAD_DIM, BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, CAUSAL=causal,
         MAX_N_BLOCKS_PER_BATCH_CONST=num_n_blocks,
-        num_warps=config["num_warps"],
-        waves_per_eu=config["waves_per_eu"],
-        num_stages=1,
-        num_ctas=1,
-        NUM_M_BLOCKS_TOTAL=num_m_blocks_total,
+        num_warps=config["num_warps"], waves_per_eu=config["waves_per_eu"], num_stages=1, num_ctas=1,
     )
-    print(f"la bwd kernel {la_bwd_kernel.n_regs} registers used, {la_bwd_kernel.n_spills} spills")
+
+    print(f"la bwd kv kernel {kv_kernel.n_regs} regs, {kv_kernel.n_spills} spills; q kernel {q_kernel.n_regs} regs, {q_kernel.n_spills} spills")
     return

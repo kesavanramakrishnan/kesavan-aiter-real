@@ -195,10 +195,10 @@ def _run_la_bwd_process_test(
 # @pytest.mark.parametrize("causal", [False, True])
 # @pytest.mark.parametrize("dtype", [torch.float16])
 
-@pytest.mark.parametrize("BATCH", [1])
-@pytest.mark.parametrize("NUM_Q_HEADS, NUM_K_HEADS", [(1,1)])
+@pytest.mark.parametrize("BATCH", [16])
+@pytest.mark.parametrize("NUM_Q_HEADS, NUM_K_HEADS", [(16,16)])
 @pytest.mark.parametrize("HEAD_SZ", [128])
-@pytest.mark.parametrize("SEQLEN_Q, SEQLEN_K", ([(1024, 4096)]))
+@pytest.mark.parametrize("SEQLEN_Q, SEQLEN_K", ([(1024, 1024)]))
 @pytest.mark.parametrize("causal", [False])
 @pytest.mark.parametrize("dtype", [torch.float16])
 def test_la_bwd_vs_flash_bwd(

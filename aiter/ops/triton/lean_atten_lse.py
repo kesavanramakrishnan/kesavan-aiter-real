@@ -263,6 +263,7 @@ def _persistent_lean_attention(
         gqa_group_size=GQA_GROUP_SIZE,
         store_lse=return_lse,
         ln_2=(1.0 / LOG_TWO_E),
+        use_64_indexing=((k.stride(0) * N_CTX_K) >= (1 << 31) or (v.stride(0) * N_CTX_K) >= (1 << 31)),
     )
     """
     kernel_timing["attn_fwd"]["end_event"].record()
@@ -428,34 +429,8 @@ def calculate_max_output_tiles_analytically(
             wg_end_in_head = min(end_iter, head_start_iter + tiles_per_head)
 
             if not causal:
-                # For non-causal, each head has one output tile per batch item per M-block.
-                # Count how many batch segments this WG's range intersects within one M-block for this head,
-                # then multiply by the number of M-blocks to form a safe upper bound.
-                if hasattr(batch_num_block_n, "tolist"):
-                    prefix_sums = batch_num_block_n.tolist()
-                else:
-                    prefix_sums = batch_num_block_n
-
-                # Build per-batch segment ranges relative to the head start for a single M-block span.
-                prev_end = 0
-                segments = []
-                for b in range(batch_size):
-                    end = prefix_sums[b]
-                    segments.append((prev_end, end))
-                    prev_end = end
-
-                # WG's range relative to the head start
-                relative_start = wg_start_in_head - head_start_iter
-                relative_end = wg_end_in_head - head_start_iter
-
-                # Number of segments intersected within a single M-block
-                seg_intersections = 0
-                for seg_start, seg_end in segments:
-                    if (relative_start < seg_end) and (relative_end > seg_start):
-                        seg_intersections += 1
-
-                # Safe upper bound across all M-blocks this head has
-                total_output_tiles_for_wg += max(1, seg_intersections) * max(1, num_m_blocks)
+                # For non-causal, each head is one output tile (match baseline implementation)
+                total_output_tiles_for_wg += 1
                 continue
 
             # --- Causal Logic using Binary Search ---
@@ -534,6 +509,7 @@ def _attention_inner(
     HEAD_DIM,
     local_iter,
     local_iter_end,
+    use_64_indexing: tl.constexpr,
 ):
     """
     Performs attention calculation for an (maybe partial) output tile
@@ -577,13 +553,16 @@ def _attention_inner(
         l_i = l_i * alpha + l_ij
         m_i = m_ij.to(m_i.dtype)
 
-        BLOCK_N64 = tl.full((), BLOCK_N, tl.int64)
-        stride_kn64 = tl.full((), stride_kn, tl.int64)
-        stride_vn64 = tl.full((), stride_vn, tl.int64)
-
-        # update k/v pointer
-        v_ptrs += BLOCK_N64 * stride_vn64
-        k_ptrs += BLOCK_N64 * stride_kn64
+        if use_64_indexing:
+            BLOCK_N64 = tl.full((), BLOCK_N, tl.int64)
+            stride_kn64 = tl.full((), stride_kn, tl.int64)
+            stride_vn64 = tl.full((), stride_vn, tl.int64)
+            # update k/v pointer
+            v_ptrs += BLOCK_N64 * stride_vn64
+            k_ptrs += BLOCK_N64 * stride_kn64
+        else:
+            v_ptrs += BLOCK_N * stride_vn
+            k_ptrs += BLOCK_N * stride_kn
 
     return m_i, l_i, acc
 
@@ -641,6 +620,7 @@ def la_persistent(
     gqa_group_size: tl.constexpr,
     store_lse: tl.constexpr,
     ln_2,
+    use_64_indexing: tl.constexpr,
 ):
     if is_pod:
         current_pid = pod_pid
@@ -726,6 +706,7 @@ def la_persistent(
                 gqa_group_size=gqa_group_size,
                 store_lse=store_lse,
                 ln_2=ln_2,
+                use_64_indexing=use_64_indexing,
             )
 
 
@@ -782,6 +763,7 @@ def la_persistent_inner(
     gqa_group_size: tl.constexpr,
     store_lse: tl.constexpr,
     ln_2,
+    use_64_indexing: tl.constexpr,
 ):
 
     tl.assume(stride_qm > 0)  # n_ctx_q
@@ -864,11 +846,6 @@ def la_persistent_inner(
     offs_n = tl.arange(0, BLOCK_N)
     offs_k = tl.arange(0, HEAD_DIM)
 
-    # Minimal 64-bit casts: only for the stride(0) term in K/V pointers
-    BLOCK_N64 = tl.full((), BLOCK_N, tl.int64)
-    stride_kn64 = tl.full((), stride_kn, tl.int64)
-    stride_vn64 = tl.full((), stride_vn, tl.int64)
-
     if causal:
         b_seq_size = tile_batch_idx * num_n_blocks
     else:
@@ -878,8 +855,16 @@ def la_persistent_inner(
             b_seq_size = tl.load(
                 batch_num_block_n + tile_batch_idx - 1
             )  # Previous batch size
-    
-    tile_khead_idx = tile_head_idx // gqa_group_size
+
+    if gqa_group_size == 1:
+        tile_khead_idx = tile_head_idx
+    else:
+        tile_khead_idx = tile_head_idx // gqa_group_size
+
+    # if use_64_indexing:
+    BLOCK_N64 = tl.full((), BLOCK_N, tl.int64)
+    stride_kn64 = tl.full((), stride_kn, tl.int64)
+    stride_vn64 = tl.full((), stride_vn, tl.int64)
     bn64 = tl.full((), b_seq_size, tl.int64) + tl.full((), local_iter, tl.int64)
     k_offs = (
         (bn64 * BLOCK_N64) * stride_kn64
@@ -893,6 +878,20 @@ def la_persistent_inner(
         + offs_n[:, None] * stride_vn
         + offs_k[None, :] * stride_vk
     )
+    # else:
+    #     bn32 = b_seq_size + local_iter
+    #     k_offs = (
+    #         (bn32 * BLOCK_N) * stride_kn
+    #         + tile_khead_idx * stride_kh
+    #         + offs_n[None, :] * stride_kn
+    #         + offs_k[:, None] * stride_kk
+    #     )
+    #     v_offs = (
+    #         (bn32 * BLOCK_N) * stride_vn
+    #         + tile_khead_idx * stride_vh
+    #         + offs_n[:, None] * stride_vn
+    #         + offs_k[None, :] * stride_vk
+    #     )
 
     k_ptrs = K + k_offs
     k_ptrs = tl.multiple_of(k_ptrs, (16, 1))
@@ -941,6 +940,7 @@ def la_persistent_inner(
         HEAD_DIM,
         local_iter,
         local_iter_end,
+        use_64_indexing=True,
     )
 
     # initialize pointer to m and l
@@ -959,6 +959,7 @@ def la_persistent_inner(
     if not causal:
         rows_in_tile = BLOCK_M
     mask_m = offs_m < rows_in_tile
+    is_full_tile = rows_in_tile == BLOCK_M
 
     if not host_block:
         # Update pointers of partial results Mp[cta], Lp[cta], Op[cta]
@@ -971,9 +972,14 @@ def la_persistent_inner(
             + offs_k[None, :] * stride_opn
         )
         
-        tl.store(mp_ptrs, m_i, mask=mask_m, cache_modifier=".wt")
-        tl.store(lp_ptrs, l_i, mask=mask_m, cache_modifier=".wt")
-        tl.store(op_ptrs, acc, mask=mask_m[:, None], cache_modifier=".wt")
+        if is_full_tile:
+            tl.store(mp_ptrs, m_i, cache_modifier=".wt")
+            tl.store(lp_ptrs, l_i, cache_modifier=".wt")
+            tl.store(op_ptrs, acc, cache_modifier=".wt")
+        else:
+            tl.store(mp_ptrs, m_i, mask=mask_m, cache_modifier=".wt")
+            tl.store(lp_ptrs, l_i, mask=mask_m, cache_modifier=".wt")
+            tl.store(op_ptrs, acc, mask=mask_m[:, None], cache_modifier=".wt")
         tl.debug_barrier()
         # tl.store(locks + current_pid, 1, cache_modifier=".wt")
         # According to streamK gemm, store + cache_modifier won't work universally
@@ -1084,8 +1090,12 @@ def la_persistent_inner(
 
         acc0 = acc0 / l_i[:, None]
         acc1 = acc1 / l_i[:, None]
-        tl.store(o_ptrs0, acc0.to(Out.type.element_ty), mask=mask_m[:, None])
-        tl.store(o_ptrs1, acc1.to(Out.type.element_ty), mask=mask_m[:, None])
+        if is_full_tile:
+            tl.store(o_ptrs0, acc0.to(Out.type.element_ty))
+            tl.store(o_ptrs1, acc1.to(Out.type.element_ty))
+        else:
+            tl.store(o_ptrs0, acc0.to(Out.type.element_ty), mask=mask_m[:, None])
+            tl.store(o_ptrs1, acc1.to(Out.type.element_ty), mask=mask_m[:, None])
 
         if store_lse:
             lse_vals = m_i * ln_2 + tl.log(l_i)

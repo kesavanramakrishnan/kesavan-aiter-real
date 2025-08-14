@@ -1697,7 +1697,7 @@ def flash_attn_onekernel_backward(
     )
 
     if causal:
-        bwd_kernel_causal[grid](
+        bwd_kernel = bwd_kernel_causal[grid](
             q,
             k,
             v,
@@ -1749,8 +1749,9 @@ def flash_attn_onekernel_backward(
             USE_INT64_STRIDES=USE_INT64_STRIDES,
             **config_onekernel,
         )
+        print(f"mha onekernel bwd (causal) {bwd_kernel.n_regs} registers used, {bwd_kernel.n_spills} spills")
     else:
-        bwd_kernel_noncausal[grid](
+        bwd_kernel = bwd_kernel_noncausal[grid](
             q,
             k,
             v,
@@ -1802,5 +1803,6 @@ def flash_attn_onekernel_backward(
             USE_INT64_STRIDES=USE_INT64_STRIDES,
             **config_onekernel,
         )
+        print(f"mha onekernel bwd (noncausal) {bwd_kernel.n_regs} registers used, {bwd_kernel.n_spills} spills")
 
     return delta
