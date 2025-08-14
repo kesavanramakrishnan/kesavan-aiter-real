@@ -692,6 +692,19 @@ def la_bwd_dq_inner(
         tl.store(dq_ptrs_out, dq_acc.to(DQ.type.element_ty), mask=valid_q)
 
 
+@triton.autotune(
+    configs=[
+        triton.Config(kwargs={}, num_warps=2, num_stages=1),
+        triton.Config(kwargs={}, num_warps=4, num_stages=1),
+        triton.Config(kwargs={}, num_warps=2, num_stages=2),
+        triton.Config(kwargs={}, num_warps=4, num_stages=2),
+    ],
+    key=[
+        'H', 'B', 'HEAD_DIM', 'N_CTX_Q', 'total_n_blocks_all_batches',
+        'total_tiles_kv', 'CAUSAL'
+    ],
+    reset_to_zero=['DK', 'DV'],
+)
 @triton.jit
 def la_bwd_kv_streamk(
     Q,
@@ -793,6 +806,19 @@ def la_bwd_kv_streamk(
     )
 
 
+@triton.autotune(
+    configs=[
+        triton.Config(kwargs={}, num_warps=2, num_stages=1),
+        triton.Config(kwargs={}, num_warps=4, num_stages=1),
+        triton.Config(kwargs={}, num_warps=2, num_stages=2),
+        triton.Config(kwargs={}, num_warps=4, num_stages=2),
+    ],
+    key=[
+        'H', 'B', 'HEAD_DIM', 'N_CTX_Q', 'total_n_blocks_all_batches',
+        'total_tiles_q', 'CAUSAL'
+    ],
+    reset_to_zero=['DQ'],
+)
 @triton.jit
 def la_bwd_q_streamk(
     Q,
@@ -1059,7 +1085,7 @@ def persistent_lean_attention_bwd(
         H=H, B=batch_size, HEAD_DIM=HEAD_DIM, BLOCK_M=BLOCK_M_KV, BLOCK_N=BLOCK_N_KV, CAUSAL=causal,
         MAX_TILES_PER_WG_KV_CONST=max_tiles_per_wg_kv_kv,
         NUM_M_BLOCKS_TOTAL=num_m_blocks_total_kv,
-        num_warps=num_warps_kv, waves_per_eu=config["waves_per_eu"], num_stages=1, num_ctas=1,
+        waves_per_eu=config["waves_per_eu"],
     )
 
     # Launch Q-only kernel (Q path uses original BLOCK_N mapping)
@@ -1077,7 +1103,7 @@ def persistent_lean_attention_bwd(
         total_tiles_q, high_load_wgs_q, max_tiles_per_wg_q,
         H=H, B=batch_size, HEAD_DIM=HEAD_DIM, BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, CAUSAL=causal,
         MAX_N_BLOCKS_PER_BATCH_CONST=num_n_blocks,
-        num_warps=config["num_warps"], waves_per_eu=config["waves_per_eu"], num_stages=1, num_ctas=1,
+        waves_per_eu=config["waves_per_eu"],
     )
 
     print(f"la bwd kv kernel {kv_kernel.n_regs} regs, {kv_kernel.n_spills} spills; q kernel {q_kernel.n_regs} regs, {q_kernel.n_spills} spills")
