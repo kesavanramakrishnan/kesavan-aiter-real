@@ -43,20 +43,23 @@ def _default_shape_grid() -> List[Dict]:
 def _default_config_grid() -> List[Dict]:
     # Tunable space (narrow and stable by default)
     block_m_q = [64, 128]
-    block_n_q = [64]  # stable
+    block_n_q = [64]  # stable for Q-path for now
     num_warps_q = [2, 4]
 
     block_m_kv = [32, 64, 128]
-    block_n_kv = [64]  # stable
+    # Try larger N for KV tiling to improve arithmetic intensity
+    block_n_kv = [64, 128]
     num_warps_kv = [1, 2, 4]
 
     waves_per_eu_vals = [1, 2]
     num_programs_mult_vals = [1, 2]
+    prefetch_qt_vals = [1, 2]
+    prefetch_kv_vals = [1, 2]
 
     cfgs = []
-    for (bmq, bnq, nwq, bmk, bnk, nwk, wpe, np_mult) in itertools.product(
+    for (bmq, bnq, nwq, bmk, bnk, nwk, wpe, np_mult, pf_qt, pf_kv) in itertools.product(
         block_m_q, block_n_q, num_warps_q, block_m_kv, block_n_kv, num_warps_kv,
-        waves_per_eu_vals, num_programs_mult_vals
+        waves_per_eu_vals, num_programs_mult_vals, prefetch_qt_vals, prefetch_kv_vals
     ):
         cfgs.append({
             "BLOCK_SIZE_M": bmq,
@@ -67,6 +70,10 @@ def _default_config_grid() -> List[Dict]:
             "num_warps_kv": nwk,
             "waves_per_eu": wpe,
             "num_programs_mult": np_mult,
+            # Fused-friendly defaults; can be overridden by CLI/DB
+            "fused": True,
+            "prefetch_qt": pf_qt,
+            "prefetch_kv": pf_kv,
         })
     return cfgs
 
@@ -106,6 +113,12 @@ def run_once(scn: Dict, cfg: Dict, dtype: torch.dtype, device: torch.device, war
         except Exception:
             num_programs = None
 
+    # ensure fused by default for this tuner variant
+    cfg["fused"] = bool(cfg.get("fused", True))
+    # prefetch knobs passed to runtime
+    cfg["prefetch_qt"] = int(cfg.get("prefetch_qt", 1))
+    cfg["prefetch_kv"] = int(cfg.get("prefetch_kv", 1))
+
     # ensure deterministic-ish
     torch.cuda.synchronize()
 
@@ -119,7 +132,6 @@ def run_once(scn: Dict, cfg: Dict, dtype: torch.dtype, device: torch.device, war
         mask = torch.ones(NQ, NK, device=device, dtype=torch.bool).tril(diagonal=(NK - NQ))
         logits.masked_fill_(~mask, float('-inf'))
     lse = torch.logsumexp(logits, dim=-1).to(torch.float32)
-    cfg["fused"] = True
     # warmup
     for _ in range(max(0, warmup)):
         persistent_lean_attention_bwd(
@@ -209,6 +221,9 @@ def main():
                     legal = False
                 if cfg["BLOCK_SIZE_M_KV"] < cfg["BLOCK_SIZE_N_KV"]:
                     legal = False
+            # Force num_programs_mult default to 2 for fused unless user overrides
+            if cfg.get("fused", True) and "num_programs_mult" not in cfg:
+                cfg["num_programs_mult"] = 2
             # Heuristic: very small N tiles with high warps are unstable on some backends
             if cfg["BLOCK_SIZE_N"] == 32 and cfg["num_warps"] >= 8:
                 legal = False
