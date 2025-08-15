@@ -11,32 +11,33 @@ from aiter.ops.triton.lean_atten_bwd_clean import persistent_lean_attention_bwd
 
 
 def _default_shape_grid() -> List[Dict]:
-    # Scenarios chosen to span short/long, balanced/unbalanced K, and head dims
-    scenarios = []
-    batches = [1, 2, 4, 8, 16]
-    heads = [16, 48]
-    head_dims = [128]
-    q_ctxs = [1024, 2048, 4096, 8192]
-    k_ctxs = [1024, 2048, 4096, 8192]
-    causal_flags = [False]
-
-    for B, H, D, NQ, NK, causal in itertools.product(
-        batches, heads, head_dims, q_ctxs, k_ctxs, causal_flags
-    ):
-        # Keep the matrix sizes within reasonable memory for typical dev GPUs
-        # Total bytes roughly: (B*NQ + NK)*H*D*2 bytes * 5-ish tensors
-        est_bytes = (B * NQ + NK) * H * D * 2 * 6
-        if est_bytes > (10 * 1024**3):  # ~10GB
-            continue
-        scenarios.append({
-            "batch": B,
-            "heads": H,
-            "head_dim": D,
-            "n_ctx_q": NQ,
-            "n_ctx_k": NK,
-            "causal": causal,
-        })
-    return scenarios
+	# Scenarios restricted to match benchmark configs
+	bench_configs = [
+		(16, 16, 16, 1024, 1024),
+		(8, 16, 16, 2048, 2048),
+		(4, 16, 16, 4096, 4096),
+		(2, 16, 16, 8192, 8192),
+		(8, 16, 16, 1024, 4096),
+		(1, 16, 16, 4096, 16384),
+		(2, 48, 48, 1024, 1024),
+		(2, 48, 48, 2048, 1024),
+		(2, 48, 48, 4096, 8192),
+		(2, 48, 48, 8192, 4096),
+	]
+	scenarios: List[Dict] = []
+	# Use 128 for head dimension by default (matches kernel-supported head sizes)
+	head_dim = 128
+	causal = False
+	for (B, HQ, HK, NQ, NK) in bench_configs:
+		scenarios.append({
+			"batch": B,
+			"heads": HQ,
+			"head_dim": head_dim,
+			"n_ctx_q": NQ,
+			"n_ctx_k": NK,
+			"causal": causal,
+		})
+	return scenarios
 
 
 def _default_config_grid() -> List[Dict]:
@@ -66,6 +67,10 @@ def _default_config_grid() -> List[Dict]:
             "num_warps_kv": nwk,
             "waves_per_eu": wpe,
             "num_programs_mult": np_mult,
+            # Fused-friendly defaults; can be overridden by CLI/DB
+            "fused": True,
+            "prefetch_qt": 1,
+            "prefetch_kv": 1,
         })
     return cfgs
 
@@ -105,6 +110,12 @@ def run_once(scn: Dict, cfg: Dict, dtype: torch.dtype, device: torch.device, war
         except Exception:
             num_programs = None
 
+    # ensure fused by default for this tuner variant
+    cfg["fused"] = bool(cfg.get("fused", True))
+    # prefetch knobs passed to runtime
+    cfg["prefetch_qt"] = int(cfg.get("prefetch_qt", 1))
+    cfg["prefetch_kv"] = int(cfg.get("prefetch_kv", 1))
+
     # ensure deterministic-ish
     torch.cuda.synchronize()
 
@@ -118,7 +129,6 @@ def run_once(scn: Dict, cfg: Dict, dtype: torch.dtype, device: torch.device, war
         mask = torch.ones(NQ, NK, device=device, dtype=torch.bool).tril(diagonal=(NK - NQ))
         logits.masked_fill_(~mask, float('-inf'))
     lse = torch.logsumexp(logits, dim=-1).to(torch.float32)
-
     # warmup
     for _ in range(max(0, warmup)):
         persistent_lean_attention_bwd(
@@ -208,6 +218,9 @@ def main():
                     legal = False
                 if cfg["BLOCK_SIZE_M_KV"] < cfg["BLOCK_SIZE_N_KV"]:
                     legal = False
+            # Force num_programs_mult default to 2 for fused unless user overrides
+            if cfg.get("fused", True) and "num_programs_mult" not in cfg:
+                cfg["num_programs_mult"] = 2
             # Heuristic: very small N tiles with high warps are unstable on some backends
             if cfg["BLOCK_SIZE_N"] == 32 and cfg["num_warps"] >= 8:
                 legal = False
