@@ -67,10 +67,6 @@ def _default_config_grid() -> List[Dict]:
             "num_warps_kv": nwk,
             "waves_per_eu": wpe,
             "num_programs_mult": np_mult,
-            # Fused-friendly defaults; can be overridden by CLI/DB
-            "fused": True,
-            "prefetch_qt": 1,
-            "prefetch_kv": 1,
         })
     return cfgs
 
@@ -110,12 +106,6 @@ def run_once(scn: Dict, cfg: Dict, dtype: torch.dtype, device: torch.device, war
         except Exception:
             num_programs = None
 
-    # ensure fused by default for this tuner variant
-    cfg["fused"] = bool(cfg.get("fused", True))
-    # prefetch knobs passed to runtime
-    cfg["prefetch_qt"] = int(cfg.get("prefetch_qt", 1))
-    cfg["prefetch_kv"] = int(cfg.get("prefetch_kv", 1))
-
     # ensure deterministic-ish
     torch.cuda.synchronize()
 
@@ -129,6 +119,7 @@ def run_once(scn: Dict, cfg: Dict, dtype: torch.dtype, device: torch.device, war
         mask = torch.ones(NQ, NK, device=device, dtype=torch.bool).tril(diagonal=(NK - NQ))
         logits.masked_fill_(~mask, float('-inf'))
     lse = torch.logsumexp(logits, dim=-1).to(torch.float32)
+    cfg["fused"] = True
     # warmup
     for _ in range(max(0, warmup)):
         persistent_lean_attention_bwd(
@@ -218,9 +209,6 @@ def main():
                     legal = False
                 if cfg["BLOCK_SIZE_M_KV"] < cfg["BLOCK_SIZE_N_KV"]:
                     legal = False
-            # Force num_programs_mult default to 2 for fused unless user overrides
-            if cfg.get("fused", True) and "num_programs_mult" not in cfg:
-                cfg["num_programs_mult"] = 2
             # Heuristic: very small N tiles with high warps are unstable on some backends
             if cfg["BLOCK_SIZE_N"] == 32 and cfg["num_warps"] >= 8:
                 legal = False
