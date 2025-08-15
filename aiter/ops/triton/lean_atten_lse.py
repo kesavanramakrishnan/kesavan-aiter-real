@@ -128,7 +128,10 @@ def _persistent_lean_attention(
     assert (
         HEAD_DIM_Q == HEAD_DIM_K and HEAD_DIM_K == HEAD_DIM_V
     ), "Incompatible Q/K/V Hidden Dimensions"
-    assert HEAD_DIM_K in {16, 32, 64, 128, 256}
+    # Support irregular head dimensions by padding compute width and masking I/O
+    HEAD_DIM_PADDED = triton.next_power_of_2(HEAD_DIM_K)
+    if HEAD_DIM_PADDED < 16:
+        HEAD_DIM_PADDED = 16
 
     # MASKED_BLOCKS is used for prefill/causal for BLOCK_M > BLOCK_N
     # For MI300, BLOCK_M=128, BLOCK_N=64 is better for performance
@@ -168,6 +171,8 @@ def _persistent_lean_attention(
         BLOCK_N,
         total_programs,
     )
+
+    # Keep original split/merge behavior for non-causal; needed for correctness across CTAs
 
     # print(
     #     f"high_load_wgs={high_load_wgs}, max_tiles_per_wg={max_tiles_per_wg}, tiles_per_head={tiles_per_head}"
@@ -209,6 +214,19 @@ def _persistent_lean_attention(
     }
     kernel_timing["attn_fwd"]["start_event"].record()
     """
+    # Determine ragged batching once to avoid repeated global reads
+    ragged_batching = False
+    if (not causal) and (batch_size > 1):
+        diffs = torch.diff(
+            torch.cat(
+                (
+                    torch.tensor([0], device=batch_num_block_n.device, dtype=batch_num_block_n.dtype),
+                    batch_num_block_n,
+                )
+            )
+        )
+        ragged_batching = (diffs != diffs[0]).any().item()
+
     la_kernel = la_persistent[grid](
         False,
         0,
@@ -242,7 +260,8 @@ def _persistent_lean_attention(
         Op.stride(1),  # n_ctx_q
         Op.stride(2),  # head_dim
         program_count=total_programs,
-        HEAD_DIM=HEAD_DIM_K,
+        HEAD_DIM_ORIG=HEAD_DIM_K,
+        HEAD_DIM=HEAD_DIM_PADDED,
         BLOCK_M=BLOCK_M,
         BLOCK_N=BLOCK_N,
         MASKED_BLOCKS=MASKED_BLOCKS,
@@ -264,6 +283,7 @@ def _persistent_lean_attention(
         store_lse=return_lse,
         ln_2=(1.0 / LOG_TWO_E),
         use_64_indexing=((k.stride(0) * N_CTX_K) >= (1 << 31) or (v.stride(0) * N_CTX_K) >= (1 << 31)),
+        RAGGED_BATCHING=ragged_batching,
     )
     """
     kernel_timing["attn_fwd"]["end_event"].record()
@@ -532,7 +552,8 @@ def _attention_inner(
     offs_n,
     BLOCK_M,
     BLOCK_N,
-    HEAD_DIM,
+    HEAD_DIM_ORIG: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
     local_iter,
     local_iter_end,
     use_64_indexing: tl.constexpr,
@@ -540,8 +561,12 @@ def _attention_inner(
     """
     Performs attention calculation for an (maybe partial) output tile
     """
+    # Mask K/V column loads to original head dim; padded tail is zero
+    offs_k_local = tl.arange(0, HEAD_DIM)
+    mask_k_cols_local = offs_k_local < HEAD_DIM_ORIG
+
     for l_iter in range(local_iter, local_iter_end):
-        k = tl.load(k_ptrs)
+        k = tl.load(k_ptrs, mask=mask_k_cols_local[:, None], other=0.0)
         qk = tl.dot(q, k) * qk_scale
 
         if causal:
@@ -571,7 +596,7 @@ def _attention_inner(
 
         # Update accumulator
         acc = acc * alpha[:, None]
-        v = tl.load(v_ptrs)
+        v = tl.load(v_ptrs, mask=mask_k_cols_local[None, :], other=0.0)
         acc += tl.dot(p.to(v.dtype), v)
 
         # Update stats
@@ -627,6 +652,7 @@ def la_persistent(
     stride_opm,  # n_ctx_q
     stride_opn,  # head_dim
     program_count,
+    HEAD_DIM_ORIG: tl.constexpr,
     HEAD_DIM: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
@@ -647,6 +673,7 @@ def la_persistent(
     store_lse: tl.constexpr,
     ln_2,
     use_64_indexing: tl.constexpr,
+    RAGGED_BATCHING: tl.constexpr,
 ):
     if is_pod:
         current_pid = pod_pid
@@ -715,6 +742,7 @@ def la_persistent(
                     iter=iter,
                     cta_end_tile_gid=cta_end_tile_gid,
                     current_pid=current_pid,
+                    HEAD_DIM_ORIG=HEAD_DIM_ORIG,
                     HEAD_DIM=HEAD_DIM,
                     BLOCK_M=BLOCK_M,
                     BLOCK_N=BLOCK_N,
@@ -734,6 +762,7 @@ def la_persistent(
                     store_lse=store_lse,
                     ln_2=ln_2,
                     use_64_indexing=use_64_indexing,
+                    RAGGED_BATCHING=RAGGED_BATCHING,
                 )
     else:
         while iter < cta_end_tile_gid:
@@ -771,6 +800,7 @@ def la_persistent(
                 iter=iter,
                 cta_end_tile_gid=cta_end_tile_gid,
                 current_pid=current_pid,
+                HEAD_DIM_ORIG=HEAD_DIM_ORIG,
                 HEAD_DIM=HEAD_DIM,
                 BLOCK_M=BLOCK_M,
                 BLOCK_N=BLOCK_N,
@@ -790,6 +820,7 @@ def la_persistent(
                 store_lse=store_lse,
                 ln_2=ln_2,
                 use_64_indexing=use_64_indexing,
+                RAGGED_BATCHING=RAGGED_BATCHING,
             )
 
 
@@ -828,6 +859,7 @@ def la_persistent_inner(
     iter,
     cta_end_tile_gid,
     current_pid,
+    HEAD_DIM_ORIG: tl.constexpr,
     HEAD_DIM: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
@@ -847,6 +879,7 @@ def la_persistent_inner(
     store_lse: tl.constexpr,
     ln_2,
     use_64_indexing: tl.constexpr,
+    RAGGED_BATCHING: tl.constexpr,
 ):
 
     tl.assume(stride_qm > 0)  # n_ctx_q
@@ -894,26 +927,43 @@ def la_persistent_inner(
             tile_head_idx * batch_size + tile_batch_idx
         ) * num_m_blocks + per_head_tile_idx
     else:
-        tile_idx = (
-            tile_head_idx * batch_size
-        )  # Output tile idx, 1 output tile per head per batch
         tile_iter = tile_head_idx * tiles_per_head
         if batch_size == 1:
             req_size = tiles_per_head
+            tile_batch_idx = 0
+            tile_iter_end = tile_iter + req_size
         else:
-            req_size = tl.load(batch_num_block_n)
-        tile_iter_end = tile_iter + req_size
-        for b in range(1, batch_size):
-            next_req_size = tl.load(batch_num_block_n + b)
             local_head_iter = iter - (tile_head_idx * tiles_per_head)
-            if (local_head_iter < next_req_size) and (local_head_iter >= req_size):
-                tile_iter = tile_iter + req_size
-                tile_idx = tile_idx + b
-                tile_iter_end = tile_iter + (next_req_size - req_size)
-            req_size = next_req_size
+            if not RAGGED_BATCHING:
+                req_size = tiles_per_head // batch_size
+                if req_size == 0:
+                    req_size = 1
+                # Determine which batch segment this iter falls into
+                tile_batch_idx = tl.minimum(local_head_iter // req_size, batch_size - 1)
+                # Shift to the start of that batch segment
+                tile_iter = tile_iter + tile_batch_idx * req_size
+                # Segment size, capped by remaining tiles in head
+                remaining = tiles_per_head - tile_batch_idx * req_size
+                seg_size = tl.minimum(req_size, remaining)
+                tile_iter_end = tile_iter + seg_size
+            else:
+                # Ragged batching: use prefix sums to carve per-batch segments
+                req_size = tl.load(batch_num_block_n)
+                tile_iter_end = tile_iter + req_size
+                for b in range(1, batch_size):
+                    next_req_size = tl.load(batch_num_block_n + b)
+                    if (local_head_iter < next_req_size) and (local_head_iter >= req_size):
+                        tile_iter = tile_iter + req_size
+                        tile_batch_idx = b
+                        tile_iter_end = tile_iter + (next_req_size - req_size)
+                    req_size = next_req_size
     # Local lean tile ID within a loop of an output tile
     local_iter = iter - tile_iter
     local_iter_end = tl.minimum(tile_iter_end, cta_end_tile_gid) - tile_iter
+
+    # If this CTA's assigned range has no work for the current head segment, jump to end of segment
+    if local_iter_end <= local_iter:
+        return tl.minimum(cta_end_tile_gid, tile_iter_end)
 
     if iter == tile_iter:
         host_block = True
@@ -928,16 +978,25 @@ def la_persistent_inner(
     offs_m = tl.arange(0, BLOCK_M)
     offs_n = tl.arange(0, BLOCK_N)
     offs_k = tl.arange(0, HEAD_DIM)
+    mask_k_cols = offs_k < HEAD_DIM_ORIG
 
     if causal:
         b_seq_size = tile_batch_idx * num_n_blocks
     else:
-        tile_batch_idx = tile_idx % batch_size
-        b_seq_size = 0
-        if tile_batch_idx > 0:
-            b_seq_size = tl.load(
-                batch_num_block_n + tile_batch_idx - 1
-            )  # Previous batch size
+        # tile_batch_idx computed above for non-causal; recompute defensively in case of upstream changes
+        if not RAGGED_BATCHING:
+            local_head_iter = iter - (tile_head_idx * tiles_per_head)
+            per_batch = tiles_per_head // batch_size
+            if per_batch == 0:
+                per_batch = 1
+            tile_batch_idx = tl.minimum(local_head_iter // per_batch, batch_size - 1)
+            total_blocks = tl.load(batch_num_block_n + (batch_size - 1))
+            per_batch_blocks = total_blocks // batch_size
+            b_seq_size = per_batch_blocks * tile_batch_idx
+        else:
+            b_seq_size = 0
+            if tile_batch_idx > 0:
+                b_seq_size = tl.load(batch_num_block_n + tile_batch_idx - 1)
 
     if gqa_group_size == 1:
         tile_khead_idx = tile_head_idx
@@ -1001,7 +1060,7 @@ def la_persistent_inner(
     l_i = tl.zeros([BLOCK_M], dtype=tl.float32) + 1.0
     acc = tl.zeros([BLOCK_M, HEAD_DIM], dtype=tl.float32)
 
-    q = tl.load(q_ptrs)
+    q = tl.load(q_ptrs, mask=mask_k_cols[None, :], other=0.0)
 
     m_i, l_i, acc = _attention_inner(
         q,
@@ -1020,6 +1079,7 @@ def la_persistent_inner(
         offs_n,
         BLOCK_M,
         BLOCK_N,
+        HEAD_DIM_ORIG,
         HEAD_DIM,
         local_iter,
         local_iter_end,
@@ -1058,11 +1118,16 @@ def la_persistent_inner(
         if is_full_tile:
             tl.store(mp_ptrs, m_i, cache_modifier=".wt")
             tl.store(lp_ptrs, l_i, cache_modifier=".wt")
-            tl.store(op_ptrs, acc, cache_modifier=".wt")
+            tl.store(op_ptrs, acc, mask=mask_k_cols[None, :], cache_modifier=".wt")
         else:
             tl.store(mp_ptrs, m_i, mask=mask_m, cache_modifier=".wt")
             tl.store(lp_ptrs, l_i, mask=mask_m, cache_modifier=".wt")
-            tl.store(op_ptrs, acc, mask=mask_m[:, None], cache_modifier=".wt")
+            tl.store(
+                op_ptrs,
+                acc,
+                mask=(mask_m[:, None] & mask_k_cols[None, :]),
+                cache_modifier=".wt",
+            )
         tl.debug_barrier()
         # tl.store(locks + current_pid, 1, cache_modifier=".wt")
         # According to streamK gemm, store + cache_modifier won't work universally
@@ -1137,9 +1202,14 @@ def la_persistent_inner(
 
                 m_cta = tl.load(mp_ptrs)
                 l_cta = tl.load(lp_ptrs)
-                # acc_cta = tl.load(op_ptrs)
-                acc_cta0 = tl.load(op_ptrs0)
-                acc_cta1 = tl.load(op_ptrs1)
+                # Load partial accumulators with head-dim masks to avoid OOB
+                COLS_HALF_MERGE: tl.constexpr = HEAD_DIM // 2
+                offs0_merge = tl.arange(0, COLS_HALF_MERGE)
+                offs1_merge = tl.arange(0, COLS_HALF_MERGE) + COLS_HALF_MERGE
+                mask_cols0_merge = offs0_merge < HEAD_DIM_ORIG
+                mask_cols1_merge = offs1_merge < HEAD_DIM_ORIG
+                acc_cta0 = tl.load(op_ptrs0, mask=mask_cols0_merge[None, :], other=0.0)
+                acc_cta1 = tl.load(op_ptrs1, mask=mask_cols1_merge[None, :], other=0.0)
 
                 # m_i is the host CTA's m, m_cta is other nonHost CTA's m
                 m_new = tl.maximum(m_cta, m_i)
@@ -1173,12 +1243,25 @@ def la_persistent_inner(
 
         acc0 = acc0 / l_i[:, None]
         acc1 = acc1 / l_i[:, None]
+        COLS_HALF: tl.constexpr = HEAD_DIM // 2
+        offs0 = tl.arange(0, COLS_HALF)
+        offs1 = tl.arange(0, COLS_HALF) + COLS_HALF
+        mask_cols0 = offs0 < HEAD_DIM_ORIG
+        mask_cols1 = offs1 < HEAD_DIM_ORIG
         if is_full_tile:
-            tl.store(o_ptrs0, acc0.to(Out.type.element_ty))
-            tl.store(o_ptrs1, acc1.to(Out.type.element_ty))
+            tl.store(o_ptrs0, acc0.to(Out.type.element_ty), mask=mask_cols0[None, :])
+            tl.store(o_ptrs1, acc1.to(Out.type.element_ty), mask=mask_cols1[None, :])
         else:
-            tl.store(o_ptrs0, acc0.to(Out.type.element_ty), mask=mask_m[:, None])
-            tl.store(o_ptrs1, acc1.to(Out.type.element_ty), mask=mask_m[:, None])
+            tl.store(
+                o_ptrs0,
+                acc0.to(Out.type.element_ty),
+                mask=(mask_m[:, None] & mask_cols0[None, :]),
+            )
+            tl.store(
+                o_ptrs1,
+                acc1.to(Out.type.element_ty),
+                mask=(mask_m[:, None] & mask_cols1[None, :]),
+            )
 
         if store_lse:
             lse_vals = m_i * ln_2 + tl.log(l_i)

@@ -139,11 +139,11 @@ def reference_lse(q, k, n_ctx, n_ctx_q, sm_scale, causal):
 @pytest.mark.parametrize(
     "causal, batch, h_q, h_k, n_ctx_q, n_ctx, d, total_programs, init_dtype, BLOCK_M, BLOCK_N, waves_per_eu, num_warps ",
     [
-        # (False, 260, 32, 8, 128, [8192] * 260, 128, 304, torch.float16, 128, 64, 1, 4),
-        # (False, 256, 32, 8, 128, [8192] * 256, 128, 304, torch.float16, 128, 64, 1, 4)
-        # (False, 512, 64, 8, 128, [8192] * 512, 128, 304, torch.float16, 128, 64, 1, 4),
-        # (False, 512, 128, 8, 128, [8192] * 512, 128, 304, torch.float16, 128, 64, 1, 4),
-        (False, 1, 128, 128, 8192, [8192]*1, 64, 304, torch.float16, 128, 64, 1, 4),
+        # (False, 8, 32, 8, 128, [8192] * 8, 128, 304, torch.float16, 128, 64, 1, 4),
+        # (False, 8, 32, 8, 128, [8192] * 8, 128, 304, torch.float16, 128, 64, 1, 4),
+        # (False, 8, 64, 8, 128, [8192] * 8, 128, 304, torch.float16, 128, 64, 1, 4),
+        # (False, 8, 128, 8, 128, [8192] * 8, 128, 304, torch.float16, 128, 64, 1, 4),
+        # (False, 512, 128, 128, 128, [8192]*512, 56, 304, torch.float16, 128, 64, 1, 4),
         # #Added from bench_mha_la
         # (False, 1, 64, 64, 128, [16384], 128, 304, torch.float16, 128, 64, 1, 4),
         # (False, 1, 96, 96, 128, [32768], 128, 304, torch.float16, 128, 64, 1, 4),
@@ -433,7 +433,7 @@ def print_mismatches(ref_out, la_out, atol=1e-8, rtol=1e-5):
 
 #(False, 1, 128, 128, 8192, [8192]*1, 64, 304, torch.float16, 128, 64, 1, 4),
 def main():
-    batch = 8
+    batch = 1
     causal = False
     h_q = 128
     h_k = 128

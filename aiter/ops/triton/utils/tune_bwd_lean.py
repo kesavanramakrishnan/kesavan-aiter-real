@@ -13,12 +13,12 @@ from aiter.ops.triton.lean_atten_bwd_clean import persistent_lean_attention_bwd
 def _default_shape_grid() -> List[Dict]:
     # Scenarios chosen to span short/long, balanced/unbalanced K, and head dims
     scenarios = []
-    batches = [2, 4, 8, 16]
-    heads = [16]
-    head_dims = [64, 128]
+    batches = [1, 2, 4, 8, 16]
+    heads = [16, 48]
+    head_dims = [128]
     q_ctxs = [1024, 2048, 4096, 8192]
     k_ctxs = [1024, 2048, 4096, 8192]
-    causal_flags = [True, False]
+    causal_flags = [False]
 
     for B, H, D, NQ, NK, causal in itertools.product(
         batches, heads, head_dims, q_ctxs, k_ctxs, causal_flags
@@ -86,6 +86,7 @@ def allocate_tensors(scn: Dict, dtype: torch.dtype, device: torch.device):
     dq = torch.empty_like(q)
     dk = torch.empty_like(k)
     dv = torch.empty_like(k)
+    # LSE will be computed per scenario in run_once for numerical stability
     softmax_lse = torch.empty((B, H, NQ), device=device, dtype=torch.float32)
 
     return q, k, v, do, o, softmax_lse, dq, dk, dv
@@ -107,6 +108,17 @@ def run_once(scn: Dict, cfg: Dict, dtype: torch.dtype, device: torch.device, war
     # ensure deterministic-ish
     torch.cuda.synchronize()
 
+    # Precompute numerically-stable softmax LSE (B, H, NQ)
+    B = scn["batch"]; H = scn["heads"]; NQ = scn["n_ctx_q"]; NK = scn["n_ctx_k"]
+    # Reshape to (B, H, NQ, D) and (B, H, D, NK)
+    q_bhmd = q.view(B, NQ, H, scn["head_dim"]).permute(0, 2, 1, 3).contiguous()
+    k_bhdn = k.view(NK, H, scn["head_dim"]).permute(1, 2, 0).contiguous().unsqueeze(0).expand(B, -1, -1, -1)
+    logits = torch.matmul(q_bhmd.to(torch.float32), k_bhdn.to(torch.float32)) * scale
+    if scn["causal"]:
+        mask = torch.ones(NQ, NK, device=device, dtype=torch.bool).tril(diagonal=(NK - NQ))
+        logits.masked_fill_(~mask, float('-inf'))
+    lse = torch.logsumexp(logits, dim=-1).to(torch.float32)
+
     # warmup
     for _ in range(max(0, warmup)):
         persistent_lean_attention_bwd(
@@ -117,6 +129,7 @@ def run_once(scn: Dict, cfg: Dict, dtype: torch.dtype, device: torch.device, war
             causal=scn["causal"],
             config=cfg,
             num_programs=num_programs,
+            seqlen_k=NK,
         )
     torch.cuda.synchronize()
 
@@ -133,6 +146,7 @@ def run_once(scn: Dict, cfg: Dict, dtype: torch.dtype, device: torch.device, war
             causal=scn["causal"],
             config=cfg,
             num_programs=num_programs,
+            seqlen_k=NK,
         )
     end.record()
     torch.cuda.synchronize()
@@ -238,6 +252,10 @@ def main():
     # Write config DB to disk
     db = []
     for scn, cfg, ms, tf in results:
+        # Include optional num_programs_mult so runtime can scale CTA count to device
+        entry_cfg = dict(cfg)
+        if "num_programs_mult" not in entry_cfg:
+            entry_cfg["num_programs_mult"] = 1
         db.append({
             "key": {
                 "causal": int(scn["causal"]),
@@ -247,7 +265,7 @@ def main():
                 "NQ": scn["n_ctx_q"],
                 "NK": scn["n_ctx_k"],
             },
-            "config": cfg,
+            "config": entry_cfg,
             "ms": ms,
             "tflops": tf,
         })
@@ -255,6 +273,7 @@ def main():
         with open(args.out, "w") as f:
             json.dump(db, f)
         print(f"\nWrote {len(db)} best-config entries to {args.out}")
+        print("To use it, set AITER_BWD_TUNED_DB to this path. Optionally set AITER_BWD_USE_TUNED_GRID=1 to scale CTAs.")
     except Exception as e:
         print(f"Failed to write autotune DB to {args.out}: {e}")
 

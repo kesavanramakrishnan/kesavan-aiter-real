@@ -1,3 +1,7 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2018-2025, Advanced Micro Devices, Inc. All rights reserved.
+
+
 import shutil
 import os
 import subprocess
@@ -152,7 +156,7 @@ def compile_lib(src_file, folder, includes=None, sources=None, cxxflags=None):
             "-DUSE_ROCM",
             "-DENABLE_FP8",
             "-O3",
-            "-std=c++17",
+            "-std=c++20",
             "-DLEGACY_HIPBLAS_DIRECT",
             "-DUSE_PROF_API=1",
             "-D__HIP_PLATFORM_HCC__=1",
