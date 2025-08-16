@@ -775,167 +775,6 @@ def la_bwd_kv_streamk(
     )
 
 
-# Narrow, proven autotune space: num_warps in {2, 4}
-@triton.autotune(
-    configs=[
-        # broader search incl. stages and warps
-        triton.Config(kwargs={}, num_warps=2, num_stages=1),
-        triton.Config(kwargs={}, num_warps=2, num_stages=2),
-        triton.Config(kwargs={}, num_warps=2, num_stages=3),
-        triton.Config(kwargs={}, num_warps=4, num_stages=1),
-        triton.Config(kwargs={}, num_warps=4, num_stages=2),
-    ],
-    key=[
-        'H', 'B', 'HEAD_DIM', 'N_CTX_Q', 'total_n_blocks_all_batches',
-        'total_tiles_kv', 'CAUSAL'
-    ],
-    cache_results=True,
-)
-@triton.jit
-def la_bwd_kv_streamk_causal(
-    *args,
-    H: tl.constexpr,
-    B: tl.constexpr,
-    HEAD_DIM: tl.constexpr,
-    BLOCK_M: tl.constexpr,
-    BLOCK_N: tl.constexpr,
-    PREFETCH_QT: tl.constexpr,
-    waves_per_eu: tl.constexpr,
-):
-    la_bwd_kv_streamk(
-        *args,
-        H=H,
-        B=B,
-        HEAD_DIM=HEAD_DIM,
-        BLOCK_M=BLOCK_M,
-        BLOCK_N=BLOCK_N,
-        CAUSAL=True,
-        MAX_TILES_PER_WG_KV_CONST=args[-3],
-        NUM_M_BLOCKS_TOTAL=args[-2],
-        PREFETCH_QT=PREFETCH_QT,
-        waves_per_eu=waves_per_eu,
-    )
-
-
-@triton.autotune(
-    configs=[
-        triton.Config(kwargs={}, num_warps=2, num_stages=1),
-        triton.Config(kwargs={}, num_warps=2, num_stages=2),
-        triton.Config(kwargs={}, num_warps=2, num_stages=3),
-        triton.Config(kwargs={}, num_warps=4, num_stages=1),
-        triton.Config(kwargs={}, num_warps=4, num_stages=2),
-    ],
-    key=[
-        'H', 'B', 'HEAD_DIM', 'N_CTX_Q', 'total_n_blocks_all_batches',
-        'total_tiles_kv', 'CAUSAL'
-    ],
-    cache_results=True,
-)
-@triton.jit
-def la_bwd_kv_streamk_noncausal(
-    *args,
-    H: tl.constexpr,
-    B: tl.constexpr,
-    HEAD_DIM: tl.constexpr,
-    BLOCK_M: tl.constexpr,
-    BLOCK_N: tl.constexpr,
-    PREFETCH_QT: tl.constexpr,
-    waves_per_eu: tl.constexpr,
-):
-    la_bwd_kv_streamk(
-        *args,
-        H=H,
-        B=B,
-        HEAD_DIM=HEAD_DIM,
-        BLOCK_M=BLOCK_M,
-        BLOCK_N=BLOCK_N,
-        CAUSAL=False,
-        MAX_TILES_PER_WG_KV_CONST=args[-3],
-        NUM_M_BLOCKS_TOTAL=args[-2],
-        PREFETCH_QT=PREFETCH_QT,
-        waves_per_eu=waves_per_eu,
-    )
-
-# Autotuned wrappers that also sweep BLOCK sizes
-@triton.autotune(
-    configs=[
-        triton.Config(kwargs={"BLOCK_M": 64, "BLOCK_N": 128}, num_warps=2, num_stages=2),
-        triton.Config(kwargs={"BLOCK_M": 64, "BLOCK_N": 128}, num_warps=4, num_stages=2),
-        triton.Config(kwargs={"BLOCK_M": 64, "BLOCK_N": 128}, num_warps=2, num_stages=3),
-        triton.Config(kwargs={"BLOCK_M": 128, "BLOCK_N": 64}, num_warps=2, num_stages=2),
-        triton.Config(kwargs={"BLOCK_M": 128, "BLOCK_N": 64}, num_warps=4, num_stages=2),
-    ],
-    key=[
-        'H', 'B', 'HEAD_DIM', 'N_CTX_Q', 'total_n_blocks_all_batches',
-        'total_tiles_kv', 'CAUSAL'
-    ],
-    cache_results=True,
-)
-@triton.jit
-def la_bwd_kv_streamk_causal_auto(
-    *args,
-    H: tl.constexpr,
-    B: tl.constexpr,
-    HEAD_DIM: tl.constexpr,
-    BLOCK_M: tl.constexpr,
-    BLOCK_N: tl.constexpr,
-    PREFETCH_QT: tl.constexpr,
-    waves_per_eu: tl.constexpr,
-):
-    la_bwd_kv_streamk(
-        *args,
-        H=H,
-        B=B,
-        HEAD_DIM=HEAD_DIM,
-        BLOCK_M=BLOCK_M,
-        BLOCK_N=BLOCK_N,
-        CAUSAL=True,
-        MAX_TILES_PER_WG_KV_CONST=args[-3],
-        NUM_M_BLOCKS_TOTAL=args[-2],
-        PREFETCH_QT=PREFETCH_QT,
-        waves_per_eu=waves_per_eu,
-    )
-
-
-@triton.autotune(
-    configs=[
-        triton.Config(kwargs={"BLOCK_M": 64, "BLOCK_N": 128}, num_warps=2, num_stages=2),
-        triton.Config(kwargs={"BLOCK_M": 64, "BLOCK_N": 128}, num_warps=4, num_stages=2),
-        triton.Config(kwargs={"BLOCK_M": 64, "BLOCK_N": 128}, num_warps=2, num_stages=3),
-        triton.Config(kwargs={"BLOCK_M": 128, "BLOCK_N": 64}, num_warps=2, num_stages=2),
-        triton.Config(kwargs={"BLOCK_M": 128, "BLOCK_N": 64}, num_warps=4, num_stages=2),
-    ],
-    key=[
-        'H', 'B', 'HEAD_DIM', 'N_CTX_Q', 'total_n_blocks_all_batches',
-        'total_tiles_kv', 'CAUSAL'
-    ],
-    cache_results=True,
-)
-@triton.jit
-def la_bwd_kv_streamk_noncausal_auto(
-    *args,
-    H: tl.constexpr,
-    B: tl.constexpr,
-    HEAD_DIM: tl.constexpr,
-    BLOCK_M: tl.constexpr,
-    BLOCK_N: tl.constexpr,
-    PREFETCH_QT: tl.constexpr,
-    waves_per_eu: tl.constexpr,
-):
-    la_bwd_kv_streamk(
-        *args,
-        H=H,
-        B=B,
-        HEAD_DIM=HEAD_DIM,
-        BLOCK_M=BLOCK_M,
-        BLOCK_N=BLOCK_N,
-        CAUSAL=False,
-        MAX_TILES_PER_WG_KV_CONST=args[-3],
-        NUM_M_BLOCKS_TOTAL=args[-2],
-        PREFETCH_QT=PREFETCH_QT,
-        waves_per_eu=waves_per_eu,
-    )
-
 @triton.jit
 def la_bwd_q_streamk(
     Q,
@@ -1035,180 +874,6 @@ def la_bwd_q_streamk(
     )
 
 
-@triton.autotune(
-    configs=[
-        triton.Config(kwargs={}, num_warps=2, num_stages=1),
-        triton.Config(kwargs={}, num_warps=2, num_stages=2),
-        triton.Config(kwargs={}, num_warps=2, num_stages=3),
-        triton.Config(kwargs={}, num_warps=4, num_stages=1),
-        triton.Config(kwargs={}, num_warps=4, num_stages=2),
-    ],
-    key=[
-        'H', 'B', 'HEAD_DIM', 'N_CTX_Q', 'total_n_blocks_all_batches',
-        'total_tiles_q', 'CAUSAL'
-    ],
-    cache_results=True,
-)
-@triton.jit
-def la_bwd_q_streamk_causal(
-    *args,
-    H: tl.constexpr,
-    B: tl.constexpr,
-    HEAD_DIM: tl.constexpr,
-    BLOCK_M: tl.constexpr,
-    BLOCK_N: tl.constexpr,
-    PREFETCH_KV: tl.constexpr,
-    waves_per_eu: tl.constexpr,
-):
-    la_bwd_q_streamk(
-        *args,
-        H=H,
-        B=B,
-        HEAD_DIM=HEAD_DIM,
-        BLOCK_M=BLOCK_M,
-        BLOCK_N=BLOCK_N,
-        CAUSAL=True,
-        MAX_N_BLOCKS_PER_BATCH_CONST=args[-1],
-        RAGGED_BATCHING=args[-2],
-        PREFETCH_KV=PREFETCH_KV,
-        waves_per_eu=waves_per_eu,
-    )
-
-
-@triton.autotune(
-    configs=[
-        triton.Config(kwargs={}, num_warps=2, num_stages=1),
-        triton.Config(kwargs={}, num_warps=2, num_stages=2),
-        triton.Config(kwargs={}, num_warps=2, num_stages=3),
-        triton.Config(kwargs={}, num_warps=4, num_stages=1),
-        triton.Config(kwargs={}, num_warps=4, num_stages=2),
-    ],
-    key=[
-        'H', 'B', 'HEAD_DIM', 'N_CTX_Q', 'total_n_blocks_all_batches',
-        'total_tiles_q', 'CAUSAL'
-    ],
-    cache_results=True,
-)
-@triton.jit
-def la_bwd_q_streamk_noncausal(
-    *args,
-    H: tl.constexpr,
-    B: tl.constexpr,
-    HEAD_DIM: tl.constexpr,
-    BLOCK_M: tl.constexpr,
-    BLOCK_N: tl.constexpr,
-    PREFETCH_KV: tl.constexpr,
-    waves_per_eu: tl.constexpr,
-):
-    la_bwd_q_streamk(
-        *args,
-        H=H,
-        B=B,
-        HEAD_DIM=HEAD_DIM,
-        BLOCK_M=BLOCK_M,
-        BLOCK_N=BLOCK_N,
-        CAUSAL=False,
-        MAX_N_BLOCKS_PER_BATCH_CONST=args[-1],
-        RAGGED_BATCHING=args[-2],
-        PREFETCH_KV=PREFETCH_KV,
-        waves_per_eu=waves_per_eu,
-    )
-
-# Autotuned wrappers for Q that sweep BLOCK sizes
-@triton.autotune(
-    configs=[
-        triton.Config(kwargs={"BLOCK_M": 64, "BLOCK_N": 128}, num_warps=2, num_stages=2),
-        triton.Config(kwargs={"BLOCK_M": 64, "BLOCK_N": 128}, num_warps=4, num_stages=2),
-        triton.Config(kwargs={"BLOCK_M": 64, "BLOCK_N": 128}, num_warps=2, num_stages=3),
-        triton.Config(kwargs={"BLOCK_M": 128, "BLOCK_N": 64}, num_warps=2, num_stages=2),
-        triton.Config(kwargs={"BLOCK_M": 128, "BLOCK_N": 64}, num_warps=4, num_stages=2),
-    ],
-    key=[
-        'H', 'B', 'HEAD_DIM', 'N_CTX_Q', 'total_n_blocks_all_batches',
-        'total_tiles_q', 'CAUSAL'
-    ],
-    cache_results=True,
-)
-@triton.jit
-def la_bwd_q_streamk_causal_auto(
-    *args,
-    H: tl.constexpr,
-    B: tl.constexpr,
-    HEAD_DIM: tl.constexpr,
-    BLOCK_M: tl.constexpr,
-    BLOCK_N: tl.constexpr,
-    PREFETCH_KV: tl.constexpr,
-    waves_per_eu: tl.constexpr,
-):
-    la_bwd_q_streamk(
-        *args,
-        H=H,
-        B=B,
-        HEAD_DIM=HEAD_DIM,
-        BLOCK_M=BLOCK_M,
-        BLOCK_N=BLOCK_N,
-        CAUSAL=True,
-        MAX_N_BLOCKS_PER_BATCH_CONST=args[-1],
-        RAGGED_BATCHING=args[-2],
-        PREFETCH_KV=PREFETCH_KV,
-        waves_per_eu=waves_per_eu,
-    )
-
-
-@triton.autotune(
-    configs=[
-        triton.Config(kwargs={"BLOCK_M": 64, "BLOCK_N": 128}, num_warps=2, num_stages=2),
-        triton.Config(kwargs={"BLOCK_M": 64, "BLOCK_N": 128}, num_warps=4, num_stages=2),
-        triton.Config(kwargs={"BLOCK_M": 64, "BLOCK_N": 128}, num_warps=2, num_stages=3),
-        triton.Config(kwargs={"BLOCK_M": 128, "BLOCK_N": 64}, num_warps=2, num_stages=2),
-        triton.Config(kwargs={"BLOCK_M": 128, "BLOCK_N": 64}, num_warps=4, num_stages=2),
-    ],
-    key=[
-        'H', 'B', 'HEAD_DIM', 'N_CTX_Q', 'total_n_blocks_all_batches',
-        'total_tiles_q', 'CAUSAL'
-    ],
-    cache_results=True,
-)
-@triton.jit
-def la_bwd_q_streamk_noncausal_auto(
-    *args,
-    H: tl.constexpr,
-    B: tl.constexpr,
-    HEAD_DIM: tl.constexpr,
-    BLOCK_M: tl.constexpr,
-    BLOCK_N: tl.constexpr,
-    PREFETCH_KV: tl.constexpr,
-    waves_per_eu: tl.constexpr,
-):
-    la_bwd_q_streamk(
-        *args,
-        H=H,
-        B=B,
-        HEAD_DIM=HEAD_DIM,
-        BLOCK_M=BLOCK_M,
-        BLOCK_N=BLOCK_N,
-        CAUSAL=False,
-        MAX_N_BLOCKS_PER_BATCH_CONST=args[-1],
-        RAGGED_BATCHING=args[-2],
-        PREFETCH_KV=PREFETCH_KV,
-        waves_per_eu=waves_per_eu,
-    )
-
-
-# Fused two-phase kernel: dK/dV then dQ using the same persistent grid
-@triton.autotune(
-    configs=[
-        triton.Config(kwargs={}, num_warps=2, num_stages=1),
-        triton.Config(kwargs={}, num_warps=2, num_stages=2),
-        triton.Config(kwargs={}, num_warps=4, num_stages=1),
-        triton.Config(kwargs={}, num_warps=4, num_stages=2),
-    ],
-    key=[
-        'H', 'B', 'HEAD_DIM', 'N_CTX_Q', 'total_n_blocks_all_batches',
-        'total_tiles_q', 'total_tiles_kv', 'CAUSAL'
-    ],
-    cache_results=True,
-)
 @triton.jit
 def la_bwd_fused_streamk(
     Q, K, V, DO, M, Delta, DQ, DK, DV, batch_num_block_n, kv_batch_num_block_n,
@@ -1294,21 +959,21 @@ def persistent_lean_attention_bwd(
     seqlen_k: int = 0,
     config: Optional[dict] = None,
     num_programs: Optional[int] = 304,
+    profile_split: bool = False,
 ):
     """
-    Host-side launcher for the split backward pass.
-    - Validates shapes, derives scheduling, constructs Delta = sum(do * o) per row.
-    - Builds a minimal `batch_num_block_n` if not provided to support ragged non-causal.
-    - Launches two kernels: KV pass (dK/dV) then Q pass (dQ).
+    Host-side launcher for the backward pass.
+    - Default: fused two-phase kernel (dK/dV then dQ) for performance.
+    - If profile_split=True: launches split dK/dV and dQ kernels separately with CUDA timing.
     """
     if config is None:
         # Use a minimal default to avoid external JSON dependency during tests
         config = {
         "split_kernels": True,
-        "BLOCK_SIZE_M": 64, "BLOCK_SIZE_N": 64, "num_warps": 2,
-        "BLOCK_SIZE_M_KV": 64, "BLOCK_SIZE_N_KV": 64, "num_warps_kv": 2, "waves_per_eu": 1,
+        "BLOCK_SIZE_M": 128, "BLOCK_SIZE_N": 64, "num_warps": 4,
+        "BLOCK_SIZE_M_KV": 32, "BLOCK_SIZE_N_KV": 128, "num_warps_kv": 2, "waves_per_eu": 1, "num_programs_mult": 3,
         }
-    # Optional: override with tuned DB (env AITER_BWD_TUNED_DB)
+    #Optional: override with tuned DB (env AITER_BWD_TUNED_DB)
     try:
         db_path = os.environ.get("AITER_BWD_TUNED_DB")
         if db_path:
@@ -1449,11 +1114,7 @@ def persistent_lean_attention_bwd(
     )
     # Outputs are fully written by kernels with proper masking; avoid extra global zeroing
 
-    # --- Choose fused or split execution ---
-    use_fused = bool(config.get("fused", True))
-    # Launch KV-only kernel (or fused)
-    num_warps_kv = int(config.get("num_warps_kv", 2))
-
+    # --- Launch fused kernel by default ---
     # Build KV-specific batch_num_block_n if non-causal to match KV BLOCK_N_KV mapping
     kv_batch_num_block_n = batch_num_block_n
     if (not causal):
@@ -1468,11 +1129,11 @@ def persistent_lean_attention_bwd(
             kv_batch_num_block_n = torch.tensor([num_n_blocks_total_kv], device=q.device, dtype=torch.int32)
 
     # Config-driven prefetch defaults
-    prefetch_qt = int(config.get("prefetch_qt", 1))
-    prefetch_kv = int(config.get("prefetch_kv", 1))
+    prefetch_qt = int(config.get("prefetch_qt", 2))
+    prefetch_kv = int(config.get("prefetch_kv", 2))
 
-    # If fused and user didn't specify num_programs/ctas, prefer 2x SMs by default
-    if use_fused and num_programs is None and ("num_ctas" not in config):
+    # If user didn't specify num_programs/ctas, prefer 2x SMs by default
+    if num_programs is None and ("num_ctas" not in config):
         try:
             if sm_count is None:
                 sm_count = int(arch_info.get_num_sms())
@@ -1481,7 +1142,123 @@ def persistent_lean_attention_bwd(
         total_programs_pref = max(1, 2 * int(sm_count))
         grid = (total_programs_pref,)
 
-    if use_fused:
+    if profile_split:
+        # Time split kernels: dK/dV then dQ
+        kernel_timing = {
+            "dkdv": {
+                "start_event": torch.cuda.Event(enable_timing=True),
+                "end_event": torch.cuda.Event(enable_timing=True),
+                "ms": 0.0,
+            },
+            "dq": {
+                "start_event": torch.cuda.Event(enable_timing=True),
+                "end_event": torch.cuda.Event(enable_timing=True),
+                "ms": 0.0,
+            },
+        }
+        # dK/dV
+        kernel_timing["dkdv"]["start_event"].record()
+        kv_kernel = la_bwd_dkdv_inner[grid](
+            q, k, v, do, softmax_lse, Delta, dk, dv, kv_batch_num_block_n,
+            q.stride(0), q.stride(1), q.stride(2),
+            k.stride(0), k.stride(1), k.stride(2),
+            v.stride(0), v.stride(1), v.stride(2),
+            do.stride(0), do.stride(1), do.stride(2),
+            softmax_lse.stride(0), softmax_lse.stride(1), softmax_lse.stride(2),
+            Delta.stride(0), Delta.stride(1), Delta.stride(2),
+            dk.stride(0), dk.stride(1), dk.stride(2),
+            dv.stride(0), dv.stride(1), dv.stride(2),
+            sm_scale, N_CTX_Q, seqlen_k,
+            total_n_blocks_all_batches_kv, total_kv_tiles_kv, high_load_wgs_kv_kv, max_tiles_per_wg_kv_kv,
+            H=H, B=batch_size, HEAD_DIM=HEAD_DIM,
+            BLOCK_M=BLOCK_M_KV, BLOCK_N=BLOCK_N_KV,
+            CAUSAL=causal, MAX_TILES_PER_WG_KV_CONST=max_tiles_per_wg_kv_kv,
+            NUM_M_BLOCKS_TOTAL=num_m_blocks_total_kv,
+            RAGGED_BATCHING=ragged_batching,
+            PREFETCH_QT=prefetch_qt,
+            waves_per_eu=config["waves_per_eu"],
+            num_warps=config.get("num_warps", 2),
+            num_stages=config.get("num_stages", 2),
+        )
+        kernel_timing["dkdv"]["end_event"].record()
+        torch.cuda.synchronize()
+        ms = kernel_timing["dkdv"]["start_event"].elapsed_time(kernel_timing["dkdv"]["end_event"])
+        kernel_timing["dkdv"]["ms"] += ms
+
+        # dQ
+        kernel_timing["dq"]["start_event"].record()
+        q_kernel = la_bwd_dq_inner[grid](
+            q, k, v, do, softmax_lse, Delta, dq, batch_num_block_n,
+            q.stride(0), q.stride(1), q.stride(2),
+            k.stride(0), k.stride(1), k.stride(2),
+            v.stride(0), v.stride(1), v.stride(2),
+            do.stride(0), do.stride(1), do.stride(2),
+            softmax_lse.stride(0), softmax_lse.stride(1), softmax_lse.stride(2),
+            Delta.stride(0), Delta.stride(1), Delta.stride(2),
+            dq.stride(0), dq.stride(1), dq.stride(2),
+            sm_scale, N_CTX_Q, seqlen_k,
+            total_n_blocks_all_batches, total_tiles_q, high_load_wgs_q, max_tiles_per_wg_q,
+            H=H, B=batch_size, HEAD_DIM=HEAD_DIM,
+            BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N,
+            CAUSAL=causal, MAX_N_BLOCKS_PER_BATCH_CONST=(N_CTX_K + BLOCK_N - 1) // BLOCK_N,
+            RAGGED_BATCHING=ragged_batching,
+            PREFETCH_KV=prefetch_kv,
+            waves_per_eu=config["waves_per_eu"],
+            num_warps=config.get("num_warps", 2),
+            num_stages=config.get("num_stages", 2),
+        )
+        kernel_timing["dq"]["end_event"].record()
+        torch.cuda.synchronize()
+        ms = kernel_timing["dq"]["start_event"].elapsed_time(kernel_timing["dq"]["end_event"])
+        kernel_timing["dq"]["ms"] += ms
+
+        print(f"la bwd split timing: dkdv={kernel_timing['dkdv']['ms']:.3f} ms, dq={kernel_timing['dq']['ms']:.3f} ms")
+        print(f"la bwd split kv kernel {kv_kernel.n_regs} regs, {kv_kernel.n_spills} spills; q kernel {q_kernel.n_regs} regs, {q_kernel.n_spills} spills")
+        return
+    kernel_timing = {
+            "fused": {
+                "start_event": torch.cuda.Event(enable_timing=True),
+                "end_event": torch.cuda.Event(enable_timing=True),
+                "ms": 0.0,
+            }
+        }
+        # dK/dV
+    kernel_timing["fused"]["start_event"].record()
+    fused_kernel = la_bwd_fused_streamk[grid](
+        q, k, v, do, softmax_lse, Delta, dq, dk, dv, batch_num_block_n, kv_batch_num_block_n,
+        q.stride(0), q.stride(1), q.stride(2),
+        k.stride(0), k.stride(1), k.stride(2),
+        v.stride(0), v.stride(1), v.stride(2),
+        do.stride(0), do.stride(1), do.stride(2),
+        softmax_lse.stride(0), softmax_lse.stride(1), softmax_lse.stride(2),
+        Delta.stride(0), Delta.stride(1), Delta.stride(2),
+        dq.stride(0), dq.stride(1), dq.stride(2),
+        dk.stride(0), dk.stride(1), dk.stride(2),
+        dv.stride(0), dv.stride(1), dv.stride(2),
+        sm_scale, N_CTX_Q, seqlen_k,
+        total_n_blocks_all_batches, total_tiles_q, high_load_wgs_q, max_tiles_per_wg_q,
+        total_n_blocks_all_batches_kv, total_kv_tiles_kv, high_load_wgs_kv_kv, max_tiles_per_wg_kv_kv,
+        H=H, B=batch_size, HEAD_DIM=HEAD_DIM,
+        BLOCK_M_Q=BLOCK_M, BLOCK_N_Q=BLOCK_N,
+        BLOCK_M_KV=BLOCK_M_KV, BLOCK_N_KV=BLOCK_N_KV,
+        CAUSAL=causal,
+        MAX_N_BLOCKS_PER_BATCH_CONST=(N_CTX_K + BLOCK_N - 1) // BLOCK_N,
+        MAX_TILES_PER_WG_KV_CONST=max_tiles_per_wg_kv_kv,
+        RAGGED_BATCHING=ragged_batching,
+        PREFETCH_QT=prefetch_qt,
+        PREFETCH_KV=prefetch_kv,
+        waves_per_eu=config["waves_per_eu"],
+        num_warps=config.get("num_warps", 2),
+        num_stages=config.get("num_stages", 2),
+    )
+    kernel_timing["fused"]["end_event"].record()
+    torch.cuda.synchronize()
+    ms = kernel_timing["fused"]["start_event"].elapsed_time(kernel_timing["fused"]["end_event"])
+    kernel_timing["fused"]["ms"] += ms
+    print(f"la bwd fused kernel {fused_kernel.n_regs} regs, {fused_kernel.n_spills} spills, {ms:.3f} ms")
+    return
+    # Spill guard: fallback to num_stages=1 if needed
+    if fused_kernel.n_spills > 0:
         fused_kernel = la_bwd_fused_streamk[grid](
             q, k, v, do, softmax_lse, Delta, dq, dk, dv, batch_num_block_n, kv_batch_num_block_n,
             q.stride(0), q.stride(1), q.stride(2),
@@ -1506,80 +1283,8 @@ def persistent_lean_attention_bwd(
             PREFETCH_QT=prefetch_qt,
             PREFETCH_KV=prefetch_kv,
             waves_per_eu=config["waves_per_eu"],
+            num_warps=config.get("num_warps", 2),
+            num_stages=1,  # Force num_stages=1 for spill guard
         )
-        # Spill guard: fallback to num_stages=1 if needed
-        if fused_kernel.n_spills > 0:
-            fused_kernel = la_bwd_fused_streamk[grid](
-                q, k, v, do, softmax_lse, Delta, dq, dk, dv, batch_num_block_n, kv_batch_num_block_n,
-                q.stride(0), q.stride(1), q.stride(2),
-                k.stride(0), k.stride(1), k.stride(2),
-                v.stride(0), v.stride(1), v.stride(2),
-                do.stride(0), do.stride(1), do.stride(2),
-                softmax_lse.stride(0), softmax_lse.stride(1), softmax_lse.stride(2),
-                Delta.stride(0), Delta.stride(1), Delta.stride(2),
-                dq.stride(0), dq.stride(1), dq.stride(2),
-                dk.stride(0), dk.stride(1), dk.stride(2),
-                dv.stride(0), dv.stride(1), dv.stride(2),
-                sm_scale, N_CTX_Q, seqlen_k,
-                total_n_blocks_all_batches, total_tiles_q, high_load_wgs_q, max_tiles_per_wg_q,
-                total_n_blocks_all_batches_kv, total_kv_tiles_kv, high_load_wgs_kv_kv, max_tiles_per_wg_kv_kv,
-                H=H, B=batch_size, HEAD_DIM=HEAD_DIM,
-                BLOCK_M_Q=BLOCK_M, BLOCK_N_Q=BLOCK_N,
-                BLOCK_M_KV=BLOCK_M_KV, BLOCK_N_KV=BLOCK_N_KV,
-                CAUSAL=causal,
-                MAX_N_BLOCKS_PER_BATCH_CONST=(N_CTX_K + BLOCK_N - 1) // BLOCK_N,
-                MAX_TILES_PER_WG_KV_CONST=max_tiles_per_wg_kv_kv,
-                RAGGED_BATCHING=ragged_batching,
-                PREFETCH_QT=prefetch_qt,
-                PREFETCH_KV=prefetch_kv,
-                waves_per_eu=config["waves_per_eu"],
-                # num_stages=1,
-            )
-        print(f"la bwd fused kernel {fused_kernel.n_regs} regs, {fused_kernel.n_spills} spills")
-        return
-    else:
-        kv_entry = la_bwd_kv_streamk_causal_auto if causal else la_bwd_kv_streamk_noncausal_auto
-        kv_kernel = kv_entry[grid](
-            q, k, v, do, softmax_lse, Delta, dk, dv, kv_batch_num_block_n,
-            q.stride(0), q.stride(1), q.stride(2),
-            k.stride(0), k.stride(1), k.stride(2),
-            v.stride(0), v.stride(1), v.stride(2),
-            do.stride(0), do.stride(1), do.stride(2),
-            softmax_lse.stride(0), softmax_lse.stride(1), softmax_lse.stride(2),
-            Delta.stride(0), Delta.stride(1), Delta.stride(2),
-            dk.stride(0), dk.stride(1), dk.stride(2),
-            dv.stride(0), dv.stride(1), dv.stride(2),
-            sm_scale, N_CTX_Q, seqlen_k,
-            total_n_blocks_all_batches_kv,
-            total_kv_tiles_kv, high_load_wgs_kv_kv, max_tiles_per_wg_kv_kv,
-            H=H, B=batch_size, HEAD_DIM=HEAD_DIM, CAUSAL=causal,
-            MAX_TILES_PER_WG_KV_CONST=max_tiles_per_wg_kv_kv,
-            NUM_M_BLOCKS_TOTAL=num_m_blocks_total_kv,
-            num_warps=num_warps_kv, waves_per_eu=config["waves_per_eu"],
-            RAGGED_BATCHING=ragged_batching,
-            PREFETCH_QT=prefetch_qt,
-        )
-
-        # Launch Q-only kernel (Q path uses original BLOCK_N mapping)
-        q_entry = la_bwd_q_streamk_causal_auto if causal else la_bwd_q_streamk_noncausal_auto
-        q_kernel = q_entry[grid](
-            q, k, v, do, softmax_lse, Delta, dq, batch_num_block_n,
-            q.stride(0), q.stride(1), q.stride(2),
-            k.stride(0), k.stride(1), k.stride(2),
-            v.stride(0), v.stride(1), v.stride(2),
-            do.stride(0), do.stride(1), do.stride(2),
-            softmax_lse.stride(0), softmax_lse.stride(1), softmax_lse.stride(2),
-            Delta.stride(0), Delta.stride(1), Delta.stride(2),
-            dq.stride(0), dq.stride(1), dq.stride(2),
-            sm_scale, N_CTX_Q, seqlen_k,
-            total_n_blocks_all_batches,
-            total_tiles_q, high_load_wgs_q, max_tiles_per_wg_q,
-            H=H, B=batch_size, HEAD_DIM=HEAD_DIM, CAUSAL=causal,
-            MAX_N_BLOCKS_PER_BATCH_CONST=(N_CTX_K + BLOCK_N - 1) // BLOCK_N,
-            num_warps=config["num_warps"], waves_per_eu=config["waves_per_eu"],
-            RAGGED_BATCHING=ragged_batching,
-            PREFETCH_KV=prefetch_kv,
-        )
-
-        print(f"la bwd kv kernel {kv_kernel.n_regs} regs, {kv_kernel.n_spills} spills; q kernel {q_kernel.n_regs} regs, {q_kernel.n_spills} spills")
-        return
+    print(f"la bwd fused kernel {fused_kernel.n_regs} regs, {fused_kernel.n_spills} spills")
+    return

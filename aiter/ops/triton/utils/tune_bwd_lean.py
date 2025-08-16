@@ -23,6 +23,10 @@ def _default_shape_grid() -> List[Dict]:
 		(2, 48, 48, 2048, 1024),
 		(2, 48, 48, 4096, 8192),
 		(2, 48, 48, 8192, 4096),
+        (2, 48, 48, 128, 8192),
+        (2, 48, 48, 128, 4096),
+        (2, 48, 48, 128, 1024),
+        (2, 48, 48, 128, 2048),
 	]
 	scenarios: List[Dict] = []
 	# Use 128 for head dimension by default (matches kernel-supported head sizes)
@@ -46,20 +50,21 @@ def _default_config_grid() -> List[Dict]:
     block_n_q = [64]  # stable for Q-path for now
     num_warps_q = [2, 4]
 
-    block_m_kv = [32, 64, 128]
+    block_m_kv = [32]
     # Try larger N for KV tiling to improve arithmetic intensity
     block_n_kv = [64, 128]
     num_warps_kv = [1, 2, 4]
 
-    waves_per_eu_vals = [1, 2]
-    num_programs_mult_vals = [1, 2]
-    prefetch_qt_vals = [1, 2]
-    prefetch_kv_vals = [1, 2]
+    waves_per_eu_vals = [1]
+    num_programs_mult_vals = [1, 2, 3, 4, 5]
+    prefetch_qt_vals = [2]
+    prefetch_kv_vals = [2]
+    num_stages_vals = [1, 2]  # Add num_stages tuning
 
     cfgs = []
-    for (bmq, bnq, nwq, bmk, bnk, nwk, wpe, np_mult, pf_qt, pf_kv) in itertools.product(
+    for (bmq, bnq, nwq, bmk, bnk, nwk, wpe, np_mult, pf_qt, pf_kv, ns) in itertools.product(
         block_m_q, block_n_q, num_warps_q, block_m_kv, block_n_kv, num_warps_kv,
-        waves_per_eu_vals, num_programs_mult_vals, prefetch_qt_vals, prefetch_kv_vals
+        waves_per_eu_vals, num_programs_mult_vals, prefetch_qt_vals, prefetch_kv_vals, num_stages_vals
     ):
         cfgs.append({
             "BLOCK_SIZE_M": bmq,
@@ -74,6 +79,7 @@ def _default_config_grid() -> List[Dict]:
             "fused": True,
             "prefetch_qt": pf_qt,
             "prefetch_kv": pf_kv,
+            "num_stages": ns,  # Add num_stages to config
         })
     return cfgs
 
