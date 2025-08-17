@@ -26,12 +26,21 @@ TEST_CONFIGS = [
         "BATCH": 1, "N_HEADS": 16, "SEQLEN_Q": 256, "SEQLEN_K": 256,
         "HEAD_DIM": 32, "CAUSAL": False, "DTYPE": torch.float16
     },
-    {
-        "BATCH": 4, "N_HEADS": 8, "SEQLEN_Q": 512, "SEQLEN_K": 256,
+    # {
+    #     "BATCH": 4, "N_HEADS": 8, "SEQLEN_Q": 512, "SEQLEN_K": 256,
+    #     "HEAD_DIM": 64, "CAUSAL": False, "DTYPE": torch.float16
+    # },
+
+     {
+        "BATCH": 1, "N_HEADS": 48, "SEQLEN_Q": 1024, "SEQLEN_K": 1024,
         "HEAD_DIM": 64, "CAUSAL": False, "DTYPE": torch.float16
     },
-     {
-        "BATCH": 1, "N_HEADS": 48, "SEQLEN_Q": 8192, "SEQLEN_K": 8192,
+    {
+        "BATCH": 1, "N_HEADS": 48, "SEQLEN_Q": 2048, "SEQLEN_K": 2048,
+        "HEAD_DIM": 64, "CAUSAL": False, "DTYPE": torch.float16
+    },
+    {
+        "BATCH": 2, "N_HEADS": 48, "SEQLEN_Q": 16384, "SEQLEN_K": 16384,
         "HEAD_DIM": 64, "CAUSAL": False, "DTYPE": torch.float16
     },
      {

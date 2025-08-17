@@ -968,10 +968,16 @@ def persistent_lean_attention_bwd(
     """
     if config is None:
         # Use a minimal default to avoid external JSON dependency during tests
+        if seqlen_k > 1024:
+            BLOCK_SIZE_M_KV = 32
+            BLOCK_SIZE_N_KV = 128
+        else:
+            BLOCK_SIZE_M_KV = 32
+            BLOCK_SIZE_N_KV = 64
         config = {
         "split_kernels": True,
         "BLOCK_SIZE_M": 128, "BLOCK_SIZE_N": 64, "num_warps": 4,
-        "BLOCK_SIZE_M_KV": 32, "BLOCK_SIZE_N_KV": 128, "num_warps_kv": 2, "waves_per_eu": 1, "num_programs_mult": 3,
+        "BLOCK_SIZE_M_KV": BLOCK_SIZE_M_KV, "BLOCK_SIZE_N_KV": BLOCK_SIZE_N_KV, "num_warps_kv": 2, "waves_per_eu": 1, "num_programs_mult": 3,
         }
     #Optional: override with tuned DB (env AITER_BWD_TUNED_DB)
     try:
@@ -985,6 +991,7 @@ def persistent_lean_attention_bwd(
             tuned = _select_bwd_config(db, causal, batch_size, H_tmp, D_tmp, NQ_tmp, NK_tmp)
             tuned_np_mult = None
             if tuned:
+                print("found")
                 tuned_np_mult = tuned.get("num_programs_mult")
                 # do not override num_programs from DB; user controls it
                 tuned = {k: v for k, v in tuned.items() if k != "num_programs" and k != "num_programs_mult"}
