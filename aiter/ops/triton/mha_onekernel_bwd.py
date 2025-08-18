@@ -13,6 +13,9 @@ from aiter.ops.triton.utils.mha_kernel_utils import (
     _compute_fp8_scaling_factors,
     _is_fp8,
 )
+from aiter.ops.triton.utils.logger import AiterTritonLogger
+
+_LOGGER = AiterTritonLogger()
 
 
 # NOTE: triton fails to import tl.constexprs so create them here for the file
@@ -545,8 +548,6 @@ def bwd_kernel_causal(  # grid = (tl.cdiv(max_seqlen_q // BLOCK_M2), batch, nhea
     DEBUG_TRITON: tl.constexpr,
     DEBUG_TRITON_DETAIL: tl.constexpr,
     USE_INT64_STRIDES: tl.constexpr,
-    DO_DKDV: tl.constexpr,
-    DO_DQ: tl.constexpr,
 ):
     if USE_INT64_STRIDES:
         stride_qb = tl.cast(stride_qb_in, tl.int64)
@@ -665,7 +666,7 @@ def bwd_kernel_causal(  # grid = (tl.cdiv(max_seqlen_q // BLOCK_M2), batch, nhea
 
     # align the delta_qk
     start_n = pid * BLOCK_N1
-    if DO_DKDV and (start_n < seqlen_k):
+    if start_n < seqlen_k:
         # This section does dk and dv
         dk = tl.zeros([BLOCK_N1, HEAD_DIM], dtype=tl.float32)
         dv = tl.zeros([BLOCK_N1, HEAD_DIM], dtype=tl.float32)
@@ -900,7 +901,7 @@ def bwd_kernel_causal(  # grid = (tl.cdiv(max_seqlen_q // BLOCK_M2), batch, nhea
 
     # This part does dq
     start_m = pid * BLOCK_M2
-    if DO_DQ and (start_m < seqlen_q):
+    if start_m < seqlen_q:
         # seqlen_q > seqlen_k, no need to process these tile for dq
         if DEBUG_TRITON:
             print(
@@ -1170,8 +1171,6 @@ def bwd_kernel_noncausal(
     DEBUG_TRITON: tl.constexpr,
     DEBUG_TRITON_DETAIL: tl.constexpr,
     USE_INT64_STRIDES: tl.constexpr,
-    DO_DKDV: tl.constexpr,
-    DO_DQ: tl.constexpr,
 ):
     if USE_INT64_STRIDES:
         stride_qb = tl.cast(stride_qb_in, tl.int64)
@@ -1286,7 +1285,7 @@ def bwd_kernel_noncausal(
     GROUP_SIZE: tl.constexpr = HQ // HK
 
     start_n = pid * BLOCK_N1
-    if DO_DKDV and (start_n < seqlen_k):
+    if start_n < seqlen_k:
         dk = tl.zeros([BLOCK_N1, HEAD_DIM], dtype=tl.float32)
         dv = tl.zeros([BLOCK_N1, HEAD_DIM], dtype=tl.float32)
 
@@ -1414,7 +1413,7 @@ def bwd_kernel_noncausal(
 
     # THIS PART DOES DQ
     start_m = pid * BLOCK_M2
-    if DO_DQ and (start_m < seqlen_q):
+    if start_m < seqlen_q:
         offs_m = start_m + tl.arange(0, BLOCK_M2)
         # Mask for loading K and V
         mask_q = offs_m[:, None] < seqlen_q
@@ -1573,8 +1572,11 @@ def flash_attn_onekernel_backward(
     descale_do: Optional[torch.Tensor] = None,
     USE_INT64_STRIDES: Optional[bool] = False,
     config: Optional[Dict[str, any]] = None,
-    profile_breakdown: Optional[bool] = False,
 ):
+    _LOGGER.info(
+        f"FLASH_ATTN_ONEKERNEL_BKWD: do={tuple(do.shape)} q={tuple(q.shape)}  k={tuple(k.shape)}  v={tuple(v.shape)} "
+        + f"dq={tuple(dq.shape)}  dk={tuple(dk.shape)}  dv={tuple(dv.shape)}"
+    )
     if dbias is not None:
         raise ValueError("Bias is not supported yet in the Triton Backend")
 
@@ -1700,120 +1702,16 @@ def flash_attn_onekernel_backward(
         triton.cdiv(seqlen, config_onekernel["BLOCK_N1"]),
         batch,
     )
-
-    # Launch main backward kernel with timing
-    start_evt = torch.cuda.Event(enable_timing=True)
-    end_evt = torch.cuda.Event(enable_timing=True)
-    torch.cuda.synchronize()
-    start_evt.record()
-
-    if profile_breakdown:
-        # DK/DV only
-        dkdv_start = torch.cuda.Event(enable_timing=True)
-        dkdv_end = torch.cuda.Event(enable_timing=True)
-        dq_start = torch.cuda.Event(enable_timing=True)
-        dq_end = torch.cuda.Event(enable_timing=True)
-        torch.cuda.synchronize()
-        dkdv_start.record()
-        if causal:
-            _ = bwd_kernel_causal[grid](
-                q, k, v, sm_scale, do, dq, dk, dv, softmax_lse, delta,
-                *q_strides, *k_strides, *v_strides, *dq_strides, *dk_strides, *dv_strides,
-                *delta_strides, *do_strides, *dropout_strides, *descale_strides,
-                stride_az, stride_ah, num_q_heads, num_k_heads, cu_seqlens_q, cu_seqlens_k,
-                max_seqlen_q, max_seqlen_k, dropout_mask, dropout_p, philox_seed, philox_offset,
-                alibi_slopes, descale_q, descale_k, descale_v, descale_do,
-                HEAD_DIM=head_sz, ACTUAL_HEAD_DIM=BLOCK_D_MODEL_POW2, ENABLE_DROPOUT=use_dropout,
-                IS_VARLEN=IS_VARLEN, USE_ALIBI=use_alibi, USE_EXP2=True, IS_FP8=IS_FP8, FP8_MAX=FP8_MAX,
-                FP8_OUTPUT=False, DEBUG_TRITON=False, DEBUG_TRITON_DETAIL=False, USE_INT64_STRIDES=USE_INT64_STRIDES,
-                DO_DKDV=True, DO_DQ=False, **config_onekernel,
-            )
-        else:
-            _ = bwd_kernel_noncausal[grid](
-                q, k, v, sm_scale, do, dq, dk, dv, softmax_lse, delta,
-                *q_strides, *k_strides, *v_strides, *dq_strides, *dk_strides, *dv_strides,
-                *delta_strides, *do_strides, *dropout_strides, *descale_strides,
-                stride_az, stride_ah, num_q_heads, num_k_heads, cu_seqlens_q, cu_seqlens_k,
-                max_seqlen_q, max_seqlen_k, dropout_mask, dropout_p, philox_seed, philox_offset,
-                alibi_slopes, descale_q, descale_k, descale_v, descale_do,
-                HEAD_DIM=head_sz, ACTUAL_HEAD_DIM=BLOCK_D_MODEL_POW2, ENABLE_DROPOUT=use_dropout,
-                IS_VARLEN=IS_VARLEN, USE_ALIBI=use_alibi, USE_EXP2=True, IS_FP8=IS_FP8, FP8_MAX=FP8_MAX,
-                FP8_OUTPUT=False, DEBUG_TRITON=False, DEBUG_TRITON_DETAIL=False, USE_INT64_STRIDES=USE_INT64_STRIDES,
-                DO_DKDV=True, DO_DQ=False, **config_onekernel,
-            )
-        dkdv_end.record(); torch.cuda.synchronize()
-        dkdv_ms = dkdv_start.elapsed_time(dkdv_end)
-
-        # DQ only
-        dq_start.record()
-        if causal:
-            _ = bwd_kernel_causal[grid](
-                q, k, v, sm_scale, do, dq, dk, dv, softmax_lse, delta,
-                *q_strides, *k_strides, *v_strides, *dq_strides, *dk_strides, *dv_strides,
-                *delta_strides, *do_strides, *dropout_strides, *descale_strides,
-                stride_az, stride_ah, num_q_heads, num_k_heads, cu_seqlens_q, cu_seqlens_k,
-                max_seqlen_q, max_seqlen_k, dropout_mask, dropout_p, philox_seed, philox_offset,
-                alibi_slopes, descale_q, descale_k, descale_v, descale_do,
-                HEAD_DIM=head_sz, ACTUAL_HEAD_DIM=BLOCK_D_MODEL_POW2, ENABLE_DROPOUT=use_dropout,
-                IS_VARLEN=IS_VARLEN, USE_ALIBI=use_alibi, USE_EXP2=True, IS_FP8=IS_FP8, FP8_MAX=FP8_MAX,
-                FP8_OUTPUT=False, DEBUG_TRITON=False, DEBUG_TRITON_DETAIL=False, USE_INT64_STRIDES=USE_INT64_STRIDES,
-                DO_DKDV=False, DO_DQ=True, **config_onekernel,
-            )
-        else:
-            _ = bwd_kernel_noncausal[grid](
-                q, k, v, sm_scale, do, dq, dk, dv, softmax_lse, delta,
-                *q_strides, *k_strides, *v_strides, *dq_strides, *dk_strides, *dv_strides,
-                *delta_strides, *do_strides, *dropout_strides, *descale_strides,
-                stride_az, stride_ah, num_q_heads, num_k_heads, cu_seqlens_q, cu_seqlens_k,
-                max_seqlen_q, max_seqlen_k, dropout_mask, dropout_p, philox_seed, philox_offset,
-                alibi_slopes, descale_q, descale_k, descale_v, descale_do,
-                HEAD_DIM=head_sz, ACTUAL_HEAD_DIM=BLOCK_D_MODEL_POW2, ENABLE_DROPOUT=use_dropout,
-                IS_VARLEN=IS_VARLEN, USE_ALIBI=use_alibi, USE_EXP2=True, IS_FP8=IS_FP8, FP8_MAX=FP8_MAX,
-                FP8_OUTPUT=False, DEBUG_TRITON=False, DEBUG_TRITON_DETAIL=False, USE_INT64_STRIDES=USE_INT64_STRIDES,
-                DO_DKDV=False, DO_DQ=True, **config_onekernel,
-            )
-        dq_end.record(); torch.cuda.synchronize()
-        dq_ms = dq_start.elapsed_time(dq_end)
-        print(f"mha onekernel breakdown: dkdv={dkdv_ms:.3f} ms, dq={dq_ms:.3f} ms")
-
-        # Also compute total time with full kernel
-        total_start = torch.cuda.Event(enable_timing=True)
-        total_end = torch.cuda.Event(enable_timing=True)
-        total_start.record()
-        if causal:
-            bwd_kernel = bwd_kernel_causal[grid](
-                q, k, v, sm_scale, do, dq, dk, dv, softmax_lse, delta,
-                *q_strides, *k_strides, *v_strides, *dq_strides, *dk_strides, *dv_strides,
-                *delta_strides, *do_strides, *dropout_strides, *descale_strides,
-                stride_az, stride_ah, num_q_heads, num_k_heads, cu_seqlens_q, cu_seqlens_k,
-                max_seqlen_q, max_seqlen_k, dropout_mask, dropout_p, philox_seed, philox_offset,
-                alibi_slopes, descale_q, descale_k, descale_v, descale_do,
-                HEAD_DIM=head_sz, ACTUAL_HEAD_DIM=BLOCK_D_MODEL_POW2, ENABLE_DROPOUT=use_dropout,
-                IS_VARLEN=IS_VARLEN, USE_ALIBI=use_alibi, USE_EXP2=True, IS_FP8=IS_FP8, FP8_MAX=FP8_MAX,
-                FP8_OUTPUT=False, DEBUG_TRITON=False, DEBUG_TRITON_DETAIL=False, USE_INT64_STRIDES=USE_INT64_STRIDES,
-                DO_DKDV=True, DO_DQ=True, **config_onekernel,
-            )
-        else:
-            bwd_kernel = bwd_kernel_noncausal[grid](
-                q, k, v, sm_scale, do, dq, dk, dv, softmax_lse, delta,
-                *q_strides, *k_strides, *v_strides, *dq_strides, *dk_strides, *dv_strides,
-                *delta_strides, *do_strides, *dropout_strides, *descale_strides,
-                stride_az, stride_ah, num_q_heads, num_k_heads, cu_seqlens_q, cu_seqlens_k,
-                max_seqlen_q, max_seqlen_k, dropout_mask, dropout_p, philox_seed, philox_offset,
-                alibi_slopes, descale_q, descale_k, descale_v, descale_do,
-                HEAD_DIM=head_sz, ACTUAL_HEAD_DIM=BLOCK_D_MODEL_POW2, ENABLE_DROPOUT=use_dropout,
-                IS_VARLEN=IS_VARLEN, USE_ALIBI=use_alibi, USE_EXP2=True, IS_FP8=IS_FP8, FP8_MAX=FP8_MAX,
-                FP8_OUTPUT=False, DEBUG_TRITON=False, DEBUG_TRITON_DETAIL=False, USE_INT64_STRIDES=USE_INT64_STRIDES,
-                DO_DKDV=True, DO_DQ=True, **config_onekernel,
-            )
-        total_end.record(); torch.cuda.synchronize()
-        total_ms = total_start.elapsed_time(total_end)
-        print(f"mha onekernel bwd kernel time: {total_ms:.3f} ms")
-        return delta
-
-    # Default path (full kernel timing)
+    kernel_timing = {
+            "mha_bwd_onekernel": {
+                "start_event": torch.cuda.Event(enable_timing=True),
+                "end_event": torch.cuda.Event(enable_timing=True),
+                "ms": 0.0,
+            }
+        }
+    kernel_timing["mha_bwd_onekernel"]["start_event"].record()
     if causal:
-        bwd_kernel = bwd_kernel_causal[grid](
+        bwd_kernel_causal[grid](
             q,
             k,
             v,
@@ -1863,11 +1761,10 @@ def flash_attn_onekernel_backward(
             DEBUG_TRITON=False,
             DEBUG_TRITON_DETAIL=False,
             USE_INT64_STRIDES=USE_INT64_STRIDES,
-            DO_DKDV=True, DO_DQ=True, **config_onekernel,
+            **config_onekernel,
         )
-        print(f"mha onekernel bwd (causal) {bwd_kernel.n_regs} registers used, {bwd_kernel.n_spills} spills")
     else:
-        bwd_kernel = bwd_kernel_noncausal[grid](
+        bwd_kernel_noncausal[grid](
             q,
             k,
             v,
@@ -1917,13 +1814,10 @@ def flash_attn_onekernel_backward(
             DEBUG_TRITON=False,
             DEBUG_TRITON_DETAIL=False,
             USE_INT64_STRIDES=USE_INT64_STRIDES,
-            DO_DKDV=True, DO_DQ=True, **config_onekernel,
+            **config_onekernel,
         )
-        print(f"mha onekernel bwd (noncausal) {bwd_kernel.n_regs} registers used, {bwd_kernel.n_spills} spills")
-
-    end_evt.record()
+    kernel_timing["mha_bwd_onekernel"]["end_event"].record()
     torch.cuda.synchronize()
-    total_ms = start_evt.elapsed_time(end_evt)
-    print(f"mha onekernel bwd kernel time: {total_ms:.3f} ms")
-
-    return delta
+    kernel_timing["mha_bwd_onekernel"]["ms"] = kernel_timing["mha_bwd_onekernel"]["start_event"].elapsed_time(kernel_timing["mha_bwd_onekernel"]["end_event"])
+    print(f"MHA BWD ONEKERNEL TIME: {kernel_timing['mha_bwd_onekernel']['ms']} ms")
+    return delta, kernel_timing

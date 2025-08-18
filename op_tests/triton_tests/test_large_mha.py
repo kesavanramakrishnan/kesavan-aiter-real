@@ -371,11 +371,90 @@ def run_flash(
     print(f"wrote Flash outputs to {out_path}")
 
 
+def _apply_causal_mask(scores: torch.Tensor, NQ: int, NK: int) -> torch.Tensor:
+    # scores: [B, H, NQ, NK]
+    diag = NK - NQ
+    ar_i = torch.arange(NQ, device=scores.device).to(torch.int64)[:, None]
+    ar_j = torch.arange(NK, device=scores.device).to(torch.int64)[None, :]
+    mask = (ar_i + diag) >= ar_j  # [NQ, NK]
+    return scores.masked_fill(~mask, float('-inf'))
+
+
+def run_torch(
+    B: int,
+    HQ: int,
+    HK: int,
+    NQ: int,
+    NK: int,
+    D: int,
+    causal: bool,
+    dtype: torch.dtype,
+    device: torch.device,
+    seed: int,
+    out_path: str,
+):
+    torch.manual_seed(seed)
+    # Build inputs in float32 for numerical stability, with grads enabled
+    q = torch.randn((B, HQ, NQ, D), dtype=torch.float32, device=device, requires_grad=True)
+    k = torch.randn((B, HK, NK, D), dtype=torch.float32, device=device, requires_grad=True)
+    v = torch.randn((B, HK, NK, D), dtype=torch.float32, device=device, requires_grad=True)
+
+    # Match heads (GQA replication) to HQ if needed
+    if HQ != HK:
+        g = HQ // HK
+        if HQ % HK != 0:
+            raise ValueError("HQ must be a multiple of HK for GQA replication")
+        k = k.repeat_interleave(g, dim=1)
+        v = v.repeat_interleave(g, dim=1)
+
+    sm_scale = 1.0 / math.sqrt(D)
+
+    # Compute attention forward in float32
+    # scores: [B, H, NQ, NK]
+    scores = sm_scale * torch.einsum('bhmd,bhnd->bhmn', q, k)
+    if causal:
+        scores = _apply_causal_mask(scores, NQ=NQ, NK=NK)
+    p = torch.softmax(scores, dim=-1)
+    o = torch.einsum('bhmn,bhnd->bhmd', p, v)
+
+    # Random upstream gradient matching o's shape
+    do = torch.randn_like(o)
+
+    # Backward via a scalar loss
+    loss = (o * do).sum()
+    loss.backward()
+
+    dq_bhmd = q.grad  # [B, H, NQ, D]
+    dk_bhnd = k.grad  # [B, H, NK, D]
+    dv_bhnd = v.grad  # [B, H, NK, D]
+
+    # Re-layout to match Lean Attention text dump order:
+    # dq: [B*NQ, H, D], dk/dv: [B*NK, H, D]
+    dq_flat = dq_bhmd.permute(0, 2, 1, 3).contiguous().view(B * NQ, HQ, D)
+    dk_flat = dk_bhnd.permute(0, 2, 1, 3).contiguous().view(B * NK, HQ, D)
+    dv_flat = dv_bhnd.permute(0, 2, 1, 3).contiguous().view(B * NK, HQ, D)
+
+    header = {
+        "mode": "torch",
+        "B": B,
+        "H": HQ,
+        "NQ": NQ,
+        "NK": NK,
+        "D": D,
+        "causal": int(causal),
+        "dtype": str(dtype),
+        "order": "dq,dk,dv",
+    }
+    _save_outputs_text(out_path, header, dq_flat, dk_flat, dv_flat)
+    print(f"wrote PyTorch reference outputs to {out_path}")
+
+
 def main():
     parser = argparse.ArgumentParser(description="Large MHA: run LA or Flash separately and save outputs to text, or compare.")
     mode = parser.add_mutually_exclusive_group(required=True)
     mode.add_argument("-l", "--lean", action="store_true", help="Run Lean Attention and save outputs")
     mode.add_argument("-f", "--flash", action="store_true", help="Run Flash Attention and save outputs")
+    mode.add_argument("-p", "--pytorch", action="store_true", help="Run PyTorch reference and save outputs")
     mode.add_argument("-c", "--compare", nargs=2, metavar=("LA_FILE", "FLASH_FILE"), help="Compare two saved output files")
 
     parser.add_argument("--out", type=str, default="/tmp/mha_outputs.txt", help="Output text file path for -l/-f")
@@ -433,6 +512,21 @@ def main():
             seed=args.seed,
             out_path=args.out,
             lse_block_n=args.lse_block_n,
+        )
+        return
+    if args.pytorch:
+        run_torch(
+            B=args.B,
+            HQ=args.HQ,
+            HK=HK,
+            NQ=args.NQ,
+            NK=args.NK,
+            D=args.D,
+            causal=args.causal,
+            dtype=dtype,
+            device=device,
+            seed=args.seed,
+            out_path=args.out,
         )
         return
 

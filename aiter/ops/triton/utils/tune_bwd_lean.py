@@ -17,21 +17,20 @@ def _default_shape_grid() -> List[Dict]:
 		(8, 16, 16, 2048, 2048),
 		(4, 16, 16, 4096, 4096),
 		(2, 16, 16, 8192, 8192),
-		(8, 16, 16, 1024, 4096),
-		(1, 16, 16, 4096, 16384),
 		(2, 48, 48, 1024, 1024),
-		(2, 48, 48, 2048, 1024),
-		(2, 48, 48, 4096, 8192),
-		(2, 48, 48, 8192, 4096),
-        (2, 48, 48, 128, 8192),
-        (2, 48, 48, 128, 4096),
-        (2, 48, 48, 128, 1024),
-        (2, 48, 48, 128, 2048),
+		# (2, 48, 48, 2048, 1024),
+		# (2, 48, 48, 4096, 8192),
+		# (2, 48, 48, 8192, 4096),
+        # (2, 48, 48, 128, 8192),
+        # (2, 48, 48, 128, 4096),
+        # (2, 48, 48, 128, 1024),
+        # (2, 48, 48, 128, 2048),
+    
 	]
 	scenarios: List[Dict] = []
 	# Use 128 for head dimension by default (matches kernel-supported head sizes)
 	head_dim = 128
-	causal = False
+	causal = True
 	for (B, HQ, HK, NQ, NK) in bench_configs:
 		scenarios.append({
 			"batch": B,
@@ -50,7 +49,7 @@ def _default_config_grid() -> List[Dict]:
     block_n_q = [64]  # stable for Q-path for now
     num_warps_q = [2, 4]
 
-    block_m_kv = [32]
+    block_m_kv = [64, 128]
     # Try larger N for KV tiling to improve arithmetic intensity
     block_n_kv = [64, 128]
     num_warps_kv = [1, 2, 4]

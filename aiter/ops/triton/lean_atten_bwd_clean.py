@@ -328,18 +328,22 @@ def la_bwd_dkdv_inner(
             if q_abs < rows_limit:
                 num_iters_kv = (rows_limit - q_abs + BLOCK_M - 1) // BLOCK_M
 
-            # Software prefetch: optionally load first Qᵀ/DOᵀ ahead of compute
-            q_tile_T = tl.load(qT_ptrs, mask=True)
-            do_tile_T = tl.load(doT_ptrs, mask=True)
-            next_qT_ptrs = qT_ptrs + BLOCK_M * stride_qm
-            next_doT_ptrs = doT_ptrs + BLOCK_M * stride_dom
+            # Software prefetch: optionally load first Qᵀ/DOᵀ ahead of compute.
+            # Always define when prefetching is enabled; masking prevents OOB even if there are zero iterations.
+            if PREFETCH_QT > 1:
+                mask_prefetch_rows = (q_abs + offs_m) < rows_limit
+                q_tile_T = tl.load(qT_ptrs, mask=mask_prefetch_rows[None, :], other=0.0)
+                do_tile_T = tl.load(doT_ptrs, mask=mask_prefetch_rows[None, :], other=0.0)
+                next_qT_ptrs = qT_ptrs + BLOCK_M * stride_qm
+                next_doT_ptrs = doT_ptrs + BLOCK_M * stride_dom
             for it in range(0, num_iters_kv):
+                # Determine valid rows for current Q tile
+                mask_mrows = (q_abs + offs_m) < rows_limit
                 # Ensure current tiles are loaded when software prefetch is disabled
                 if PREFETCH_QT <= 1:
-                    q_tile_T = tl.load(qT_ptrs, mask=True)
-                    do_tile_T = tl.load(doT_ptrs, mask=True)
+                    q_tile_T = tl.load(qT_ptrs, mask=mask_mrows[None, :], other=0.0)
+                    do_tile_T = tl.load(doT_ptrs, mask=mask_mrows[None, :], other=0.0)
                 # per-row LSE stats
-                mask_mrows = (q_abs + offs_m) < rows_limit
                 m_rows = tl.load(m_ptrs,     mask=mask_mrows, other=-float("inf"))
                 delta_rows = tl.load(delta_ptrs, mask=mask_mrows, other=0.0)
 
@@ -366,11 +370,12 @@ def la_bwd_dkdv_inner(
                 # Use low-precision inputs to enable TC/MFMA with fp32 accumulate
                 # Load V tile just-in-time to shorten live range
                 v_tile = tl.load(V + v_offs, mask=True, other=0.0)
-                dp_T = tl.dot(v_tile, do_tile_T)
+                # Compute dp in higher precision for stability
+                dp_T = tl.dot(v_tile.to(tl.float32), do_tile_T.to(tl.float32))
                 dp_T = tl.where(mask_mrows[None, :], dp_T, 0.0)
                 delta_cols = tl.where(mask_mrows, delta_rows, 0.0)
                 # ds_T = P ⊙ (dp_T - Δ)
-                ds_T = p_T * (dp_T - delta_cols[None, :])
+                ds_T = p_T.to(tl.float32) * (dp_T - delta_cols[None, :])
                 # dK += ds_T · Qᵀ   (N, M) x (M, K) = (N, K)
                 # Cast ds_T to low precision to trigger TC/MFMA; accumulate into fp32
                 dk_acc += tl.dot(ds_T.to(q_tile_T.type.element_ty), tl.trans(q_tile_T))
@@ -386,8 +391,10 @@ def la_bwd_dkdv_inner(
                 if PREFETCH_QT > 1:
                     do_prefetch = it + 1 < num_iters_kv
                     if do_prefetch:
-                        q_tile_T = tl.load(next_qT_ptrs, mask=True)
-                        do_tile_T = tl.load(next_doT_ptrs, mask=True)
+                        # q_abs already advanced above; compute mask for next tile rows
+                        next_mask_rows = (q_abs + offs_m) < rows_limit
+                        q_tile_T = tl.load(next_qT_ptrs, mask=next_mask_rows[None, :], other=0.0)
+                        do_tile_T = tl.load(next_doT_ptrs, mask=next_mask_rows[None, :], other=0.0)
                         next_qT_ptrs += BLOCK_M * stride_qm
                         next_doT_ptrs += BLOCK_M * stride_dom
                     # else keep last loaded tiles (won't be used)
@@ -610,17 +617,12 @@ def la_bwd_dq_inner(
         start_n_blocks = 0
         end_n_blocks = num_n_blocks_per_batch
         if CAUSAL:
-            # Diagonal index for the top of this Q tile
-            # q_start_abs + m runs [q_start_abs, q_start_abs + BLOCK_M)
-            # Valid K indices satisfy: q >= k + (N_CTX_Q - SEQLEN_K)
-            # Solve for k: k <= q - (N_CTX_Q - SEQLEN_K)
-            # Using the smallest q in the tile gives the tightest start bound
+            # Valid K indices satisfy: q >= k + (N_CTX_Q - SEQLEN_K) ⇒ k <= q - (N_CTX_Q - SEQLEN_K)
+            # For the entire Q tile, use the smallest q in the tile to get a conservative upper bound.
             k_max_for_tile = (q_start_abs) - (N_CTX_Q - SEQLEN_K)
             end_n_blocks = tl.maximum(0, tl.minimum(num_n_blocks_per_batch, (k_max_for_tile - k_start_abs) // BLOCK_N + 1))
-            # Using the largest q in the tile for the lower bound
-            k_min_for_tile = (q_start_abs + BLOCK_M - 1) - (N_CTX_Q - SEQLEN_K)
-            start_n_blocks = tl.maximum(0, tl.minimum(num_n_blocks_per_batch, (k_min_for_tile - k_start_abs - (BLOCK_N - 1)) // BLOCK_N))
-            start_n_blocks = tl.minimum(start_n_blocks, end_n_blocks)
+            # There is no lower bound beyond zero; keep start at 0.
+            start_n_blocks = 0
 
         # Dynamic loop to avoid heavy unrolling and register pressure
         # Prefetch first K tile
@@ -1136,8 +1138,8 @@ def persistent_lean_attention_bwd(
             kv_batch_num_block_n = torch.tensor([num_n_blocks_total_kv], device=q.device, dtype=torch.int32)
 
     # Config-driven prefetch defaults
-    prefetch_qt = int(config.get("prefetch_qt", 2))
-    prefetch_kv = int(config.get("prefetch_kv", 2))
+    prefetch_qt = 1 #int(config.get("prefetch_qt", 2))
+    prefetch_kv = 1 #int(config.get("prefetch_kv", 2))
 
     # If user didn't specify num_programs/ctas, prefer 2x SMs by default
     if num_programs is None and ("num_ctas" not in config):

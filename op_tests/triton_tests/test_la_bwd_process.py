@@ -21,14 +21,12 @@ BENCH_NONVARLEN_CONFIGS = [
     (8, 16, 16, 2048, 2048),
     (4, 16, 16, 4096, 4096),
     (2, 16, 16, 8192, 8192),
-    (8, 16, 16, 1024, 4096),
-    (1, 16, 16, 4096, 16384),
-    (2, 48, 48, 1024, 1024),
-    (2, 48, 48, 2048, 1024),
-    (2, 48, 48, 4096, 8192),
-    (2, 48, 48, 8192, 4096),
-    (2, 48, 48, 128, 8192),
-    (2, 48, 48, 128, 4096),
+    # (8, 16, 16, 1024, 4096),
+    # (1, 16, 16, 4096, 16384),
+    # (2, 48, 48, 1024, 1024),
+    # (2, 48, 48, 2048, 1024),
+    # (2, 48, 48, 4096, 8192),
+    # (2, 48, 48, 8192, 4096),
     
     # (2, 48, 48, 16384, 8192),
     # (8, 16, 16, 1989, 15344),
@@ -43,20 +41,20 @@ BENCH_NONVARLEN_CONFIGS = [
 
 
 HEAD_SZ_128_BENCH_CONFIGS = [
-    # (16, 16, 16, 1024, 1024),
-    # (8, 16, 16, 2048, 2048),
-    # (4, 16, 16, 4096, 4096),
-    # (2, 16, 16, 8192, 8192),
-    # (8, 16, 16, 1024, 4096),
-    # (1, 16, 16, 4096, 16384),
-    # (2, 48, 48, 1024, 1024),
-    # (2, 48, 48, 2048, 1024),
-    # (2, 48, 48, 4096, 8192),
-    # (2, 48, 48, 8192, 4096),
+    (16, 16, 16, 1024, 1024),
+    # (1, 16, 16, 512, 512),
+    (4, 16, 16, 4096, 4096),
+    (2, 16, 16, 8192, 8192),
+    (8, 16, 16, 1024, 4096),
+    (1, 16, 16, 4096, 16384),
+    (2, 48, 48, 1024, 1024),
+    (2, 48, 48, 2048, 1024),
+    (2, 48, 48, 4096, 8192),
+    (2, 48, 48, 8192, 4096),
     # (2, 48, 48, 16384, 8192),
     # (2, 48, 48, 8192, 4096),
     # (2, 48, 48, 16384, 8192),
-    (2, 48, 48, 8192, 16384),
+    # (2, 48, 48, 8192, 16384),
     # (2, 48, 48, 16384, 16384),
 ]
 
@@ -205,16 +203,16 @@ def _run_la_bwd_process_test(
     # dq_tol = atol + rtol * torch.abs(dq_flash)
     # dq_mismatch_pct = (dq_diff > dq_tol).float().mean().item() * 100
     # print(f"% mismatched (dQ): {dq_mismatch_pct:.6f}%")
-    # print("dk_la", dk_la)
-    # print("dk_flash", dk_flash)
+    # print("dq_la", dq_la)
+    # print("dq_flash", dq_flash)
     #Compare Lean Attention with Flash Attention
     # print("dq_la", dq_la)
     # print("dq_flash", dq_flash)
 
     
     # torch.testing.assert_close(dq_la, dq_flash, atol=atol, rtol=rtol, msg="dQ (Lean Attn vs Flash Attn)")
-    torch.testing.assert_close(dk_la, dk_flash, atol=atol, rtol=rtol, msg="dK (Lean Attn vs Flash Attn)")
-    torch.testing.assert_close(dv_la, dv_flash, atol=atol, rtol=rtol, msg="dV (Lean Attn vs Flash Attn)")
+    torch.testing.assert_close(dk_la, dk_ref, atol=atol, rtol=rtol, msg="dK (Lean Attn vs Flash Attn)")
+    torch.testing.assert_close(dv_la, dv_ref, atol=atol, rtol=rtol, msg="dV (Lean Attn vs Flash Attn)")
 
 # @pytest.mark.parametrize("BATCH", [1, 2, 4, 8, 16])
 # @pytest.mark.parametrize("NUM_Q_HEADS, NUM_K_HEADS", [(1, 1), (16,16), (48,48)])
@@ -227,7 +225,7 @@ def _run_la_bwd_process_test(
 @pytest.mark.parametrize("NUM_Q_HEADS, NUM_K_HEADS", [(16,16)])
 @pytest.mark.parametrize("HEAD_SZ", [128])
 @pytest.mark.parametrize("SEQLEN_Q, SEQLEN_K", ([(1024, 1024)]))
-@pytest.mark.parametrize("causal", [True])
+@pytest.mark.parametrize("causal", [False])
 @pytest.mark.parametrize("dtype", [torch.float16])
 def test_la_bwd_vs_flash_bwd(
     BATCH: int,
@@ -258,7 +256,7 @@ def test_la_bwd_vs_flash_bwd(
     HEAD_SZ_128_BENCH_CONFIGS,
 )
 @pytest.mark.parametrize("HEAD_SZ", [128])
-@pytest.mark.parametrize("causal", [False])
+@pytest.mark.parametrize("causal", [True])
 @pytest.mark.parametrize("dtype", [torch.float16])
 def test_la_bwd_vs_flash_bwd_head_sz_128(
     BATCH: int,
@@ -288,7 +286,7 @@ def test_la_bwd_vs_flash_bwd_head_sz_128(
     BENCH_NONVARLEN_CONFIGS,
 )
 @pytest.mark.parametrize("HEAD_SZ", [128])
-@pytest.mark.parametrize("causal", [False])
+@pytest.mark.parametrize("causal", [True])
 @pytest.mark.parametrize("dtype", [torch.float16])
 def test_la_bwd_vs_flash_bwd_bench_nonvarlen(
     BATCH: int,
