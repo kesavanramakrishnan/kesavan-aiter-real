@@ -1702,14 +1702,7 @@ def flash_attn_onekernel_backward(
         triton.cdiv(seqlen, config_onekernel["BLOCK_N1"]),
         batch,
     )
-    kernel_timing = {
-            "mha_bwd_onekernel": {
-                "start_event": torch.cuda.Event(enable_timing=True),
-                "end_event": torch.cuda.Event(enable_timing=True),
-                "ms": 0.0,
-            }
-        }
-    kernel_timing["mha_bwd_onekernel"]["start_event"].record()
+
     if causal:
         bwd_kernel_causal[grid](
             q,
@@ -1816,8 +1809,5 @@ def flash_attn_onekernel_backward(
             USE_INT64_STRIDES=USE_INT64_STRIDES,
             **config_onekernel,
         )
-    kernel_timing["mha_bwd_onekernel"]["end_event"].record()
-    torch.cuda.synchronize()
-    kernel_timing["mha_bwd_onekernel"]["ms"] = kernel_timing["mha_bwd_onekernel"]["start_event"].elapsed_time(kernel_timing["mha_bwd_onekernel"]["end_event"])
-    print(f"MHA BWD ONEKERNEL TIME: {kernel_timing['mha_bwd_onekernel']['ms']} ms")
-    return delta, kernel_timing
+
+    return delta

@@ -1138,8 +1138,8 @@ def persistent_lean_attention_bwd(
             kv_batch_num_block_n = torch.tensor([num_n_blocks_total_kv], device=q.device, dtype=torch.int32)
 
     # Config-driven prefetch defaults
-    prefetch_qt = 1 #int(config.get("prefetch_qt", 2))
-    prefetch_kv = 1 #int(config.get("prefetch_kv", 2))
+    prefetch_qt = int(config.get("prefetch_qt", 2))
+    prefetch_kv = int(config.get("prefetch_kv", 2))
 
     # If user didn't specify num_programs/ctas, prefer 2x SMs by default
     if num_programs is None and ("num_ctas" not in config):
@@ -1297,3 +1297,20 @@ def persistent_lean_attention_bwd(
         )
     print(f"la bwd fused kernel {fused_kernel.n_regs} regs, {fused_kernel.n_spills} spills")
     return
+
+
+    # fused-attention-bwd-D_HEAD-128-layout-bshd-fp8-False-causal-False:
+#     BATCH    HQ    HK  N_CTX_Q  N_CTX_K  fused-bwd(ms)     bwd(ms)
+# 0     8.0  16.0  16.0   1024.0   4096.0       5.043464    6.420011
+# 1     1.0  16.0  16.0   4096.0  16384.0       9.902170   10.243707
+# 2     2.0  48.0  48.0   1024.0   1024.0       1.086990    1.395209
+# 3     2.0  48.0  48.0   2048.0   1024.0       2.165276    1.780026
+# 4     2.0  48.0  48.0   4096.0   8192.0      31.805403   11.216395
+# 5     2.0  48.0  48.0   8192.0   4096.0      34.341858   12.872743
+# 6     2.0  48.0  48.0  16384.0   8192.0     127.641678   44.088789
+# 7     2.0  48.0  48.0   8192.0  16384.0     127.201187   38.511293
+# 8     2.0  48.0  48.0  16384.0  16384.0     247.439499   73.900841
+# 9     2.0  48.0  48.0  16384.0  32768.0     485.110077  144.510422
+# 10    2.0  48.0  48.0  32768.0  16384.0     490.320160  146.580826
+# 11    2.0  48.0  48.0  32768.0  32768.0     968.125671  285.581085
+# 12    2.0  48.0  48.0  16384.0   8192.0     128.828995   40.319927

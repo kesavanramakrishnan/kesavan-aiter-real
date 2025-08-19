@@ -1,6 +1,7 @@
 import pytest
 import torch
 import triton
+import sys
 
 from aiter.ops.triton.lean_atten_bwd_clean import persistent_lean_attention_bwd
 from aiter.ops.triton.mha_onekernel_bwd import flash_attn_onekernel_backward
@@ -310,3 +311,105 @@ def test_la_bwd_vs_flash_bwd_bench_nonvarlen(
         dtype,
         device,
     )
+
+
+def main():
+    """Main function for manual testing of individual configurations"""
+    import sys
+    
+    # Default configuration - you can modify these values for testing
+    BATCH = 1
+    NUM_Q_HEADS = 48
+    NUM_K_HEADS = 48
+    HEAD_SZ = 128
+    SEQLEN_Q = 16384
+    SEQLEN_K = 16384
+    causal = False
+    dtype = torch.float16
+    device = "cuda"
+    
+    print(f"Testing Lean Attention Backward configuration:")
+    print(f"  BATCH: {BATCH}")
+    print(f"  NUM_Q_HEADS: {NUM_Q_HEADS}")
+    print(f"  NUM_K_HEADS: {NUM_K_HEADS}")
+    print(f"  HEAD_SZ: {HEAD_SZ}")
+    print(f"  SEQLEN_Q: {SEQLEN_Q}")
+    print(f"  SEQLEN_K: {SEQLEN_K}")
+    print(f"  causal: {causal}")
+    print(f"  dtype: {dtype}")
+    print(f"  device: {device}")
+    print("-" * 50)
+    
+    torch.manual_seed(2024)
+
+    # Define tensor shapes
+    q_shape = (BATCH, NUM_Q_HEADS, SEQLEN_Q, HEAD_SZ)
+    k_shape = (BATCH, NUM_K_HEADS, SEQLEN_K, HEAD_SZ)
+    v_shape = (BATCH, NUM_K_HEADS, SEQLEN_K, HEAD_SZ)
+
+    # Initialize input tensors
+    q = torch.randn(q_shape, dtype=dtype, device=device)
+    k = torch.randn(k_shape, dtype=dtype, device=device)
+    v = torch.randn(v_shape, dtype=dtype, device=device)
+    sm_scale = HEAD_SZ**-0.5
+
+    # Create dummy output and gradient tensors
+    o = torch.randn(BATCH, NUM_Q_HEADS, SEQLEN_Q, HEAD_SZ, dtype=dtype, device=device)
+    do = torch.randn(BATCH, NUM_Q_HEADS, SEQLEN_Q, HEAD_SZ, dtype=dtype, device=device)
+    softmax_lse = torch.randn(BATCH, NUM_Q_HEADS, SEQLEN_Q, dtype=torch.float32, device=device)
+
+    # Prepare tensors in BSHD format (batch, seqlen, heads, dim)
+    q_bsnh = q.permute(0, 2, 1, 3).contiguous()
+    k_bsnh = k.permute(0, 2, 1, 3).contiguous()
+    v_bsnh = v.permute(0, 2, 1, 3).contiguous()
+    o_bsnh = o.permute(0, 2, 1, 3).contiguous()
+    do_bsnh = do.permute(0, 2, 1, 3).contiguous()
+
+    # Flatten to [B*Seqlen, H, D] and concatenate K/V across batch
+    q_flat = q_bsnh.reshape(BATCH * SEQLEN_Q, NUM_Q_HEADS, HEAD_SZ).contiguous()
+    k_flat = k_bsnh.reshape(BATCH * SEQLEN_K, NUM_K_HEADS, HEAD_SZ).contiguous()
+    v_flat = v_bsnh.reshape(BATCH * SEQLEN_K, NUM_K_HEADS, HEAD_SZ).contiguous()
+    o_flat = o_bsnh.reshape(BATCH * SEQLEN_Q, NUM_Q_HEADS, HEAD_SZ).contiguous()
+    do_flat = do_bsnh.reshape(BATCH * SEQLEN_Q, NUM_Q_HEADS, HEAD_SZ).contiguous()
+
+    dq_flat = torch.zeros_like(q_flat)
+    dk_flat = torch.zeros_like(k_flat)
+    dv_flat = torch.zeros_like(v_flat)
+
+    # Compute batch_num_block_n for non-causal multi-batch decode
+    BLOCK_N = 64
+    num_n_blocks = (SEQLEN_K + BLOCK_N - 1) // BLOCK_N
+    batch_num_block_n = None
+    if (not causal) and (BATCH > 1):
+        batch_num_block_n = (
+            torch.arange(1, BATCH + 1, device=device, dtype=torch.int32) * num_n_blocks
+        )
+
+    print("Running Lean Attention Backward...")
+    torch.cuda.synchronize()
+    
+    try:
+        persistent_lean_attention_bwd(
+            q=q_flat, k=k_flat, v=v_flat, do=do_flat, o=o_flat,
+            softmax_lse=softmax_lse,
+            dq=dq_flat, dk=dk_flat, dv=dv_flat,
+            batch_num_block_n=batch_num_block_n,
+            batch_size=BATCH, sm_scale=sm_scale, causal=causal,
+            seqlen_k=BATCH * SEQLEN_K,
+            num_programs=304,
+        )
+        torch.cuda.synchronize()
+        
+        print("✅ Lean Attention Backward completed successfully!")
+        print(f"Output shapes - dq: {dq_flat.shape}, dk: {dk_flat.shape}, dv: {dv_flat.shape}")
+        return 0
+        
+    except Exception as e:
+        print(f"❌ Lean Attention Backward failed with error: {e}")
+        import traceback
+        traceback.print_exc()
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())    

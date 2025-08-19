@@ -1,0 +1,14 @@
+{
+    "jobs": [
+        {
+            "kernel_include_regex": "la_bwd_dkdv_inner",
+            "kernel_exclude_regex": "",
+            "advanced_thread_trace": true,
+            "att_target_cu" : 0,
+            "att_shader_engine_mask" : "0xF",
+            "att_simd_select": "0xF",
+            "att_buffer_size": "0x6000000"
+ 
+         }
+    ]
+}
