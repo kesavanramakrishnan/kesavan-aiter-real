@@ -1702,6 +1702,16 @@ def flash_attn_onekernel_backward(
         triton.cdiv(seqlen, config_onekernel["BLOCK_N1"]),
         batch,
     )
+    kernel_timing = {
+        "bwd_kernel": {
+            "start_event": torch.cuda.Event(enable_timing=True),
+            "end_event": torch.cuda.Event(enable_timing=True),
+            "ms": 0.0,
+        }
+    }
+    kernel_timing["bwd_kernel"]["start_event"].record()
+    def _print_triton_kernel_lds(kernel_obj):
+        print(f"kernel_metadata: {kernel_obj.metadata}")
 
     if causal:
         bwd_kernel_causal[grid](
@@ -1757,7 +1767,7 @@ def flash_attn_onekernel_backward(
             **config_onekernel,
         )
     else:
-        bwd_kernel_noncausal[grid](
+        krr = bwd_kernel_noncausal[grid](
             q,
             k,
             v,
@@ -1809,5 +1819,12 @@ def flash_attn_onekernel_backward(
             USE_INT64_STRIDES=USE_INT64_STRIDES,
             **config_onekernel,
         )
-
+        try:
+            _print_triton_kernel_lds(krr)
+        except Exception:
+            pass
+    kernel_timing["bwd_kernel"]["end_event"].record()
+    torch.cuda.synchronize()
+    kernel_timing["bwd_kernel"]["ms"] = kernel_timing["bwd_kernel"]["start_event"].elapsed_time(kernel_timing["bwd_kernel"]["end_event"])
+    print(f"bwd_kernel FA2: {kernel_timing['bwd_kernel']['ms']} ms")
     return delta

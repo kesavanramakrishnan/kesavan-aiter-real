@@ -31,10 +31,10 @@ def nonvarlen_benchmark_configs():
         # (2, 48, 48, 128, 4096),
         # (2, 48, 48, 128, 1024),
         # (2, 48, 48, 128, 2048),
-        # (16, 16, 16, 1024, 1024),
-        # (8, 16, 16, 2048, 2048),
-        # (4, 16, 16, 4096, 4096),
-        # (2, 16, 16, 8192, 8192),
+        (16, 16, 16, 1024, 1024),
+        (8, 16, 16, 2048, 2048),
+        (4, 16, 16, 4096, 4096),
+        (2, 16, 16, 8192, 8192),
         (8, 16, 16, 1024, 4096),
         (1, 16, 16, 4096, 16384),
         (2, 48, 48, 1024, 1024),
@@ -48,7 +48,7 @@ def nonvarlen_benchmark_configs():
         (2, 48, 48, 32768, 16384),
         (2, 48, 48, 32768, 32768),
         
-        (2, 48, 48, 16384, 8192),
+        # (2, 48, 48, 16384, 8192),
         # (8, 16, 16, 1989, 15344),
         # (4, 16, 16, 4097, 163),
         # (2, 16, 16, 8122, 2159),
@@ -64,19 +64,19 @@ def nonvarlen_benchmark_configs():
 def varlen_benchmark_configs():
     configs = [
         # (2, 16, 4, 1024, 1024),
-        (8, 16, 2, 2048, 2048),
-        (4, 16, 8, 4096, 4096),
-        (2, 16, 4, 8192, 8192),
-        (2, 16, 8, 16384, 16384),
-        (2, 48, 12, 1024, 1024),
-        (2, 48, 24, 2048, 2048),
-        (2, 48, 8, 4096, 4096),
-        (2, 48, 4, 8192, 8192),
-        (2, 48, 2, 16384, 16384),
-        (2, 64, 32, 1024, 1024),
-        (4, 64, 16, 2048, 2048),
-        (4, 64, 8, 4096, 4096),
-        (4, 64, 32, 8192, 8192),
+        # (8, 16, 2, 2048, 2048),
+        # (4, 16, 8, 4096, 4096),
+        # (2, 16, 4, 8192, 8192),
+        # (2, 16, 8, 16384, 16384),
+        # (2, 48, 12, 1024, 1024),
+        # (2, 48, 24, 2048, 2048),
+        # (2, 48, 8, 4096, 4096),
+        # (2, 48, 4, 8192, 8192),
+        # (2, 48, 2, 16384, 16384),
+        # (2, 64, 32, 1024, 1024),
+        # (4, 64, 16, 2048, 2048),
+        # (4, 64, 8, 4096, 4096),
+        # (4, 64, 32, 8192, 8192),
         (4, 128, 16, 16384, 16384),
     ]
     return configs
@@ -170,7 +170,10 @@ def create_benchmark_configs(custom, args):
     # unit = "ms"
 
     if mode == "bwd":
-        if args.fused_bwd:
+        if getattr(args, "compare_fa2_lean", False):
+            # Compare FA2 one-kernel backward vs Lean persistent backward
+            line_vals = [f"fa2-onekernel({unit})", f"lean-bwd({unit})"]
+        elif args.fused_bwd:
             line_vals = [f"fused-bwd({unit})"]
         else:
             line_vals = [f"fused-bwd({unit})", f"bwd({unit})"]
@@ -241,13 +244,104 @@ def run_benchmark(custom, args):
         global _USE_FUSED_BWD
 
         fused_backward = "fused-bwd" in provider
+        if getattr(args, "compare_fa2_lean", False):
+            # Override provider mapping by label:
+            # - "fa2-onekernel" => use FA2 one-kernel backward (no lean)
+            # - "lean-bwd" => monkey-patch bwd to Lean
+            provider_is_fa2 = provider.startswith("fa2-onekernel")
+            provider_is_lean = provider.startswith("lean-bwd")
+            # Ensure we don't toggle fused kernel; we want the standard one-kernel bwd path
+            fused_backward = False
 
         # Conditionally switch to Lean Attention persistent bwd (only non-varlen)
-        if args.lean and (mode == "bwd") and (not varlen):
+        if (args.lean or (getattr(args, "compare_fa2_lean", False) and provider_is_lean)) and (mode == "bwd") and (not varlen):
             try:
-                from aiter.ops.triton import lean_atten_bwd_prod as _lab
+                from aiter.ops.triton.lean_atten_bwd_clean import (
+                    persistent_lean_attention_bwd as _lean_bwd,
+                )
+
+                def _lean_flash_attn_onekernel_backward(
+                    do: torch.Tensor,
+                    q: torch.Tensor,
+                    k: torch.Tensor,
+                    v: torch.Tensor,
+                    o: torch.Tensor,
+                    softmax_lse: torch.Tensor,
+                    dq: torch.Tensor,
+                    dk: torch.Tensor,
+                    dv: torch.Tensor,
+                    dbias: torch.Tensor,
+                    sm_scale: float,
+                    alibi_slopes: torch.Tensor,
+                    causal: bool,
+                    cu_seqlens_q: torch.Tensor,
+                    cu_seqlens_k: torch.Tensor,
+                    max_seqlen_q: int,
+                    max_seqlen_k: int,
+                    dropout_p: float,
+                    philox_seed: int = 0,
+                    philox_offset: int = 0,
+                    descale_q: torch.Tensor = None,
+                    descale_k: torch.Tensor = None,
+                    descale_v: torch.Tensor = None,
+                    descale_do: torch.Tensor = None,
+                    USE_INT64_STRIDES: bool = False,
+                    config: dict = None,
+                ):
+                    # Only non-varlen supported in this lean path
+                    if cu_seqlens_q is not None or cu_seqlens_k is not None:
+                        raise NotImplementedError(
+                            "lean_atten_bwd_clean path only supports non-varlen"
+                        )
+                    # Dropout not supported in lean path
+                    if dropout_p and dropout_p > 0.0:
+                        raise NotImplementedError(
+                            "lean_atten_bwd_clean path expects dropout_p == 0.0"
+                        )
+
+                    # q/do/o: [B, Nq, H, D], k/v: [B, Nk, H, D]
+                    B, Nq, H, D = q.shape
+                    Nk = k.shape[1]
+
+                    # Build lean views
+                    q_lean = q.reshape(B * Nq, H, D)
+                    do_lean = do.reshape(B * Nq, H, D)
+                    o_lean = o.reshape(B * Nq, H, D)
+                    k_lean = k.reshape(B * Nk, H, D)
+                    v_lean = v.reshape(B * Nk, H, D)
+
+                    dq_view = dq.reshape(B * Nq, H, D)
+                    dk_view = dk.reshape(B * Nk, H, D)
+                    dv_view = dv.reshape(B * Nk, H, D)
+
+                    _lean_bwd(
+                        q=q_lean,
+                        k=k_lean,
+                        v=v_lean,
+                        do=do_lean,
+                        o=o_lean,
+                        softmax_lse=softmax_lse,
+                        dq=dq_view,
+                        dk=dk_view,
+                        dv=dv_view,
+                        batch_num_block_n=None,
+                        batch_size=B,
+                        sm_scale=sm_scale,
+                        causal=causal,
+                        config=config,
+                        num_programs=None,
+                    )
+                    print("Sum of DQ: ", dq_view.sum())
+                    print("Sum of DK: ", dk_view.sum())
+                    print("Sum of DV: ", dv_view.sum())
+
+                    # Return delta to match API (same as softmax_lse shape: [B, H, Nq])
+                    delta = (do * o).sum(dim=-1)
+                    delta = delta.permute(0, 2, 1).contiguous()
+                    return delta
+
                 if _orig_onekernel_bwd is not None:
-                    _mha.flash_attn_onekernel_backward = _lab.flash_attn_onekernel_backward
+                    _mha.flash_attn_onekernel_backward = _lean_flash_attn_onekernel_backward
             except Exception as e:
                 raise RuntimeError(f"Failed to enable Lean backward (-l/--lean): {e}")
         else:
@@ -486,6 +580,9 @@ def run_benchmark(custom, args):
                         d_out,
                         retain_graph=True,
                     )
+                    print("Sum of DQ grads: ", grads[0].sum())
+                    print("Sum of DK grads: ", grads[1].sum())
+                    print("Sum of DV grads: ", grads[2].sum())
                     return grads
 
         ms = triton.testing.do_bench(fn)
@@ -578,6 +675,12 @@ def parse_args():
     parser.add_argument("-dtype", default="fp16")
     parser.add_argument("-bench_torch", action="store_true", default=False)
     parser.add_argument("-fused_bwd", action="store_true", default=False)
+    parser.add_argument(
+        "--compare_fa2_lean",
+        action="store_true",
+        default=False,
+        help="Compare FA2 fused backward vs Lean persistent backward on the same plot",
+    )
     parser.add_argument(
         "-l",
         "--lean",

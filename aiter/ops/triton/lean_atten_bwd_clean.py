@@ -14,34 +14,9 @@ import aiter.ops.triton.utils.arch_info as arch_info
 # - Supports causal and non-causal (ragged) sequences via `batch_num_block_n`.
 # - Uses softmax LSE `M` from forward for numerical stability when reconstructing P.
 
-
-@triton.jit
-def find_group(x, MASKED_BLOCKS: tl.constexpr, num_m_blocks: tl.constexpr):
-    """
-    Returns a zig-zag grouping index for m-blocks. Currently unused in this file,
-    but kept for potential scheduling experiments.
-    """
-    total_blocks_processed = 0
-    final_q_block_idx = 0
-    final_task_size = 0
-    final_total_blocks = 0
-    found = False
-    for i in tl.static_range(0, num_m_blocks):
-        pair_idx = i // 2
-        if (i % 2) == 0:
-            q_block_idx = pair_idx
-        else:
-            q_block_idx = num_m_blocks - 1 - pair_idx
-        task_size = (q_block_idx + 1) * MASKED_BLOCKS
-        if total_blocks_processed + task_size > x and not found:
-            final_q_block_idx, final_task_size, final_total_blocks = (
-                q_block_idx,
-                task_size,
-                total_blocks_processed,
-            )
-            found = True
-        total_blocks_processed += task_size
-    return final_q_block_idx, final_task_size, final_total_blocks
+def _print_triton_kernel_lds(kernel_obj):
+    """Best-effort print of LDS/shared-memory usage for a compiled Triton kernel."""
+    print(f"LA Kernel Metadata: {kernel_obj.metadata}")
 
 
 def get_num_splits_and_buffer_sizes_bwd(
@@ -672,208 +647,208 @@ def la_bwd_dq_inner(
             tl.store(dq_ptrs_out, dq_acc.to(DQ.type.element_ty), mask=mask_m[:, None])
 
 
-@triton.jit
-def la_bwd_kv_streamk(
-    Q,
-    K,
-    V,
-    DO,
-    M,
-    Delta,
-    DK,
-    DV,
-    batch_num_block_n,
-    stride_qm,
-    stride_qh,
-    stride_qk,
-    stride_kn,
-    stride_kh,
-    stride_kk,
-    stride_vn,
-    stride_vh,
-    stride_vk,
-    stride_dom,
-    stride_doh,
-    stride_dok,
-    stride_mb,
-    stride_mh,
-    stride_mm,
-    stride_deltab,
-    stride_deltah,
-    stride_deltam,
-    stride_dkn_out,
-    stride_dkh_out,
-    stride_dkk_out,
-    stride_dvn_out,
-    stride_dvh_out,
-    stride_dvk_out,
-    sm_scale,
-    N_CTX_Q,
-    SEQLEN_K,
-    total_n_blocks_all_batches,
-    total_tiles_kv,
-    high_load_wgs_kv,
-    max_tiles_per_wg_kv,
-    H: tl.constexpr,
-    B: tl.constexpr,
-    HEAD_DIM: tl.constexpr,
-    BLOCK_M: tl.constexpr,
-    BLOCK_N: tl.constexpr,
-    CAUSAL: tl.constexpr,
-    MAX_TILES_PER_WG_KV_CONST: tl.constexpr,
-    NUM_M_BLOCKS_TOTAL: tl.constexpr,
-    RAGGED_BATCHING: tl.constexpr,
-    PREFETCH_QT: tl.constexpr,
-    waves_per_eu: tl.constexpr,
-):
-    la_bwd_dkdv_inner(
-        Q,
-        K,
-        V,
-        DO,
-        M,
-        Delta,
-        DK,
-        DV,
-        batch_num_block_n,
-        stride_qm,
-        stride_qh,
-        stride_qk,
-        stride_kn,
-        stride_kh,
-        stride_kk,
-        stride_vn,
-        stride_vh,
-        stride_vk,
-        stride_dom,
-        stride_doh,
-        stride_dok,
-        stride_mb,
-        stride_mh,
-        stride_mm,
-        stride_deltab,
-        stride_deltah,
-        stride_deltam,
-        stride_dkn_out,
-        stride_dkh_out,
-        stride_dkk_out,
-        stride_dvn_out,
-        stride_dvh_out,
-        stride_dvk_out,
-        sm_scale, N_CTX_Q, SEQLEN_K,
-        total_n_blocks_all_batches, total_tiles_kv,
-        high_load_wgs_kv, max_tiles_per_wg_kv,
-        H=H,
-        B=B,
-        HEAD_DIM=HEAD_DIM,
-        BLOCK_M=BLOCK_M,
-        BLOCK_N=BLOCK_N,
-        CAUSAL=CAUSAL,
-        MAX_TILES_PER_WG_KV_CONST=MAX_TILES_PER_WG_KV_CONST,
-        NUM_M_BLOCKS_TOTAL=NUM_M_BLOCKS_TOTAL,
-        RAGGED_BATCHING=RAGGED_BATCHING,
-        PREFETCH_QT=PREFETCH_QT,
-        waves_per_eu=waves_per_eu,
-    )
+# @triton.jit
+# def la_bwd_kv_streamk(
+#     Q,
+#     K,
+#     V,
+#     DO,
+#     M,
+#     Delta,
+#     DK,
+#     DV,
+#     batch_num_block_n,
+#     stride_qm,
+#     stride_qh,
+#     stride_qk,
+#     stride_kn,
+#     stride_kh,
+#     stride_kk,
+#     stride_vn,
+#     stride_vh,
+#     stride_vk,
+#     stride_dom,
+#     stride_doh,
+#     stride_dok,
+#     stride_mb,
+#     stride_mh,
+#     stride_mm,
+#     stride_deltab,
+#     stride_deltah,
+#     stride_deltam,
+#     stride_dkn_out,
+#     stride_dkh_out,
+#     stride_dkk_out,
+#     stride_dvn_out,
+#     stride_dvh_out,
+#     stride_dvk_out,
+#     sm_scale,
+#     N_CTX_Q,
+#     SEQLEN_K,
+#     total_n_blocks_all_batches,
+#     total_tiles_kv,
+#     high_load_wgs_kv,
+#     max_tiles_per_wg_kv,
+#     H: tl.constexpr,
+#     B: tl.constexpr,
+#     HEAD_DIM: tl.constexpr,
+#     BLOCK_M: tl.constexpr,
+#     BLOCK_N: tl.constexpr,
+#     CAUSAL: tl.constexpr,
+#     MAX_TILES_PER_WG_KV_CONST: tl.constexpr,
+#     NUM_M_BLOCKS_TOTAL: tl.constexpr,
+#     RAGGED_BATCHING: tl.constexpr,
+#     PREFETCH_QT: tl.constexpr,
+#     waves_per_eu: tl.constexpr,
+# ):
+#     la_bwd_dkdv_inner(
+#         Q,
+#         K,
+#         V,
+#         DO,
+#         M,
+#         Delta,
+#         DK,
+#         DV,
+#         batch_num_block_n,
+#         stride_qm,
+#         stride_qh,
+#         stride_qk,
+#         stride_kn,
+#         stride_kh,
+#         stride_kk,
+#         stride_vn,
+#         stride_vh,
+#         stride_vk,
+#         stride_dom,
+#         stride_doh,
+#         stride_dok,
+#         stride_mb,
+#         stride_mh,
+#         stride_mm,
+#         stride_deltab,
+#         stride_deltah,
+#         stride_deltam,
+#         stride_dkn_out,
+#         stride_dkh_out,
+#         stride_dkk_out,
+#         stride_dvn_out,
+#         stride_dvh_out,
+#         stride_dvk_out,
+#         sm_scale, N_CTX_Q, SEQLEN_K,
+#         total_n_blocks_all_batches, total_tiles_kv,
+#         high_load_wgs_kv, max_tiles_per_wg_kv,
+#         H=H,
+#         B=B,
+#         HEAD_DIM=HEAD_DIM,
+#         BLOCK_M=BLOCK_M,
+#         BLOCK_N=BLOCK_N,
+#         CAUSAL=CAUSAL,
+#         MAX_TILES_PER_WG_KV_CONST=MAX_TILES_PER_WG_KV_CONST,
+#         NUM_M_BLOCKS_TOTAL=NUM_M_BLOCKS_TOTAL,
+#         RAGGED_BATCHING=RAGGED_BATCHING,
+#         PREFETCH_QT=PREFETCH_QT,
+#         waves_per_eu=waves_per_eu,
+#     )
 
 
-@triton.jit
-def la_bwd_q_streamk(
-    Q,
-    K,
-    V,
-    DO,
-    M,
-    Delta,
-    DQ,
-    batch_num_block_n,
-    stride_qm,
-    stride_qh,
-    stride_qk,
-    stride_kn,
-    stride_kh,
-    stride_kk,
-    stride_vn,
-    stride_vh,
-    stride_vk,
-    stride_dom,
-    stride_doh,
-    stride_dok,
-    stride_mb,
-    stride_mh,
-    stride_mm,
-    stride_deltab,
-    stride_deltah,
-    stride_deltam,
-    stride_dqm,
-    stride_dqh,
-    stride_dqk,
-    sm_scale,
-    N_CTX_Q,
-    SEQLEN_K,
-    total_n_blocks_all_batches,
-    total_tiles_q,
-    high_load_wgs_q,
-    max_tiles_per_wg_q,
-    H: tl.constexpr,
-    B: tl.constexpr,
-    HEAD_DIM: tl.constexpr,
-    BLOCK_M: tl.constexpr,
-    BLOCK_N: tl.constexpr,
-    CAUSAL: tl.constexpr,
-    MAX_N_BLOCKS_PER_BATCH_CONST: tl.constexpr,
-    RAGGED_BATCHING: tl.constexpr,
-    PREFETCH_KV: tl.constexpr,
-    waves_per_eu: tl.constexpr,
-):
-    la_bwd_dq_inner(
-        Q,
-        K,
-        V,
-        DO,
-        M,
-        Delta,
-        DQ,
-        batch_num_block_n,
-        stride_qm,
-        stride_qh,
-        stride_qk,
-        stride_kn,
-        stride_kh,
-        stride_kk,
-        stride_vn,
-        stride_vh,
-        stride_vk,
-        stride_dom,
-        stride_doh,
-        stride_dok,
-        stride_mb,
-        stride_mh,
-        stride_mm,
-        stride_deltab,
-        stride_deltah,
-        stride_deltam,
-        stride_dqm,
-        stride_dqh,
-        stride_dqk,
-        sm_scale,
-        N_CTX_Q,
-        SEQLEN_K,
-        total_n_blocks_all_batches,
-        total_tiles_q,
-        high_load_wgs_q,
-        max_tiles_per_wg_q,
-        H=H,
-        B=B,
-        HEAD_DIM=HEAD_DIM,
-        BLOCK_M=BLOCK_M,
-        BLOCK_N=BLOCK_N,
-        CAUSAL=CAUSAL,
-        MAX_N_BLOCKS_PER_BATCH_CONST=MAX_N_BLOCKS_PER_BATCH_CONST,
-        RAGGED_BATCHING=RAGGED_BATCHING,
-        PREFETCH_KV=PREFETCH_KV,
-        waves_per_eu=waves_per_eu,
-    )
+# @triton.jit
+# def la_bwd_q_streamk(
+#     Q,
+#     K,
+#     V,
+#     DO,
+#     M,
+#     Delta,
+#     DQ,
+#     batch_num_block_n,
+#     stride_qm,
+#     stride_qh,
+#     stride_qk,
+#     stride_kn,
+#     stride_kh,
+#     stride_kk,
+#     stride_vn,
+#     stride_vh,
+#     stride_vk,
+#     stride_dom,
+#     stride_doh,
+#     stride_dok,
+#     stride_mb,
+#     stride_mh,
+#     stride_mm,
+#     stride_deltab,
+#     stride_deltah,
+#     stride_deltam,
+#     stride_dqm,
+#     stride_dqh,
+#     stride_dqk,
+#     sm_scale,
+#     N_CTX_Q,
+#     SEQLEN_K,
+#     total_n_blocks_all_batches,
+#     total_tiles_q,
+#     high_load_wgs_q,
+#     max_tiles_per_wg_q,
+#     H: tl.constexpr,
+#     B: tl.constexpr,
+#     HEAD_DIM: tl.constexpr,
+#     BLOCK_M: tl.constexpr,
+#     BLOCK_N: tl.constexpr,
+#     CAUSAL: tl.constexpr,
+#     MAX_N_BLOCKS_PER_BATCH_CONST: tl.constexpr,
+#     RAGGED_BATCHING: tl.constexpr,
+#     PREFETCH_KV: tl.constexpr,
+#     waves_per_eu: tl.constexpr,
+# ):
+#     la_bwd_dq_inner(
+#         Q,
+#         K,
+#         V,
+#         DO,
+#         M,
+#         Delta,
+#         DQ,
+#         batch_num_block_n,
+#         stride_qm,
+#         stride_qh,
+#         stride_qk,
+#         stride_kn,
+#         stride_kh,
+#         stride_kk,
+#         stride_vn,
+#         stride_vh,
+#         stride_vk,
+#         stride_dom,
+#         stride_doh,
+#         stride_dok,
+#         stride_mb,
+#         stride_mh,
+#         stride_mm,
+#         stride_deltab,
+#         stride_deltah,
+#         stride_deltam,
+#         stride_dqm,
+#         stride_dqh,
+#         stride_dqk,
+#         sm_scale,
+#         N_CTX_Q,
+#         SEQLEN_K,
+#         total_n_blocks_all_batches,
+#         total_tiles_q,
+#         high_load_wgs_q,
+#         max_tiles_per_wg_q,
+#         H=H,
+#         B=B,
+#         HEAD_DIM=HEAD_DIM,
+#         BLOCK_M=BLOCK_M,
+#         BLOCK_N=BLOCK_N,
+#         CAUSAL=CAUSAL,
+#         MAX_N_BLOCKS_PER_BATCH_CONST=MAX_N_BLOCKS_PER_BATCH_CONST,
+#         RAGGED_BATCHING=RAGGED_BATCHING,
+#         PREFETCH_KV=PREFETCH_KV,
+#         waves_per_eu=waves_per_eu,
+#     )
 
 
 @triton.jit
@@ -903,6 +878,12 @@ def la_bwd_fused_streamk(
     PREFETCH_KV: tl.constexpr,
     waves_per_eu: tl.constexpr,
 ):
+    # if tl.program_id(0) == 0:
+    #     print("BLOCK_M_KV: ", BLOCK_M_KV)
+    #     print("BLOCK_N_KV: ", BLOCK_N_KV)
+    #     print("BLOCK_M_Q: ", BLOCK_M_Q)
+    #     print("BLOCK_N_Q: ", BLOCK_N_Q)
+    # print("Here")
     # Phase 1: dK/dV with KV tiling
     la_bwd_dkdv_inner(
         Q, K, V, DO, M, Delta, DK, DV, kv_batch_num_block_n,
@@ -925,7 +906,7 @@ def la_bwd_fused_streamk(
         waves_per_eu=waves_per_eu,
     )
 
-    # Phase 2: dQ with Q tiling
+    # # Phase 2: dQ with Q tiling
     la_bwd_dq_inner(
         Q, K, V, DO, M, Delta, DQ, batch_num_block_n,
         stride_qm, stride_qh, stride_qk,
@@ -979,9 +960,10 @@ def persistent_lean_attention_bwd(
         config = {
         "split_kernels": True,
         "BLOCK_SIZE_M": 128, "BLOCK_SIZE_N": 64, "num_warps": 4,
-        "BLOCK_SIZE_M_KV": BLOCK_SIZE_M_KV, "BLOCK_SIZE_N_KV": BLOCK_SIZE_N_KV, "num_warps_kv": 2, "waves_per_eu": 1, "num_programs_mult": 3,
+        "BLOCK_SIZE_M_KV": BLOCK_SIZE_M_KV, "BLOCK_SIZE_N_KV": BLOCK_SIZE_N_KV, "num_warps_kv": 2, "waves_per_eu": 1, "num_programs_mult": 2,
         }
     #Optional: override with tuned DB (env AITER_BWD_TUNED_DB)
+    # print(f"config: {config}")
     try:
         db_path = os.environ.get("AITER_BWD_TUNED_DB")
         if db_path:
@@ -991,9 +973,10 @@ def persistent_lean_attention_bwd(
             NK_tmp = k.shape[0]
             db = _load_bwd_tuned_db(db_path)
             tuned = _select_bwd_config(db, causal, batch_size, H_tmp, D_tmp, NQ_tmp, NK_tmp)
+            print(f"tuned: {tuned}")
             tuned_np_mult = None
             if tuned:
-                print("found")
+                print(f"tuned.get('num_programs_mult'): {tuned.get('num_programs_mult')}")
                 tuned_np_mult = tuned.get("num_programs_mult")
                 # do not override num_programs from DB; user controls it
                 tuned = {k: v for k, v in tuned.items() if k != "num_programs" and k != "num_programs_mult"}
@@ -1001,7 +984,7 @@ def persistent_lean_attention_bwd(
     except Exception:
         pass
     # Resolve total programs (CTAs) preference: explicit arg > config > device
-    total_programs_pref = None
+    total_programs_pref = config["num_programs_mult"]
     sm_count = None
     if num_programs is not None:
         total_programs_pref = int(num_programs)
@@ -1010,12 +993,12 @@ def persistent_lean_attention_bwd(
     else:
         try:
             sm_count = int(arch_info.get_num_sms())
-            total_programs_pref = sm_count
+            total_programs_pref = sm_count# * total_programs_pref
         except Exception:
             sm_count = int(torch.cuda.get_device_properties(q.device).multi_processor_count)
             total_programs_pref = sm_count
 
-    #If enabled, apply tuned grid size from DB multiplier when user hasn't set num_programs explicitly
+    # #If enabled, apply tuned grid size from DB multiplier when user hasn't set num_programs explicitly
     try:
         use_tuned_grid = os.environ.get("AITER_BWD_USE_TUNED_GRID", "0") == "1"
         if use_tuned_grid and (num_programs is None):
@@ -1023,11 +1006,13 @@ def persistent_lean_attention_bwd(
             if 'tuned' in locals():
                 tuned_np_mult = locals().get('tuned_np_mult', None)
                 if tuned_np_mult and sm_count:
+                    print(f"tuned_np_mult: {tuned_np_mult}")
+                    print(f"sm_count: {sm_count}")
                     total_programs_pref = max(1, int(tuned_np_mult) * int(sm_count))
     except Exception:
         pass
 
-    print(f"config: {config}")
+    # print(f"config: {config}")
 
     BLOCK_M = config["BLOCK_SIZE_M"]
     BLOCK_N = config["BLOCK_SIZE_N"]
@@ -1045,6 +1030,10 @@ def persistent_lean_attention_bwd(
 
     BLOCK_M_KV = int(config.get("BLOCK_SIZE_M_KV", BLOCK_M))
     BLOCK_N_KV = int(config.get("BLOCK_SIZE_N_KV", BLOCK_N))
+    # print("BLOCK_M_KV: ", BLOCK_M_KV)
+    # print("BLOCK_N_KV: ", BLOCK_N_KV)
+    # print("BLOCK_M: ", BLOCK_M)
+    # print("BLOCK_N: ", BLOCK_N)
 
     (
         total_n_blocks_all_batches,
@@ -1071,7 +1060,7 @@ def persistent_lean_attention_bwd(
         total_programs_pref,
     )
 
-    grid = (total_programs_pref,)
+    grid = (304,)
 
     # NOTE: `DqOp` and `locks` are not used by the current design;
     # retained here only for potential experimentation with host-block reductions.
@@ -1142,88 +1131,18 @@ def persistent_lean_attention_bwd(
     prefetch_kv = int(config.get("prefetch_kv", 2))
 
     # If user didn't specify num_programs/ctas, prefer 2x SMs by default
+    num_programs = None
     if num_programs is None and ("num_ctas" not in config):
+        print("here")
         try:
             if sm_count is None:
                 sm_count = int(arch_info.get_num_sms())
         except Exception:
             sm_count = int(torch.cuda.get_device_properties(q.device).multi_processor_count)
         total_programs_pref = max(1, 2 * int(sm_count))
-        grid = (total_programs_pref,)
+        grid = (608,)
 
-    if profile_split:
-        # Time split kernels: dK/dV then dQ
-        kernel_timing = {
-            "dkdv": {
-                "start_event": torch.cuda.Event(enable_timing=True),
-                "end_event": torch.cuda.Event(enable_timing=True),
-                "ms": 0.0,
-            },
-            "dq": {
-                "start_event": torch.cuda.Event(enable_timing=True),
-                "end_event": torch.cuda.Event(enable_timing=True),
-                "ms": 0.0,
-            },
-        }
-        # dK/dV
-        kernel_timing["dkdv"]["start_event"].record()
-        kv_kernel = la_bwd_dkdv_inner[grid](
-            q, k, v, do, softmax_lse, Delta, dk, dv, kv_batch_num_block_n,
-            q.stride(0), q.stride(1), q.stride(2),
-            k.stride(0), k.stride(1), k.stride(2),
-            v.stride(0), v.stride(1), v.stride(2),
-            do.stride(0), do.stride(1), do.stride(2),
-            softmax_lse.stride(0), softmax_lse.stride(1), softmax_lse.stride(2),
-            Delta.stride(0), Delta.stride(1), Delta.stride(2),
-            dk.stride(0), dk.stride(1), dk.stride(2),
-            dv.stride(0), dv.stride(1), dv.stride(2),
-            sm_scale, N_CTX_Q, seqlen_k,
-            total_n_blocks_all_batches_kv, total_kv_tiles_kv, high_load_wgs_kv_kv, max_tiles_per_wg_kv_kv,
-            H=H, B=batch_size, HEAD_DIM=HEAD_DIM,
-            BLOCK_M=BLOCK_M_KV, BLOCK_N=BLOCK_N_KV,
-            CAUSAL=causal, MAX_TILES_PER_WG_KV_CONST=max_tiles_per_wg_kv_kv,
-            NUM_M_BLOCKS_TOTAL=num_m_blocks_total_kv,
-            RAGGED_BATCHING=ragged_batching,
-            PREFETCH_QT=prefetch_qt,
-            waves_per_eu=config["waves_per_eu"],
-            num_warps=config.get("num_warps", 2),
-            num_stages=config.get("num_stages", 2),
-        )
-        kernel_timing["dkdv"]["end_event"].record()
-        torch.cuda.synchronize()
-        ms = kernel_timing["dkdv"]["start_event"].elapsed_time(kernel_timing["dkdv"]["end_event"])
-        kernel_timing["dkdv"]["ms"] += ms
 
-        # dQ
-        kernel_timing["dq"]["start_event"].record()
-        q_kernel = la_bwd_dq_inner[grid](
-            q, k, v, do, softmax_lse, Delta, dq, batch_num_block_n,
-            q.stride(0), q.stride(1), q.stride(2),
-            k.stride(0), k.stride(1), k.stride(2),
-            v.stride(0), v.stride(1), v.stride(2),
-            do.stride(0), do.stride(1), do.stride(2),
-            softmax_lse.stride(0), softmax_lse.stride(1), softmax_lse.stride(2),
-            Delta.stride(0), Delta.stride(1), Delta.stride(2),
-            dq.stride(0), dq.stride(1), dq.stride(2),
-            sm_scale, N_CTX_Q, seqlen_k,
-            total_n_blocks_all_batches, total_tiles_q, high_load_wgs_q, max_tiles_per_wg_q,
-            H=H, B=batch_size, HEAD_DIM=HEAD_DIM,
-            BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N,
-            CAUSAL=causal, MAX_N_BLOCKS_PER_BATCH_CONST=(N_CTX_K + BLOCK_N - 1) // BLOCK_N,
-            RAGGED_BATCHING=ragged_batching,
-            PREFETCH_KV=prefetch_kv,
-            waves_per_eu=config["waves_per_eu"],
-            num_warps=config.get("num_warps", 2),
-            num_stages=config.get("num_stages", 2),
-        )
-        kernel_timing["dq"]["end_event"].record()
-        torch.cuda.synchronize()
-        ms = kernel_timing["dq"]["start_event"].elapsed_time(kernel_timing["dq"]["end_event"])
-        kernel_timing["dq"]["ms"] += ms
-
-        print(f"la bwd split timing: dkdv={kernel_timing['dkdv']['ms']:.3f} ms, dq={kernel_timing['dq']['ms']:.3f} ms")
-        print(f"la bwd split kv kernel {kv_kernel.n_regs} regs, {kv_kernel.n_spills} spills; q kernel {q_kernel.n_regs} regs, {q_kernel.n_spills} spills")
-        return
     kernel_timing = {
             "fused": {
                 "start_event": torch.cuda.Event(enable_timing=True),
@@ -1232,6 +1151,7 @@ def persistent_lean_attention_bwd(
             }
         }
         # dK/dV
+    print(f"grid: {grid}")
     kernel_timing["fused"]["start_event"].record()
     fused_kernel = la_bwd_fused_streamk[grid](
         q, k, v, do, softmax_lse, Delta, dq, dk, dv, batch_num_block_n, kv_batch_num_block_n,
@@ -1265,52 +1185,5 @@ def persistent_lean_attention_bwd(
     ms = kernel_timing["fused"]["start_event"].elapsed_time(kernel_timing["fused"]["end_event"])
     kernel_timing["fused"]["ms"] += ms
     print(f"la bwd fused kernel {fused_kernel.n_regs} regs, {fused_kernel.n_spills} spills, {ms:.3f} ms")
+    _print_triton_kernel_lds(fused_kernel)
     return
-    # Spill guard: fallback to num_stages=1 if needed
-    if fused_kernel.n_spills > 0:
-        fused_kernel = la_bwd_fused_streamk[grid](
-            q, k, v, do, softmax_lse, Delta, dq, dk, dv, batch_num_block_n, kv_batch_num_block_n,
-            q.stride(0), q.stride(1), q.stride(2),
-            k.stride(0), k.stride(1), k.stride(2),
-            v.stride(0), v.stride(1), v.stride(2),
-            do.stride(0), do.stride(1), do.stride(2),
-            softmax_lse.stride(0), softmax_lse.stride(1), softmax_lse.stride(2),
-            Delta.stride(0), Delta.stride(1), Delta.stride(2),
-            dq.stride(0), dq.stride(1), dq.stride(2),
-            dk.stride(0), dk.stride(1), dk.stride(2),
-            dv.stride(0), dv.stride(1), dv.stride(2),
-            sm_scale, N_CTX_Q, seqlen_k,
-            total_n_blocks_all_batches, total_tiles_q, high_load_wgs_q, max_tiles_per_wg_q,
-            total_n_blocks_all_batches_kv, total_kv_tiles_kv, high_load_wgs_kv_kv, max_tiles_per_wg_kv_kv,
-            H=H, B=batch_size, HEAD_DIM=HEAD_DIM,
-            BLOCK_M_Q=BLOCK_M, BLOCK_N_Q=BLOCK_N,
-            BLOCK_M_KV=BLOCK_M_KV, BLOCK_N_KV=BLOCK_N_KV,
-            CAUSAL=causal,
-            MAX_N_BLOCKS_PER_BATCH_CONST=(N_CTX_K + BLOCK_N - 1) // BLOCK_N,
-            MAX_TILES_PER_WG_KV_CONST=max_tiles_per_wg_kv_kv,
-            RAGGED_BATCHING=ragged_batching,
-            PREFETCH_QT=prefetch_qt,
-            PREFETCH_KV=prefetch_kv,
-            waves_per_eu=config["waves_per_eu"],
-            num_warps=config.get("num_warps", 2),
-            num_stages=1,  # Force num_stages=1 for spill guard
-        )
-    print(f"la bwd fused kernel {fused_kernel.n_regs} regs, {fused_kernel.n_spills} spills")
-    return
-
-
-    # fused-attention-bwd-D_HEAD-128-layout-bshd-fp8-False-causal-False:
-#     BATCH    HQ    HK  N_CTX_Q  N_CTX_K  fused-bwd(ms)     bwd(ms)
-# 0     8.0  16.0  16.0   1024.0   4096.0       5.043464    6.420011
-# 1     1.0  16.0  16.0   4096.0  16384.0       9.902170   10.243707
-# 2     2.0  48.0  48.0   1024.0   1024.0       1.086990    1.395209
-# 3     2.0  48.0  48.0   2048.0   1024.0       2.165276    1.780026
-# 4     2.0  48.0  48.0   4096.0   8192.0      31.805403   11.216395
-# 5     2.0  48.0  48.0   8192.0   4096.0      34.341858   12.872743
-# 6     2.0  48.0  48.0  16384.0   8192.0     127.641678   44.088789
-# 7     2.0  48.0  48.0   8192.0  16384.0     127.201187   38.511293
-# 8     2.0  48.0  48.0  16384.0  16384.0     247.439499   73.900841
-# 9     2.0  48.0  48.0  16384.0  32768.0     485.110077  144.510422
-# 10    2.0  48.0  48.0  32768.0  16384.0     490.320160  146.580826
-# 11    2.0  48.0  48.0  32768.0  32768.0     968.125671  285.581085
-# 12    2.0  48.0  48.0  16384.0   8192.0     128.828995   40.319927

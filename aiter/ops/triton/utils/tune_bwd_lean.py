@@ -8,24 +8,28 @@ from typing import Dict, List, Tuple
 import torch
 
 from aiter.ops.triton.lean_atten_bwd_clean import persistent_lean_attention_bwd
+from aiter.ops.triton.mha_onekernel_bwd import (
+    flash_attn_onekernel_backward,
+    _get_config as _fa2_get_config,
+)
 
 
 def _default_shape_grid() -> List[Dict]:
 	# Scenarios restricted to match benchmark configs
 	bench_configs = [
-		(16, 16, 16, 1024, 1024),
-		(8, 16, 16, 2048, 2048),
-		(4, 16, 16, 4096, 4096),
-		(2, 16, 16, 8192, 8192),
-		(2, 48, 48, 1024, 1024),
-		(2, 48, 48, 2048, 1024),
-		(2, 48, 48, 4096, 8192),
-		(2, 48, 48, 8192, 4096),
-        (2, 48, 48, 16384, 16384),
-        (2, 48, 48, 32768, 32768),
-        (2, 48, 48, 16384, 8192),
-        (1, 16, 16, 4096, 16384),
-        (2, 48, 48, 16384, 32768),
+		# (16, 16, 16, 1024, 1024),
+		# (8, 16, 16, 2048, 2048),
+		# (4, 16, 16, 4096, 4096),
+		# (2, 16, 16, 8192, 8192),
+		# (2, 48, 48, 1024, 1024),
+		# (2, 48, 48, 2048, 1024),
+		# (2, 48, 48, 4096, 8192),
+		# (2, 48, 48, 8192, 4096),
+        (2, 16, 16, 16384, 16384),
+        (2, 16, 16, 32768, 32768),
+        # (2, 16, 16, 16384, 8192),
+        # (1, 16, 16, 4096, 16384),
+        (2, 16, 16, 16384, 32768),
         # (2, 48, 48, 128, 8192),
         # (2, 48, 48, 128, 4096),
         # (2, 48, 48, 128, 1024),
@@ -60,7 +64,7 @@ def _default_config_grid() -> List[Dict]:
     num_warps_kv = [1, 2, 4]
 
     waves_per_eu_vals = [1]
-    num_programs_mult_vals = [1, 2, 3, 4, 5]
+    num_programs_mult_vals = [2, 3, 4, 5]
     prefetch_qt_vals = [2]
     prefetch_kv_vals = [2]
     num_stages_vals = [1]  # Add num_stages tuning
@@ -85,6 +89,38 @@ def _default_config_grid() -> List[Dict]:
             "prefetch_kv": pf_kv,
             "num_stages": ns,  # Add num_stages to config
         })
+    return cfgs
+
+
+def _fa2_default_config_grid() -> List[Dict]:
+    # Tune core one-kernel params. Keep search small to avoid compile pressure.
+    cfgs = []
+    BLOCK_M1_vals = [32, 64]
+    BLOCK_N1_vals = [128, 64]
+    BLOCK_M2_vals = [128, 64]
+    BLOCK_N2_vals = [32, 64]
+    BLK_SLICE_FACTOR_vals = [2]
+    num_warps_vals = [2, 4, 8]
+    num_ctas_vals = [1]
+    num_stages_vals = [1]
+    for bm1 in BLOCK_M1_vals:
+        for bn1 in BLOCK_N1_vals:
+            for bm2 in BLOCK_M2_vals:
+                for bn2 in BLOCK_N2_vals:
+                    for slice_f in BLK_SLICE_FACTOR_vals:
+                        for nw in num_warps_vals:
+                            for nctas in num_ctas_vals:
+                                for nst in num_stages_vals:
+                                    cfgs.append({
+                                        "BLOCK_M1": bm1,
+                                        "BLOCK_N1": bn1,
+                                        "BLOCK_M2": bm2,
+                                        "BLOCK_N2": bn2,
+                                        "BLK_SLICE_FACTOR": slice_f,
+                                        "num_warps": nw,
+                                        "num_ctas": nctas,
+                                        "num_stages": nst,
+                                    })
     return cfgs
 
 
@@ -185,12 +221,67 @@ def run_once(scn: Dict, cfg: Dict, dtype: torch.dtype, device: torch.device, war
     return ms, tflops
 
 
+@torch.no_grad()
+def run_once_fa2(scn: Dict, cfg: Dict, dtype: torch.dtype, device: torch.device, warmup: int, iters: int) -> Tuple[float, float]:
+    B = scn["batch"]; Hq = scn["heads"]; Hk = scn["heads"]; D = scn["head_dim"]; NQ = scn["n_ctx_q"]; NK = scn["n_ctx_k"]
+    scale = 1.0 / math.sqrt(D)
+    # Allocate BSHD layout to match FA2 wrapper
+    q = torch.randn((B, NQ, Hq, D), device=device, dtype=dtype)
+    k = torch.randn((B, NK, Hk, D), device=device, dtype=dtype)
+    v = torch.randn((B, NK, Hk, D), device=device, dtype=dtype)
+    o = torch.randn((B, NQ, Hq, D), device=device, dtype=dtype)
+    do = torch.randn_like(o)
+    lse = torch.randn((B, Hq, NQ), device=device, dtype=torch.float32)
+    dq = torch.zeros_like(q)
+    dk = torch.zeros_like(k)
+    dv = torch.zeros_like(v)
+
+    # Build a config dict by merging the default backend config and overriding onekernel
+    base_cfg = _fa2_get_config()
+    fa2_cfg = dict(base_cfg)
+    fa2_cfg["onekernel"] = dict(fa2_cfg["onekernel"])
+    fa2_cfg["onekernel"].update(cfg)
+
+    torch.cuda.synchronize()
+    for _ in range(max(0, warmup)):
+        flash_attn_onekernel_backward(
+            do, q, k, v, o, lse, dq, dk, dv,
+            dbias=None, sm_scale=scale, alibi_slopes=None, causal=scn["causal"],
+            cu_seqlens_q=None, cu_seqlens_k=None,
+            max_seqlen_q=NQ, max_seqlen_k=NK,
+            dropout_p=0.0,
+            USE_INT64_STRIDES=False,
+            config=fa2_cfg,
+        )
+    torch.cuda.synchronize()
+
+    start = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
+    start.record()
+    for _ in range(max(1, iters)):
+        flash_attn_onekernel_backward(
+            do, q, k, v, o, lse, dq, dk, dv,
+            dbias=None, sm_scale=scale, alibi_slopes=None, causal=scn["causal"],
+            cu_seqlens_q=None, cu_seqlens_k=None,
+            max_seqlen_q=NQ, max_seqlen_k=NK,
+            dropout_p=0.0,
+            USE_INT64_STRIDES=False,
+            config=fa2_cfg,
+        )
+    end.record()
+    torch.cuda.synchronize()
+    ms = start.elapsed_time(end) / max(1, iters)
+    approx_flops = 12.0 * B * Hq * NQ * NK * D
+    tflops = approx_flops / (ms * 1e-3) / 1e12
+    return ms, tflops
+
+
 def format_scn(s: Dict) -> str:
     return f"B={s['batch']} H={s['heads']} D={s['head_dim']} NQ={s['n_ctx_q']} NK={s['n_ctx_k']} causal={int(s['causal'])}"
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Autotune lean attention backward (split kernels)")
+    parser = argparse.ArgumentParser(description="Autotune attention backward kernels")
     parser.add_argument("--device", default="cuda", type=str)
     parser.add_argument("--dtype", default="fp16", choices=["fp16", "bf16"], type=str)
     parser.add_argument("--iters", default=10, type=int)
@@ -198,6 +289,7 @@ def main():
     parser.add_argument("--limit_scenarios", default=None, type=int, help="Limit number of scenarios for quick runs")
     parser.add_argument("--limit_configs", default=None, type=int, help="Limit number of configs per scenario")
     parser.add_argument("--out", type=str, default="bwd_split_autotune.json", help="Path to write best-config DB as JSON")
+    parser.add_argument("--algo", type=str, choices=["lean", "fa2"], default="lean", help="Which kernel to tune: 'lean' (persistent) or 'fa2' (flash one-kernel)")
     args = parser.parse_args()
 
     device = torch.device(args.device)
@@ -207,7 +299,7 @@ def main():
     if args.limit_scenarios is not None:
         scenarios = scenarios[: args.limit_scenarios]
 
-    cfg_grid = _default_config_grid()
+    cfg_grid = _default_config_grid() if args.algo == "lean" else _fa2_default_config_grid()
     if args.limit_configs is not None:
         cfg_grid = cfg_grid[: args.limit_configs]
 
@@ -216,53 +308,64 @@ def main():
     results: List[Tuple[Dict, Dict, float, float]] = []  # (scn, cfg, ms, tflops)
 
     for scn in scenarios:
-        best_ms = float("inf"); best_cfg = None; best_tflops = 0.0
+        best_ms = float("inf"); best_cfg = None; best_tflops = float('-inf')
         # Filter illegal/unstable configs for causal and known-bad mixes
         legal_cfgs = []
         for cfg in cfg_grid:
             legal = True
-            if scn["causal"]:
-                if (cfg["BLOCK_SIZE_M"] % cfg["BLOCK_SIZE_N"]) != 0:
+            if args.algo == "lean":
+                if scn["causal"]:
+                    if (cfg["BLOCK_SIZE_M"] % cfg["BLOCK_SIZE_N"]) != 0:
+                        legal = False
+                    if (cfg["BLOCK_SIZE_M_KV"] % cfg["BLOCK_SIZE_N_KV"]) != 0:
+                        legal = False
+                    if cfg["BLOCK_SIZE_M"] < cfg["BLOCK_SIZE_N"]:
+                        legal = False
+                    if cfg["BLOCK_SIZE_M_KV"] < cfg["BLOCK_SIZE_N_KV"]:
+                        legal = False
+                if cfg.get("fused", True) and "num_programs_mult" not in cfg:
+                    cfg["num_programs_mult"] = 2
+                if cfg["BLOCK_SIZE_N"] == 32 and cfg["num_warps"] >= 8:
                     legal = False
-                if (cfg["BLOCK_SIZE_M_KV"] % cfg["BLOCK_SIZE_N_KV"]) != 0:
+                if cfg["BLOCK_SIZE_N_KV"] == 32 and cfg["num_warps_kv"] >= 8:
                     legal = False
-                # Prefer BM >= BN in causal to avoid large masked tails
-                if cfg["BLOCK_SIZE_M"] < cfg["BLOCK_SIZE_N"]:
+                if cfg["BLOCK_SIZE_N"] == 32 or cfg["BLOCK_SIZE_N_KV"] == 32:
                     legal = False
-                if cfg["BLOCK_SIZE_M_KV"] < cfg["BLOCK_SIZE_N_KV"]:
+                if cfg["num_warps"] >= 8 and (cfg["BLOCK_SIZE_M"] <= 64 or cfg["BLOCK_SIZE_N"] <= 64):
                     legal = False
-            # Force num_programs_mult default to 2 for fused unless user overrides
-            if cfg.get("fused", True) and "num_programs_mult" not in cfg:
-                cfg["num_programs_mult"] = 2
-            # Heuristic: very small N tiles with high warps are unstable on some backends
-            if cfg["BLOCK_SIZE_N"] == 32 and cfg["num_warps"] >= 8:
-                legal = False
-            if cfg["BLOCK_SIZE_N_KV"] == 32 and cfg["num_warps_kv"] >= 8:
-                legal = False
-            # Stronger filter: avoid N=32 entirely for now
-            if cfg["BLOCK_SIZE_N"] == 32 or cfg["BLOCK_SIZE_N_KV"] == 32:
-                legal = False
-            # Avoid 8 warps on small tiles to reduce compiler pressure
-            if cfg["num_warps"] >= 8 and (cfg["BLOCK_SIZE_M"] <= 64 or cfg["BLOCK_SIZE_N"] <= 64):
-                legal = False
-            if cfg["num_warps_kv"] >= 8 and (cfg["BLOCK_SIZE_M_KV"] <= 64 or cfg["BLOCK_SIZE_N_KV"] <= 64):
-                legal = False
-            # Also filter ridiculous tile larger than context
-            if cfg["BLOCK_SIZE_M"] > scn["n_ctx_q"] or cfg["BLOCK_SIZE_M_KV"] > scn["n_ctx_q"]:
-                legal = False
+                if cfg["num_warps_kv"] >= 8 and (cfg["BLOCK_SIZE_M_KV"] <= 64 or cfg["BLOCK_SIZE_N_KV"] <= 64):
+                    legal = False
+                if cfg["BLOCK_SIZE_M"] > scn["n_ctx_q"] or cfg["BLOCK_SIZE_M_KV"] > scn["n_ctx_q"]:
+                    legal = False
+            else:
+                # FA2 legality: ensure integers and reasonable ranges
+                for key in ("BLOCK_M1","BLOCK_N1","BLOCK_M2","BLOCK_N2","BLK_SLICE_FACTOR"):
+                    if key not in cfg or int(cfg[key]) <= 0:
+                        legal = False
+                if cfg.get("num_warps", 4) not in (2,4,8):
+                    legal = False
+                if cfg.get("num_ctas", 1) not in (1,2):
+                    legal = False
+                if cfg.get("num_stages", 1) not in (1,2):
+                    legal = False
+                # Optional: reject absurd blocks
+                if cfg["BLOCK_M2"] > scn["n_ctx_q"]:
+                    legal = False
             if not legal:
                 continue
             legal_cfgs.append(cfg)
 
         for cfg in legal_cfgs:
             try:
-                ms, tflops = run_once(scn, cfg, dtype, device, args.warmup, args.iters)
+                if args.algo == "lean":
+                    ms, tflops = run_once(scn, cfg, dtype, device, args.warmup, args.iters)
+                else:
+                    ms, tflops = run_once_fa2(scn, cfg, dtype, device, args.warmup, args.iters)
             except RuntimeError as e:
-                # Skip failing configs
                 print(f"[skip] {format_scn(scn)} cfg={cfg} error={str(e)}")
                 continue
-            if ms < best_ms:
-                best_ms = ms; best_cfg = cfg; best_tflops = tflops
+            if tflops > best_tflops:
+                best_tflops = tflops; best_cfg = cfg; best_ms = ms
 
         if best_cfg is not None:
             results.append((scn, best_cfg, best_ms, best_tflops))
@@ -278,28 +381,47 @@ def main():
     # Write config DB to disk
     db = []
     for scn, cfg, ms, tf in results:
-        # Include optional num_programs_mult so runtime can scale CTA count to device
-        entry_cfg = dict(cfg)
-        if "num_programs_mult" not in entry_cfg:
-            entry_cfg["num_programs_mult"] = 1
-        db.append({
-            "key": {
-                "causal": int(scn["causal"]),
-                "B": scn["batch"],
-                "H": scn["heads"],
-                "D": scn["head_dim"],
-                "NQ": scn["n_ctx_q"],
-                "NK": scn["n_ctx_k"],
-            },
-            "config": entry_cfg,
-            "ms": ms,
-            "tflops": tf,
-        })
+        if args.algo == "lean":
+            entry_cfg = dict(cfg)
+            if "num_programs_mult" not in entry_cfg:
+                entry_cfg["num_programs_mult"] = 1
+            db.append({
+                "key": {
+                    "causal": int(scn["causal"]),
+                    "B": scn["batch"],
+                    "H": scn["heads"],
+                    "D": scn["head_dim"],
+                    "NQ": scn["n_ctx_q"],
+                    "NK": scn["n_ctx_k"],
+                },
+                "config": entry_cfg,
+                "ms": ms,
+                "tflops": tf,
+            })
+        else:
+            # For FA2, store only the onekernel sub-config; runtime will merge with base
+            entry_cfg = dict(cfg)
+            db.append({
+                "key": {
+                    "causal": int(scn["causal"]),
+                    "B": scn["batch"],
+                    "H": scn["heads"],
+                    "D": scn["head_dim"],
+                    "NQ": scn["n_ctx_q"],
+                    "NK": scn["n_ctx_k"],
+                },
+                "config": entry_cfg,
+                "ms": ms,
+                "tflops": tf,
+            })
     try:
         with open(args.out, "w") as f:
             json.dump(db, f)
         print(f"\nWrote {len(db)} best-config entries to {args.out}")
-        print("To use it, set AITER_BWD_TUNED_DB to this path. Optionally set AITER_BWD_USE_TUNED_GRID=1 to scale CTAs.")
+        if args.algo == "lean":
+            print("To use it, set AITER_BWD_TUNED_DB to this path. Optionally set AITER_BWD_USE_TUNED_GRID=1 to scale CTAs.")
+        else:
+            print("For FA2, merge 'config' entries into the 'onekernel' section of your backend config or feed them via the config parameter.")
     except Exception as e:
         print(f"Failed to write autotune DB to {args.out}: {e}")
 

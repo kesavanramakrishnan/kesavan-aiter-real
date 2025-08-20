@@ -2,9 +2,11 @@ import pytest
 import torch
 import triton
 import sys
+import os
 
 from aiter.ops.triton.lean_atten_bwd_clean import persistent_lean_attention_bwd
 from aiter.ops.triton.mha_onekernel_bwd import flash_attn_onekernel_backward
+from aiter.ops.triton.mha import flash_attn_func
 
 # Define data types for testing, including float32 on capable hardware
 DTYPES = [torch.float16]
@@ -124,10 +126,10 @@ def _run_la_bwd_process_test(
     do_bsnh = do.permute(0, 2, 1, 3).contiguous()
 
     # --- Lean Attention Backward Pass ---
-    # Flatten to [B*Seqlen, H, D] and concatenate K/V across batch
+    # Flatten to Lean shapes: q = [B*NQ, H, D], k/v = [NK, H, D] to match DB keys (NK per-seq)
     q_flat = q_bsnh.reshape(BATCH * SEQLEN_Q, NUM_Q_HEADS, HEAD_SZ).contiguous()
-    k_flat = k_bsnh.reshape(BATCH * SEQLEN_K, NUM_K_HEADS, HEAD_SZ).contiguous()
-    v_flat = v_bsnh.reshape(BATCH * SEQLEN_K, NUM_K_HEADS, HEAD_SZ).contiguous()
+    k_flat = k_bsnh.reshape(SEQLEN_K, NUM_K_HEADS, HEAD_SZ).contiguous()
+    v_flat = v_bsnh.reshape(SEQLEN_K, NUM_K_HEADS, HEAD_SZ).contiguous()
     o_flat = o_bsnh.reshape(BATCH * SEQLEN_Q, NUM_Q_HEADS, HEAD_SZ).contiguous()
     do_flat = do_bsnh.reshape(BATCH * SEQLEN_Q, NUM_Q_HEADS, HEAD_SZ).contiguous()
 
@@ -313,14 +315,14 @@ def test_la_bwd_vs_flash_bwd_bench_nonvarlen(
     )
 
 
-def main():
+def main_la():
     """Main function for manual testing of individual configurations"""
     import sys
     
     # Default configuration - you can modify these values for testing
-    BATCH = 1
-    NUM_Q_HEADS = 48
-    NUM_K_HEADS = 48
+    BATCH = 2
+    NUM_Q_HEADS = 16
+    NUM_K_HEADS = 16
     HEAD_SZ = 128
     SEQLEN_Q = 16384
     SEQLEN_K = 16384
@@ -340,30 +342,45 @@ def main():
     print(f"  device: {device}")
     print("-" * 50)
     
-    torch.manual_seed(2024)
+    # Ensure tuned DB is picked up like in bench runs
+    os.environ.setdefault("AITER_BWD_TUNED_DB", "la_configs/bwd_long_seq.json")
+    os.environ.setdefault("AITER_BWD_USE_TUNED_GRID", "1")
 
-    # Define tensor shapes
-    q_shape = (BATCH, NUM_Q_HEADS, SEQLEN_Q, HEAD_SZ)
-    k_shape = (BATCH, NUM_K_HEADS, SEQLEN_K, HEAD_SZ)
-    v_shape = (BATCH, NUM_K_HEADS, SEQLEN_K, HEAD_SZ)
+    # Shared deterministic inputs
+    def _generate_inputs(B, HQ, HK, D, SQ, SK, dtype, device, seed=2024):
+        torch.manual_seed(seed)
+        q = torch.randn((B, HQ, SQ, D), dtype=dtype, device=device)
+        k = torch.randn((B, HK, SK, D), dtype=dtype, device=device)
+        v = torch.randn((B, HK, SK, D), dtype=dtype, device=device)
+        o = torch.randn((B, HQ, SQ, D), dtype=dtype, device=device)
+        do = torch.randn((B, HQ, SQ, D), dtype=dtype, device=device)
+        softmax_lse = torch.randn((B, HQ, SQ), dtype=torch.float32, device=device)
+        return q, k, v, o, do, softmax_lse
 
-    # Initialize input tensors
-    q = torch.randn(q_shape, dtype=dtype, device=device)
-    k = torch.randn(k_shape, dtype=dtype, device=device)
-    v = torch.randn(v_shape, dtype=dtype, device=device)
+    q, k, v, o_seed, do_seed, _ = _generate_inputs(
+        BATCH, NUM_Q_HEADS, NUM_K_HEADS, HEAD_SZ, SEQLEN_Q, SEQLEN_K, dtype, device, seed=2024
+    )
     sm_scale = HEAD_SZ**-0.5
-
-    # Create dummy output and gradient tensors
-    o = torch.randn(BATCH, NUM_Q_HEADS, SEQLEN_Q, HEAD_SZ, dtype=dtype, device=device)
-    do = torch.randn(BATCH, NUM_Q_HEADS, SEQLEN_Q, HEAD_SZ, dtype=dtype, device=device)
-    softmax_lse = torch.randn(BATCH, NUM_Q_HEADS, SEQLEN_Q, dtype=torch.float32, device=device)
 
     # Prepare tensors in BSHD format (batch, seqlen, heads, dim)
     q_bsnh = q.permute(0, 2, 1, 3).contiguous()
     k_bsnh = k.permute(0, 2, 1, 3).contiguous()
     v_bsnh = v.permute(0, 2, 1, 3).contiguous()
-    o_bsnh = o.permute(0, 2, 1, 3).contiguous()
-    do_bsnh = do.permute(0, 2, 1, 3).contiguous()
+
+    # Forward via MHA to mirror bench_full_bwd.py and get o and softmax_lse
+    o_bsnh, softmax_lse = flash_attn_func(
+        q_bsnh,
+        k_bsnh,
+        v_bsnh,
+        dropout_p=0.0,
+        softmax_scale=sm_scale,
+        causal=causal,
+        return_lse=True,
+        return_attn_probs=False,
+        mapping_mode=0,
+        use_remap=False,
+    )
+    do_bsnh = torch.randn_like(o_bsnh)
 
     # Flatten to [B*Seqlen, H, D] and concatenate K/V across batch
     q_flat = q_bsnh.reshape(BATCH * SEQLEN_Q, NUM_Q_HEADS, HEAD_SZ).contiguous()
@@ -385,21 +402,40 @@ def main():
             torch.arange(1, BATCH + 1, device=device, dtype=torch.int32) * num_n_blocks
         )
 
-    print("Running Lean Attention Backward...")
+    # Warmup run (not timed)
+    print("Warmup Lean Attention Backward...")
+    torch.cuda.synchronize()
+    persistent_lean_attention_bwd(
+        q=q_flat, k=k_flat, v=v_flat, do=do_flat, o=o_flat,
+        softmax_lse=softmax_lse,
+        dq=dq_flat, dk=dk_flat, dv=dv_flat,
+        batch_num_block_n=batch_num_block_n,
+        batch_size=BATCH, sm_scale=sm_scale, causal=causal,
+        seqlen_k=SEQLEN_K,
+    )
+    torch.cuda.synchronize()
+
+    print("Running Lean Attention Backward (15 iters)...")
     torch.cuda.synchronize()
     
     try:
-        persistent_lean_attention_bwd(
-            q=q_flat, k=k_flat, v=v_flat, do=do_flat, o=o_flat,
-            softmax_lse=softmax_lse,
-            dq=dq_flat, dk=dk_flat, dv=dv_flat,
-            batch_num_block_n=batch_num_block_n,
-            batch_size=BATCH, sm_scale=sm_scale, causal=causal,
-            seqlen_k=BATCH * SEQLEN_K,
-            num_programs=304,
-        )
+        iters = 1
+        start_evt = torch.cuda.Event(enable_timing=True)
+        end_evt = torch.cuda.Event(enable_timing=True)
+        start_evt.record()
+        for _ in range(iters):
+            persistent_lean_attention_bwd(
+                q=q_flat, k=k_flat, v=v_flat, do=do_flat, o=o_flat,
+                softmax_lse=softmax_lse,
+                dq=dq_flat, dk=dk_flat, dv=dv_flat,
+                batch_num_block_n=batch_num_block_n,
+                batch_size=BATCH, sm_scale=sm_scale, causal=causal,
+                seqlen_k=SEQLEN_K,
+            )
+        end_evt.record()
         torch.cuda.synchronize()
-        
+        avg_ms = start_evt.elapsed_time(end_evt) / iters
+        print(f"la bwd avg: {avg_ms:.3f} ms over {iters} iters")
         print("✅ Lean Attention Backward completed successfully!")
         print(f"Output shapes - dq: {dq_flat.shape}, dk: {dk_flat.shape}, dv: {dv_flat.shape}")
         return 0
@@ -410,6 +446,143 @@ def main():
         traceback.print_exc()
         return 1
 
+def main_flash():
+    """Main function for manual testing Flash Attention one-kernel backward"""
+    import sys
+
+    # Default configuration - you can modify these values for testing
+    BATCH = 2
+    NUM_Q_HEADS = 16
+    NUM_K_HEADS = 16
+    HEAD_SZ = 128
+    SEQLEN_Q = 16384
+    SEQLEN_K = 16384
+    causal = False
+    dtype = torch.float16
+    device = "cuda"
+
+    print(f"Testing Flash Attention Backward configuration:")
+    print(f"  BATCH: {BATCH}")
+    print(f"  NUM_Q_HEADS: {NUM_Q_HEADS}")
+    print(f"  NUM_K_HEADS: {NUM_K_HEADS}")
+    print(f"  HEAD_SZ: {HEAD_SZ}")
+    print(f"  SEQLEN_Q: {SEQLEN_Q}")
+    print(f"  SEQLEN_K: {SEQLEN_K}")
+    print(f"  causal: {causal}")
+    print(f"  dtype: {dtype}")
+    print(f"  device: {device}")
+    print("-" * 50)
+
+    # Use same deterministic inputs as main_la
+    def _generate_inputs(B, HQ, HK, D, SQ, SK, dtype, device, seed=2024):
+        torch.manual_seed(seed)
+        q = torch.randn((B, HQ, SQ, D), dtype=dtype, device=device)
+        k = torch.randn((B, HK, SK, D), dtype=dtype, device=device)
+        v = torch.randn((B, HK, SK, D), dtype=dtype, device=device)
+        o = torch.randn((B, HQ, SQ, D), dtype=dtype, device=device)
+        do = torch.randn((B, HQ, SQ, D), dtype=dtype, device=device)
+        softmax_lse = torch.randn((B, HQ, SQ), dtype=torch.float32, device=device)
+        return q, k, v, o, do, softmax_lse
+
+    q, k, v, _, _, _ = _generate_inputs(
+        BATCH, NUM_Q_HEADS, NUM_K_HEADS, HEAD_SZ, SEQLEN_Q, SEQLEN_K, dtype, device, seed=2024
+    )
+    sm_scale = HEAD_SZ**-0.5
+
+    # Prepare tensors in BSHD format (batch, seqlen, heads, dim)
+    q_bsnh = q.permute(0, 2, 1, 3).contiguous()
+    k_bsnh = k.permute(0, 2, 1, 3).contiguous()
+    v_bsnh = v.permute(0, 2, 1, 3).contiguous()
+
+    # Forward via MHA to mirror bench_full_bwd.py and get o and softmax_lse
+    o_bsnh, softmax_lse = flash_attn_func(
+        q_bsnh,
+        k_bsnh,
+        v_bsnh,
+        dropout_p=0.0,
+        softmax_scale=sm_scale,
+        causal=causal,
+        return_lse=True,
+        return_attn_probs=False,
+        mapping_mode=0,
+        use_remap=False,
+    )
+    do_bsnh = torch.randn_like(o_bsnh)
+
+    dq_bsnh = torch.zeros_like(q_bsnh)
+    dk_bsnh = torch.zeros_like(k_bsnh)
+    dv_bsnh = torch.zeros_like(v_bsnh)
+
+    # Warmup run (not timed)
+    print("Warmup Flash Attention One-Kernel Backward...")
+    torch.cuda.synchronize()
+    flash_attn_onekernel_backward(
+        do=do_bsnh,
+        q=q_bsnh,
+        k=k_bsnh,
+        v=v_bsnh,
+        o=o_bsnh,
+        softmax_lse=softmax_lse,
+        dq=dq_bsnh,
+        dk=dk_bsnh,
+        dv=dv_bsnh,
+        dbias=None,
+        sm_scale=sm_scale,
+        alibi_slopes=None,
+        causal=causal,
+        cu_seqlens_q=None,
+        cu_seqlens_k=None,
+        max_seqlen_q=SEQLEN_Q,
+        max_seqlen_k=SEQLEN_K,
+        dropout_p=0.0,
+    )
+    torch.cuda.synchronize()
+
+    print("Running Flash Attention One-Kernel Backward (15 iters)...")
+    torch.cuda.synchronize()
+    
+    try:
+        iters = 1
+        start_evt = torch.cuda.Event(enable_timing=True)
+        end_evt = torch.cuda.Event(enable_timing=True)
+        start_evt.record()
+        for _ in range(iters):
+            flash_attn_onekernel_backward(
+                do=do_bsnh,
+                q=q_bsnh,
+                k=k_bsnh,
+                v=v_bsnh,
+                o=o_bsnh,
+                softmax_lse=softmax_lse,
+                dq=dq_bsnh,
+                dk=dk_bsnh,
+                dv=dv_bsnh,
+                dbias=None,
+                sm_scale=sm_scale,
+                alibi_slopes=None,
+                causal=causal,
+                cu_seqlens_q=None,
+                cu_seqlens_k=None,
+                max_seqlen_q=SEQLEN_Q,
+                max_seqlen_k=SEQLEN_K,
+                dropout_p=0.0,
+            )
+        end_evt.record()
+        torch.cuda.synchronize()
+        avg_ms = start_evt.elapsed_time(end_evt) / iters
+        print(f"fa2 onekernel bwd avg: {avg_ms:.3f} ms over {iters} iters")
+        print("✅ Flash Attention Backward completed successfully!")
+        print(
+            f"Output shapes - dq: {dq_bsnh.shape}, dk: {dk_bsnh.shape}, dv: {dv_bsnh.shape}"
+        )
+        return 0
+        
+    except Exception as e:
+        print(f"❌ Flash Attention Backward failed with error: {e}")
+        import traceback
+        traceback.print_exc()
+        return 1
+
 
 if __name__ == "__main__":
-    sys.exit(main())    
+    sys.exit(main_la())    

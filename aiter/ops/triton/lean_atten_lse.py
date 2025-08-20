@@ -123,6 +123,7 @@ def _persistent_lean_attention(
     """
     Inner kernel launching function.
     """
+    # total_programs *= 2
     # shape constraints
     HEAD_DIM_Q, HEAD_DIM_K, HEAD_DIM_V = q.shape[-1], k.shape[-1], v.shape[-1]
     assert (
@@ -181,7 +182,7 @@ def _persistent_lean_attention(
     #     f"total_programs={total_programs}, num_splits={num_splits}, even_split={even_split}"
     # )
     # print(f"num_m_blocks={num_m_blocks}, num_n_blocks={num_n_blocks}")
-
+    # total_programs *= 2
     max_output_tile_cnt = calculate_max_output_tiles_analytically(
         tiles_per_head=tiles_per_head,
         num_m_blocks=num_m_blocks,
@@ -195,7 +196,7 @@ def _persistent_lean_attention(
     )
 
     max_output_tile_cnt = max_output_tile_cnt + 4
-
+    print(f"total_programs: {total_programs}")
     grid = (total_programs, 1, 1)
 
     o = torch.empty_like(q, dtype=v.dtype)
