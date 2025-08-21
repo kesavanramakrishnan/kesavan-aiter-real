@@ -128,8 +128,8 @@ def _run_la_bwd_process_test(
     # --- Lean Attention Backward Pass ---
     # Flatten to Lean shapes: q = [B*NQ, H, D], k/v = [NK, H, D] to match DB keys (NK per-seq)
     q_flat = q_bsnh.reshape(BATCH * SEQLEN_Q, NUM_Q_HEADS, HEAD_SZ).contiguous()
-    k_flat = k_bsnh.reshape(SEQLEN_K, NUM_K_HEADS, HEAD_SZ).contiguous()
-    v_flat = v_bsnh.reshape(SEQLEN_K, NUM_K_HEADS, HEAD_SZ).contiguous()
+    k_flat = k_bsnh.reshape(BATCH * SEQLEN_K, NUM_K_HEADS, HEAD_SZ).contiguous()
+    v_flat = v_bsnh.reshape(BATCH * SEQLEN_K, NUM_K_HEADS, HEAD_SZ).contiguous()
     o_flat = o_bsnh.reshape(BATCH * SEQLEN_Q, NUM_Q_HEADS, HEAD_SZ).contiguous()
     do_flat = do_bsnh.reshape(BATCH * SEQLEN_Q, NUM_Q_HEADS, HEAD_SZ).contiguous()
 
@@ -259,7 +259,7 @@ def test_la_bwd_vs_flash_bwd(
     HEAD_SZ_128_BENCH_CONFIGS,
 )
 @pytest.mark.parametrize("HEAD_SZ", [128])
-@pytest.mark.parametrize("causal", [True])
+@pytest.mark.parametrize("causal", [False])
 @pytest.mark.parametrize("dtype", [torch.float16])
 def test_la_bwd_vs_flash_bwd_head_sz_128(
     BATCH: int,
