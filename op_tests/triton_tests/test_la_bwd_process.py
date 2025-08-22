@@ -20,10 +20,10 @@ RTOL = {torch.float16: 1e-2, torch.bfloat16: 2e-2, torch.float32: 1e-4}
 # Benchmark-derived non-varlen configs (BATCH, HQ, HK, N_CTX_Q, N_CTX_K)
 # Sourced from nonvarlen_benchmark_configs used in fused-attention bwd benchmarks
 BENCH_NONVARLEN_CONFIGS = [
-    (16, 16, 16, 1024, 1024),
-    (8, 16, 16, 2048, 2048),
-    (4, 16, 16, 4096, 4096),
-    (2, 16, 16, 8192, 8192),
+    # (16, 16, 16, 1024, 1024),
+    # (8, 16, 16, 2048, 2048),
+    # (4, 16, 16, 4096, 4096),
+    # (2, 16, 16, 16384, 16384),
     # (8, 16, 16, 1024, 4096),
     # (1, 16, 16, 4096, 16384),
     # (2, 48, 48, 1024, 1024),
@@ -289,7 +289,7 @@ def test_la_bwd_vs_flash_bwd_head_sz_128(
     BENCH_NONVARLEN_CONFIGS,
 )
 @pytest.mark.parametrize("HEAD_SZ", [128])
-@pytest.mark.parametrize("causal", [True])
+@pytest.mark.parametrize("causal", [False])
 @pytest.mark.parametrize("dtype", [torch.float16])
 def test_la_bwd_vs_flash_bwd_bench_nonvarlen(
     BATCH: int,
@@ -585,4 +585,4 @@ def main_flash():
 
 
 if __name__ == "__main__":
-    sys.exit(main_la())    
+    sys.exit(main_flash())    

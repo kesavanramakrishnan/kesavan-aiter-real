@@ -387,9 +387,7 @@ def la_bwd_dkdv_inner(
                         qk_T = tl.where(mask_T, qk_T, -float("inf"))
 
                     # probabilities using exp2 and stored m_rows
-                    # p_T = exp2(qk - m) ; also wipe NaNs (appear when all masked)
                     p_T = tl.math.exp2(qk_T * RCP_LN2 - m_rows[None, :] * RCP_LN2)
-                    p_T = tl.where(p_T == p_T, p_T, 0.0)   # NaN -> 0
                     p_T = tl.where(mask_mrows[None, :], p_T, 0.0)
 
                     # --------- accumulate dV (one GEMM)
@@ -398,15 +396,14 @@ def la_bwd_dkdv_inner(
 
                     # --------- accumulate dK (one GEMM)
                     # dp_T = V · dOᵀ  (N, K) x (K, M) = (N, M)
-                    # Use low-precision inputs to enable TC/MFMA with fp32 accumulate
                     # Load V tile just-in-time to shorten live range
                     v_tile = tl.load(V + v_offs, mask=True, other=0.0)
-                    # Compute dp in higher precision for stability
-                    dp_T = tl.dot(v_tile.to(tl.float32), do_tile_T.to(tl.float32))
+                    # Compute dp
+                    dp_T = tl.dot(v_tile, do_tile_T)
                     dp_T = tl.where(mask_mrows[None, :], dp_T, 0.0)
                     delta_cols = tl.where(mask_mrows, delta_rows, 0.0)
                     # ds_T = P ⊙ (dp_T - Δ)
-                    ds_T = p_T.to(tl.float32) * (dp_T - delta_cols[None, :])
+                    ds_T = p_T * (dp_T - delta_cols[None, :])
                     # dK += ds_T · Qᵀ   (N, M) x (M, K) = (N, K)
                     # Cast ds_T to low precision to trigger TC/MFMA; accumulate into fp32
                     dk_acc += tl.dot(ds_T.to(q_tile_T.type.element_ty), tl.trans(q_tile_T))
@@ -672,13 +669,12 @@ def la_bwd_dq_inner(
                     mask = (q_start_abs + offs_m[:, None]) >= (k_start_abs + offs_n[None, :]) + (N_CTX_Q - SEQLEN_K)
                     qk = tl.where(mask, qk, -float("inf"))
                 p = tl.math.exp2(qk * RCP_LN2 - m_rows[:, None] * RCP_LN2)
-                p = tl.where(p != p, 0, p)
 
                 # Load V tile only when needed for dP to shorten live range
                 v_tile = tl.load(v_ptrs, mask=valid_q, other=0.0)
-                # Form dS and accumulate contribution to dQ with higher precision
-                dp = tl.dot(do_tile.to(tl.float32), tl.trans(v_tile).to(tl.float32))
-                ds = p.to(tl.float32) * (dp - delta_rows[:, None])
+                # Form dS and accumulate contribution to dQ
+                dp = tl.dot(do_tile, tl.trans(v_tile))
+                ds = p * (dp - delta_rows[:, None])
                 # Cast ds to low precision to trigger TC/MFMA; accumulate into fp32 accumulator
                 dq_acc += tl.dot(ds.to(k_tile.dtype), k_tile)
 
@@ -1023,16 +1019,19 @@ def persistent_lean_attention_bwd(
             BLOCK_SIZE_M_KV = 32
             BLOCK_SIZE_N_KV = 64
         config = {
-            "split_kernels": False,
             "BLOCK_SIZE_M": 128,
-            "BLOCK_SIZE_N": 32,
+            "BLOCK_SIZE_N": 64,
             "num_warps": 4,
-            "BLOCK_SIZE_M_KV": BLOCK_SIZE_M_KV,
-            "BLOCK_SIZE_N_KV": BLOCK_SIZE_N_KV,
+            "BLOCK_SIZE_M_KV": 32,
+            "BLOCK_SIZE_N_KV": 128,
             "num_warps_kv": 4,
             "waves_per_eu": 1,
             "num_programs_mult": 2,
             "static_range_cap": 32,
+            "fused": True,
+            "prefetch_qt": 2,
+            "prefetch_kv": 2,
+            "num_stages": 1,
         }
         # Optional: override with tuned DB (env AITER_BWD_TUNED_DB)
         try:
@@ -1186,20 +1185,10 @@ def persistent_lean_attention_bwd(
     prefetch_qt = int(config.get("prefetch_qt", 2))
     prefetch_kv = int(config.get("prefetch_kv", 2))
 
-    # Calculate max output tile counts for static ranges
-    max_kv_tiles, max_q_tiles = calculate_max_output_tiles_bwd_analytically(
-        total_kv_tiles_kv,
-        total_tiles_q,
-        total_programs_pref,
-        high_load_wgs_kv_kv,
-        max_tiles_per_wg_kv_kv,
-        high_load_wgs_q,
-        max_tiles_per_wg_q,
-    )
-    
-    # Add safety margin like in forward pass
-    max_kv_tiles += 4
-    max_q_tiles += 4
+    # Compute conservative static-range bounds from per-WG maxima (clamped)
+    static_cap = int(config.get("static_range_cap", 32))
+    max_kv_tiles = min(max_tiles_per_wg_kv_kv, static_cap)
+    max_q_tiles = min(max_tiles_per_wg_q, static_cap)
 
     # If user didn't specify num_programs/ctas, prefer 2x SMs by default
     num_programs = None

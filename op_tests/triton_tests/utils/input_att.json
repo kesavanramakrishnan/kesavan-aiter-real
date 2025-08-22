@@ -1,10 +1,10 @@
 {
     "jobs": [
         {
-            "kernel_include_regex": "la_bwd_fused_streamk",
+            "kernel_include_regex": "bwd_kernel_noncausal",
             "kernel_exclude_regex": "",
             "advanced_thread_trace": true,
-        "att_target_cu" : 0,
+            "att_target_cu" : 1,
             "att_shader_engine_mask" : "0xF",
             "att_simd_select": "0xF",
             "att_buffer_size": "0x6000000"
