@@ -17,19 +17,19 @@ from aiter.ops.triton.mha_onekernel_bwd import (
 def _default_shape_grid() -> List[Dict]:
 	# Scenarios restricted to match benchmark configs
 	bench_configs = [
-		# (16, 16, 16, 1024, 1024),
-		# (8, 16, 16, 2048, 2048),
-		# (4, 16, 16, 4096, 4096),
-		# (2, 16, 16, 8192, 8192),
-		# (2, 48, 48, 1024, 1024),
-		# (2, 48, 48, 2048, 1024),
-		# (2, 48, 48, 4096, 8192),
-		# (2, 48, 48, 8192, 4096),
-        # (2, 16, 16, 16384, 16384),
-        # (2, 16, 16, 32768, 32768),
-        # (2, 16, 16, 16384, 8192),
-        # (1, 16, 16, 4096, 16384),
-        # (2, 16, 16, 16384, 32768),
+		(16, 16, 16, 1024, 1024),
+		(8, 16, 16, 2048, 2048),
+		(4, 16, 16, 4096, 4096),
+		(2, 16, 16, 8192, 8192),
+		(2, 48, 48, 1024, 1024),
+		(2, 48, 48, 2048, 1024),
+		(2, 48, 48, 4096, 8192),
+		(2, 48, 48, 8192, 4096),
+        (2, 16, 16, 16384, 16384),
+        (2, 16, 16, 32768, 32768),
+        (2, 16, 16, 16384, 8192),
+        (1, 16, 16, 4096, 16384),
+        (2, 16, 16, 16384, 32768),
         (2, 16, 16, 16384, 16384),
         # (2, 48, 48, 32768, 32768),
         # (2, 48, 48, 16384, 8192),
@@ -60,13 +60,13 @@ def _default_shape_grid() -> List[Dict]:
 def _default_config_grid() -> List[Dict]:
     # Tunable space (narrow and stable by default)
     block_m_q = [128, 64]
-    block_n_q = [64, 32]  # stable for Q-path for now
-    num_warps_q = [2, 4, 8]
+    block_n_q = [128, 64, 32]  # stable for Q-path for now
+    num_warps_q = [4]
 
-    block_m_kv = [16, 32]
+    block_m_kv = [32, 64]
     # Try larger N for KV tiling to improve arithmetic intensity
     block_n_kv = [64, 128]
-    num_warps_kv = [2, 4, 8]
+    num_warps_kv = [4]
 
     waves_per_eu_vals = [1]
     num_programs_mult_vals = [2]
@@ -75,21 +75,21 @@ def _default_config_grid() -> List[Dict]:
     num_stages_vals = [1]  # Add num_stages tuning
 
     cfgs = [
-        {
-            "BLOCK_SIZE_M": 128,
-            "BLOCK_SIZE_N": 64,
-            "num_warps": 4,
-            "BLOCK_SIZE_M_KV": 32,
-            "BLOCK_SIZE_N_KV": 128,
-            "num_warps_kv": 4,
-            "waves_per_eu": 1,
-            "num_programs_mult": 2,
-            "static_range_cap": 32,
-            "fused": True,
-            "prefetch_qt": 2,
-            "prefetch_kv": 2,
-            "num_stages": 1,
-        },
+        # {
+        #     "BLOCK_SIZE_M": 128,
+        #     "BLOCK_SIZE_N": 64,
+        #     "num_warps": 4,
+        #     "BLOCK_SIZE_M_KV": 32,
+        #     "BLOCK_SIZE_N_KV": 128,
+        #     "num_warps_kv": 4,
+        #     "waves_per_eu": 1,
+        #     "num_programs_mult": 2,
+        #     "static_range_cap": 32,
+        #     "fused": True,
+        #     "prefetch_qt": 2,
+        #     "prefetch_kv": 2,
+        #     "num_stages": 1,
+        # },
         # {
         #     "BLOCK_SIZE_M": 32,
         #     "BLOCK_SIZE_N": 16,
@@ -122,25 +122,25 @@ def _default_config_grid() -> List[Dict]:
         # }
 
     ]
-    # for (bmq, bnq, nwq, bmk, bnk, nwk, wpe, np_mult, pf_qt, pf_kv, ns) in itertools.product(
-    #     block_m_q, block_n_q, num_warps_q, block_m_kv, block_n_kv, num_warps_kv,
-    #     waves_per_eu_vals, num_programs_mult_vals, prefetch_qt_vals, prefetch_kv_vals, num_stages_vals
-    # ):
-    #     cfgs.append({
-    #         "BLOCK_SIZE_M": bmq,
-    #         "BLOCK_SIZE_N": bnq,
-    #         "num_warps": nwq,
-    #         "BLOCK_SIZE_M_KV": bmk,
-    #         "BLOCK_SIZE_N_KV": bnk,
-    #         "num_warps_kv": nwk,
-    #         "waves_per_eu": wpe,
-    #         "num_programs_mult": np_mult,
-    #         # Fused-friendly defaults; can be overridden by CLI/DB
-    #         "fused": True,
-    #         "prefetch_qt": pf_qt,
-    #         "prefetch_kv": pf_kv,
-    #         "num_stages": ns,  # Add num_stages to config
-    #     })
+    for (bmq, bnq, nwq, bmk, bnk, nwk, wpe, np_mult, pf_qt, pf_kv, ns) in itertools.product(
+        block_m_q, block_n_q, num_warps_q, block_m_kv, block_n_kv, num_warps_kv,
+        waves_per_eu_vals, num_programs_mult_vals, prefetch_qt_vals, prefetch_kv_vals, num_stages_vals
+    ):
+        cfgs.append({
+            "BLOCK_SIZE_M": bmq,
+            "BLOCK_SIZE_N": bnq,
+            "num_warps": nwq,
+            "BLOCK_SIZE_M_KV": bmk,
+            "BLOCK_SIZE_N_KV": bnk,
+            "num_warps_kv": nwk,
+            "waves_per_eu": wpe,
+            "num_programs_mult": np_mult,
+            # Fused-friendly defaults; can be overridden by CLI/DB
+            "fused": True,
+            "prefetch_qt": pf_qt,
+            "prefetch_kv": pf_kv,
+            "num_stages": ns,  # Add num_stages to config
+        })
     return cfgs
 
 

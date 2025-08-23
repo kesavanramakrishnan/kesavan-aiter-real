@@ -1,0 +1,1 @@
+[{"key": {"causal": 0, "B": 2, "H": 16, "D": 128, "NQ": 16384, "NK": 16384}, "config": {"BLOCK_SIZE_M": 128, "BLOCK_SIZE_N": 128, "num_warps": 4, "BLOCK_SIZE_M_KV": 64, "BLOCK_SIZE_N_KV": 128, "num_warps_kv": 4, "waves_per_eu": 1, "num_programs_mult": 2, "fused": true, "prefetch_qt": 2, "prefetch_kv": 2, "num_stages": 1}, "ms": 24.605979919433594, "tflops": 536.2167886226462}]

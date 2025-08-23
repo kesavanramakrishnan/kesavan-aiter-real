@@ -1020,9 +1020,9 @@ def persistent_lean_attention_bwd(
             BLOCK_SIZE_N_KV = 64
         config = {
             "BLOCK_SIZE_M": 128,
-            "BLOCK_SIZE_N": 64,
+            "BLOCK_SIZE_N": 128,
             "num_warps": 4,
-            "BLOCK_SIZE_M_KV": 32,
+            "BLOCK_SIZE_M_KV": 64,
             "BLOCK_SIZE_N_KV": 128,
             "num_warps_kv": 4,
             "waves_per_eu": 1,

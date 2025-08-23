@@ -1,7 +1,7 @@
 {
     "jobs": [
         {
-            "kernel_include_regex": "bwd_kernel_noncausal",
+            "kernel_include_regex": "la_bwd_fused_streamk",
             "kernel_exclude_regex": "",
             "advanced_thread_trace": true,
             "att_target_cu" : 1,
