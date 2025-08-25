@@ -1020,13 +1020,13 @@ def persistent_lean_attention_bwd(
             BLOCK_SIZE_N_KV = 64
         config = {
             "BLOCK_SIZE_M": 128,
-            "BLOCK_SIZE_N": 128,
+            "BLOCK_SIZE_N": 32,
             "num_warps": 4,
-            "BLOCK_SIZE_M_KV": 64,
-            "BLOCK_SIZE_N_KV": 128,
+            "BLOCK_SIZE_M_KV": 16,
+            "BLOCK_SIZE_N_KV": 64,
             "num_warps_kv": 4,
             "waves_per_eu": 1,
-            "num_programs_mult": 2,
+            "num_programs_mult": 1,
             "static_range_cap": 32,
             "fused": True,
             "prefetch_qt": 2,
@@ -1187,8 +1187,8 @@ def persistent_lean_attention_bwd(
 
     # Compute conservative static-range bounds from per-WG maxima (clamped)
     static_cap = int(config.get("static_range_cap", 32))
-    max_kv_tiles = min(max_tiles_per_wg_kv_kv, static_cap)
-    max_q_tiles = min(max_tiles_per_wg_q, static_cap)
+    max_kv_tiles = max_tiles_per_wg_kv_kv
+    max_q_tiles = max_tiles_per_wg_q
 
     # If user didn't specify num_programs/ctas, prefer 2x SMs by default
     num_programs = None

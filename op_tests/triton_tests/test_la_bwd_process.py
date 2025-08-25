@@ -585,4 +585,4 @@ def main_flash():
 
 
 if __name__ == "__main__":
-    sys.exit(main_la())    
+    sys.exit(main_flash())    

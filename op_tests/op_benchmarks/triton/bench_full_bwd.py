@@ -42,9 +42,9 @@ def nonvarlen_benchmark_configs():
         # (2, 48, 48, 4096, 8192),
         # (2, 48, 48, 8192, 4096),
         # (2, 48, 48, 16384, 8192),
-        # (2, 48, 48, 8192, 16384),
+        (2, 48, 48, 8192, 16384),
         (2, 16, 16, 16384, 16384),
-        # (2, 16, 16, 16384, 32768),
+        (2, 16, 16, 16384, 32768),
         # (2, 16, 16, 32768, 16384),
         # (2, 16, 16, 32768, 32768),
         
@@ -332,9 +332,6 @@ def run_benchmark(custom, args):
                         num_programs=None,
                         seqlen_k=N_CTX_K,
                     )
-                    print("Sum of DQ: ", dq_view.sum())
-                    print("Sum of DK: ", dk_view.sum())
-                    print("Sum of DV: ", dv_view.sum())
 
                     # Return delta to match API (same as softmax_lse shape: [B, H, Nq])
                     delta = (do * o).sum(dim=-1)
@@ -581,9 +578,7 @@ def run_benchmark(custom, args):
                         d_out,
                         retain_graph=True,
                     )
-                    print("Sum of DQ grads: ", grads[0].sum())
-                    print("Sum of DK grads: ", grads[1].sum())
-                    print("Sum of DV grads: ", grads[2].sum())
+                    
                     return grads
 
         ms = triton.testing.do_bench(fn)

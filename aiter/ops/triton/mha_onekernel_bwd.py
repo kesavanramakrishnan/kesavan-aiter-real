@@ -1711,7 +1711,8 @@ def flash_attn_onekernel_backward(
     }
     kernel_timing["bwd_kernel"]["start_event"].record()
     def _print_triton_kernel_lds(kernel_obj):
-        print(f"kernel_metadata: {kernel_obj.metadata}")
+        return
+        #print(f"kernel_metadata: {kernel_obj.metadata}")
 
     if causal:
         bwd_kernel_causal[grid](
@@ -1819,6 +1820,7 @@ def flash_attn_onekernel_backward(
             USE_INT64_STRIDES=USE_INT64_STRIDES,
             **config_onekernel,
         )
+        print(f"la bwd fused kernel {krr.n_regs} regs, {krr.n_spills} spills")
         try:
             _print_triton_kernel_lds(krr)
         except Exception:

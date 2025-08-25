@@ -66,7 +66,7 @@ def allocate_tensors(scn: Dict, dtype: torch.dtype, device: torch.device, cfg: D
 
 	# Layouts expected by persistent_lean_attention
 	q = torch.randn((B * NQ, H, D), device=device, dtype=dtype)
-	k = torch.randn((NK, H, D), device=device, dtype=dtype)
+	k = torch.randn((B * NK, H, D), device=device, dtype=dtype)
 	v = torch.randn_like(k)
 
 	# Determine total programs and BLOCK sizes to size temp buffers
